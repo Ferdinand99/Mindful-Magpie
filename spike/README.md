@@ -26,6 +26,8 @@ The token for the running spike instance is in `spike/README.local` (git-ignored
 2. Open the extension's options page, enter the server URL and token, and save. Accept the host permission prompt.
 3. Open a new tab.
 
+The manifest sets its own `content_security_policy` because Firefox's default for MV3 extension pages includes `upgrade-insecure-requests`, which would turn the fetch to the plain-http LAN server into https and make it fail.
+
 ## What to check (Windows and Mac)
 
 - Open a new tab and start typing at once. The text should land in the address bar.

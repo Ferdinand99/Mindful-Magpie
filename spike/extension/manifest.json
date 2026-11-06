@@ -6,6 +6,7 @@
   "chrome_url_overrides": { "newtab": "newtab.html" },
   "options_ui": { "page": "options.html", "open_in_tab": true },
   "permissions": ["storage"],
+  "content_security_policy": { "extension_pages": "script-src 'self'; object-src 'self';" },
   "optional_host_permissions": ["*://*/*"],
   "browser_specific_settings": {
     "gecko": { "id": "spike@magpie.hedgerow.tools", "strict_min_version": "128.0" }
