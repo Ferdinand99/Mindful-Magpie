@@ -29,7 +29,7 @@ The token for the running spike instance is in `spike/README.local` (git-ignored
 ## What to check (Windows and Mac)
 
 - Open a new tab and start typing at once. The text should land in the address bar.
-- Compare with the plain web page: set it as the home/new-tab page (about:preferences#home, "Custom URLs") and repeat.
+- Compare with how the Homarr page behaves today in a new tab: does typing land in the address bar, and how quickly does the page appear? (The plain page at `/` on the spike server is only for opening by hand; Firefox's "Custom URLs" setting covers the homepage and new windows, not Ctrl+T, so it is not a new-tab comparison.)
 - Read the "vist på N ms" figure in the corner of the extension page on the second and later tabs; it shows when the cached data was painted.
 - Stop the server and open a tab: cached data stays visible with an offline note.
 

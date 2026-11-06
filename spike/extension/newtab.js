@@ -1,10 +1,10 @@
-import { nextView } from "./state.js";
+import { fetchData, isValidData, nextView } from "./state.js";
 
 const statusText = {
   fresh: "Fresh from server",
   cached: "Cached, checking server...",
   offline: "Server unreachable, showing cached data",
-  unauthorized: "Token rejected, showing cached data (check the options page)",
+  unauthorized: "Token rejected (check the options page)",
   empty: "No data yet. Open the extension options and set server URL and token.",
 };
 
@@ -27,28 +27,14 @@ function render(view) {
   }
 }
 
-async function fetchData(serverUrl, token) {
-  if (!serverUrl || !token) return { ok: false, kind: "network" };
-  try {
-    const res = await fetch(`${serverUrl.replace(/\/+$/, "")}/api/spike/data`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (res.status === 401) return { ok: false, kind: "unauthorized" };
-    if (!res.ok) return { ok: false, kind: "network" };
-    return { ok: true, data: await res.json() };
-  } catch {
-    return { ok: false, kind: "network" };
-  }
-}
-
 async function start() {
   const stored = await browser.storage.local.get(["last", "serverUrl", "token"]);
-  const cached = stored.last ?? null;
+  const cached = isValidData(stored.last) ? stored.last : null;
   render(nextView(cached, undefined));
   const ms = Math.round(performance.now());
   document.getElementById("timing").textContent = `vist på ${ms} ms`;
 
-  const result = await fetchData(stored.serverUrl, stored.token);
+  const result = await fetchData(fetch, stored.serverUrl, stored.token);
   const view = nextView(cached, result);
   render(view);
   if (view.status === "fresh") {
