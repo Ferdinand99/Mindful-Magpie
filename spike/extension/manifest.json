@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Magpie spike",
+  "version": "0.0.1",
+  "description": "Throwaway spike: does a new-tab extension keep the address bar focused, and does cached data show instantly?",
+  "chrome_url_overrides": { "newtab": "newtab.html" },
+  "options_ui": { "page": "options.html" },
+  "permissions": ["storage"],
+  "optional_host_permissions": ["*://*/*"],
+  "browser_specific_settings": {
+    "gecko": { "id": "spike@magpie.hedgerow.tools" }
+  }
+}

@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Magpie spike options</title>
+  <style>
+    body { font-family: system-ui, sans-serif; padding: 1rem; }
+    label { display: block; margin: .6rem 0; }
+    input { display: block; width: 24rem; max-width: 100%; margin-top: .2rem; }
+  </style>
+</head>
+<body>
+  <h1>Magpie spike</h1>
+  <form id="form">
+    <label>Server URL
+      <input id="serverUrl" type="url" placeholder="http://10.0.3.152:8099" required>
+    </label>
+    <label>Token
+      <input id="token" type="text" autocomplete="off" required>
+    </label>
+    <button type="submit">Save</button>
+    <span id="msg"></span>
+  </form>
+  <script src="options.js"></script>
+</body>
+</html>
