@@ -32,13 +32,15 @@ export function draw(doc) {
 }
 
 /**
- * After an htmx swap: draws only when #groups is there but empty (a fresh
- * body of the start page), and cleans up when it is gone. Content that is
- * already drawn is never drawn over (edit mode works on it).
+ * After an htmx swap or a history restore: draws when #groups is there but
+ * empty (a fresh body of the start page), or when <html> has lost its
+ * background (the body was restored from history after a visit to another page
+ * cleared it), and cleans up when #groups is gone. Content that is drawn and
+ * has its background is never drawn over (edit mode works on it).
  */
 export function drawIfNeeded(doc) {
   const root = doc.getElementById("groups");
-  if (root && root.firstElementChild) return;
+  if (root && root.firstElementChild && doc.documentElement.hasAttribute("data-bg")) return;
   draw(doc);
 }
 
@@ -51,4 +53,7 @@ if (typeof document !== "undefined") {
   // A boosted visit to the start page swaps in a fresh body, and htmx does not
   // run scripts it swaps in. A boosted visit to another page takes the body away.
   document.addEventListener("htmx:afterSettle", () => drawIfNeeded(document));
+  // Back to the start page: htmx puts the saved body back, drawn but without
+  // the background that the visit to the other page cleared.
+  document.addEventListener("htmx:historyRestore", () => drawIfNeeded(document));
 }

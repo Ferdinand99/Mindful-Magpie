@@ -354,6 +354,13 @@ test("image_base_is_an_origin_or_nothing", () => {
     ["https://magpie.example/", 'url("https://magpie.example/start/background/abc")'],
     ["https://magpie.example:8443/some/path?q=1", 'url("https://magpie.example:8443/start/background/abc")'],
     ["http://10.0.3.152:3010", 'url("http://10.0.3.152:3010/start/background/abc")'],
+    ["http://[::1]:3010/x", 'url("http://[::1]:3010/start/background/abc")'],
+    // Hosts the URL parser accepts but that would end the url("...").
+    ['https://x"y.example', 'url("/start/background/abc")'],
+    ['https://x"),red,url("y.example', 'url("/start/background/abc")'],
+    ["https://x;y.example", 'url("/start/background/abc")'],
+    ["https://x(y).example", 'url("/start/background/abc")'],
+    ["https://x'y.example", 'url("/start/background/abc")'],
   ];
   for (const [imageBase, expected] of cases) {
     render(root, layout(image), { ...OPTS, imageBase });

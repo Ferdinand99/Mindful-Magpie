@@ -186,16 +186,22 @@ function drawEmpty(doc, opts) {
   return card;
 }
 
+// A host the browser's URL parser accepts can still hold a quote, a bracket or a
+// semicolon, which would end the url("...") the origin is written into. Only
+// plain host names, IPv4 and IPv6 literals pass, with an optional port.
+const PLAIN_ORIGIN = /^https?:\/\/(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::\d+)?$/;
+
 /**
  * `value` as an origin (`https://host:port`, no trailing slash) if it is an
- * http or https address, else "" (a relative path). Written into url("..."),
- * so nothing but a parsed origin may get in.
+ * http or https address with a plain host, else "" (a relative path). It is
+ * written into url("..."), so nothing but a checked origin may get in.
  */
 function originOf(value) {
   if (typeof value !== "string") return "";
   try {
     const url = new URL(value);
-    return url.protocol === "http:" || url.protocol === "https:" ? url.origin : "";
+    if (url.protocol !== "http:" && url.protocol !== "https:") return "";
+    return PLAIN_ORIGIN.test(url.origin) ? url.origin : "";
   } catch {
     return "";
   }

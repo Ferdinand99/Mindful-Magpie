@@ -88,11 +88,14 @@ async fn background_rules_only_apply_where_the_root_is() {
                 let selector = css[selector_start..at].trim();
                 let body = &css[at..css[at..].find('}').map_or(css.len(), |end| at + end)];
                 if selector.contains("data-bg") || selector.starts_with("html") {
-                    assert!(
-                        selector.contains(":has(.mm-root)"),
-                        "this rule outlives the start page: {selector}"
-                    );
-                    checked += 1;
+                    // A selector list: every member needs the root.
+                    for member in selector.split(',') {
+                        assert!(
+                            member.contains(":has(.mm-root)"),
+                            "this rule outlives the start page: {member} (in {selector})"
+                        );
+                        checked += 1;
+                    }
                 }
                 if selector.contains("data-bg") {
                     assert!(

@@ -124,3 +124,26 @@ test("draw_if_needed_never_draws_over_existing_content", () => {
   drawIfNeeded(document);
   assert.equal(root.querySelectorAll(".mm-card").length, 1);
 });
+
+test("back_navigation_restores_the_background", () => {
+  const document = startPage({
+    layout: JSON.stringify({ ...LAYOUT, background: { kind: "image", id: "abc" } }),
+  });
+  const html = document.documentElement;
+  draw(document);
+  const drawn = document.body.innerHTML;
+
+  // Start -> Settings: the body is swapped and the background cleared.
+  settingsPage(document);
+  drawIfNeeded(document);
+  assert.equal(html.hasAttribute("data-bg"), false);
+
+  // Back: htmx puts the saved, drawn body back. The root has content but
+  // <html> has no background, so it is drawn again.
+  document.body.innerHTML = drawn;
+  assert.ok(document.getElementById("groups").firstElementChild);
+  drawIfNeeded(document);
+  assert.equal(html.getAttribute("data-bg"), "image");
+  assert.equal(html.style.getPropertyValue("--mm-bg-image"), 'url("/start/background/abc")');
+  assert.equal(document.querySelectorAll("section.mm-group").length, 1);
+});
