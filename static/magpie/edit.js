@@ -18,7 +18,10 @@
 // `editButton` (the header button; it shows aria-pressed and gets focus back),
 // `reload` (called by «Reload» after a conflict), `draft` (a layout to start from
 // instead of the stored one: an unsaved draft that was kept, see start.js) and
-// `onDiscard` (called when the person gives the changes up).
+// `onDiscard` (called when the person gives the changes up) and `background`
+// (`{ upload(file), remove() }`, the two calls of the background picture; each
+// resolves to `{ status, body }` like `save`. Without it the picker offers the
+// four presets only).
 import {
   addBookmark,
   addCard,
@@ -30,6 +33,7 @@ import {
   removeCard,
   removeGroup,
   renameGroup,
+  setBackground,
   updateBookmark,
   updateCard,
 } from "./ops.js";
@@ -92,6 +96,25 @@ export const LABEL_KEYS = [
   "confirm_leave",
   "confirm_leave_text",
   "confirm_leave_yes",
+  "background",
+  "bg_title",
+  "bg_presets",
+  "bg_preset_hedgerow",
+  "bg_preset_natt",
+  "bg_preset_skumring",
+  "bg_preset_hav",
+  "bg_upload",
+  "bg_upload_help",
+  "bg_uploading",
+  "bg_remove",
+  "bg_removing",
+  "bg_image_set",
+  "bg_err_size",
+  "bg_err_type",
+  "bg_err_failed",
+  "bg_err_remove",
+  "bg_gone",
+  "bg_gone_toast",
   // The next three are used by start.js (the notice for a kept draft), not by
   // edit.js: they are listed here so that one list covers every string.
   "restore_notice",
@@ -134,6 +157,33 @@ export const LABEL_KEYS = [
 const SVG_NS = "http://www.w3.org/2000/svg";
 const DEFAULT_COLOUR = "blue";
 const SUMMARY_LIMIT = 10;
+const PRESETS = ["hedgerow", "natt", "skumring", "hav"];
+const DEFAULT_PRESET = { kind: "preset", name: "hedgerow" };
+// What the server takes (src/layout/background.rs): at most 5 MiB.
+const MAX_PICTURE_BYTES = 5 * 1024 * 1024;
+
+/** Whether `head` (the first bytes of a file) starts like a PNG, JPEG or WebP. */
+function isPicture(head) {
+  const at = (offset, bytes) => bytes.every((b, i) => head[offset + i] === b);
+  const text = (offset, value) => at(offset, [...value].map((c) => c.charCodeAt(0)));
+  return (
+    at(0, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) ||
+    at(0, [0xff, 0xd8, 0xff]) ||
+    (text(0, "RIFF") && text(8, "WEBP"))
+  );
+}
+
+/** The label key of the problem with `file`, or null. The server checks again. */
+async function pictureProblem(file) {
+  if (file.size > MAX_PICTURE_BYTES) return "bg_err_size";
+  let head;
+  try {
+    head = new Uint8Array(await file.slice(0, 12).arrayBuffer());
+  } catch {
+    return "bg_err_type";
+  }
+  return isPicture(head) ? null : "bg_err_type";
+}
 
 // The strings of the editor that is open. Edit mode is one at a time.
 const ui = { labels: {} };
@@ -261,7 +311,13 @@ export function startEditing(root, getLayout, save, opts = {}) {
   const stored = getLayout();
   let draft = structuredClone(opts.draft ?? stored);
   // What "unsaved" is measured against: the stored layout (a kept draft is unsaved by definition).
-  const baseline = JSON.stringify(opts.draft ? stored : draft);
+  // The version is left out: it moves on without the person changing anything
+  // (removing the picture bumps it on the server).
+  const plain = (layout) => JSON.stringify({ ...layout, version: 0 });
+  let baseline = plain(opts.draft ? stored : draft);
+  const background = opts.background ?? null;
+  // The id of the picture uploaded in this session that no saved layout uses yet.
+  let uploadedId = null;
   const onDiscard = opts.onDiscard ?? (() => {});
   let active = true;
   let saving = false;
@@ -271,7 +327,7 @@ export function startEditing(root, getLayout, save, opts = {}) {
   let marked = null;
   const listeners = [];
 
-  const dirty = () => JSON.stringify(draft) !== baseline;
+  const dirty = () => plain(draft) !== baseline;
 
   function on(target, type, handler, options) {
     target.addEventListener(type, handler, options);
@@ -289,6 +345,7 @@ export function startEditing(root, getLayout, save, opts = {}) {
   const adds = h(doc, "div", { class: "mm-edit-adds" });
   adds.appendChild(textButton(doc, "add-group", L("add_group"), { iconName: "plus" }));
   adds.appendChild(textButton(doc, "add-bookmark", L("add_bookmark"), { iconName: "plus" }));
+  adds.appendChild(textButton(doc, "background", L("background"), { iconName: "sparkle" }));
   const ends = h(doc, "div", { class: "mm-edit-ends" });
   ends.appendChild(textButton(doc, "cancel", L("edit_cancel"), { kind: "ghost" }));
   ends.appendChild(textButton(doc, "done", L("edit_done"), { kind: "primary" }));
@@ -851,6 +908,217 @@ export function startEditing(root, getLayout, save, opts = {}) {
     no.focus();
   }
 
+  // -- the background picker --
+
+  /**
+   * The picker sheet: the four presets, an upload and, with a picture set,
+   * "remove". A preset or a finished upload changes the draft and the page at
+   * once; nothing is saved before «Done», except that the picture itself is on
+   * the server as soon as it is uploaded (and goes when it is removed).
+   */
+  function backgroundSheet(trigger) {
+    const sheet = openSheet({ title: L("bg_title"), trigger });
+    const body = sheet.body;
+
+    const labelId = uid("mm-f-bg");
+    const group = h(doc, "div", { class: "field", role: "radiogroup", "aria-labelledby": labelId });
+    group.appendChild(h(doc, "span", { class: "label", id: labelId, text: L("bg_presets") }));
+    const presets = h(doc, "div", { class: "mm-bg-presets" });
+    const radios = [];
+    for (const name of PRESETS) {
+      const radio = h(doc, "input", { type: "radio", name: "preset", value: name, class: "vh" });
+      const dot = h(doc, "span", { class: "mm-bg-dot", "data-preset": name, "aria-hidden": "true" });
+      const text = h(doc, "span", { class: "mm-bg-name", text: L(`bg_preset_${name}`) });
+      presets.appendChild(h(doc, "label", { class: "mm-bg-preset" }, [radio, dot, text]));
+      radio.addEventListener("change", () => {
+        if (busy || saving || !(radio.checked ?? radio.hasAttribute("checked"))) return;
+        choose({ kind: "preset", name });
+      });
+      radios.push(radio);
+    }
+    group.appendChild(presets);
+    body.appendChild(group);
+
+    let remove = null;
+    let input = null;
+    let status = null;
+    let problem = null;
+    let busy = false;
+    if (background) {
+      const id = uid("mm-f-image");
+      const upload = h(doc, "div", { class: "field", "data-field": "image" });
+      upload.appendChild(h(doc, "label", { class: "label", for: id, text: L("bg_upload") }));
+      input = h(doc, "input", { type: "file", id, name: "image", accept: "image/png,image/jpeg,image/webp" });
+      upload.appendChild(input);
+      upload.appendChild(h(doc, "p", { class: "help", id: `${id}-help`, text: L("bg_upload_help") }));
+      problem = h(doc, "p", { class: "field-error", id: `${id}-error`, "data-for": "image", hidden: true });
+      upload.appendChild(problem);
+      input.setAttribute("aria-describedby", `${id}-help ${id}-error`);
+      status = h(doc, "p", { class: "help mm-bg-status", role: "status" });
+      upload.appendChild(status);
+      body.appendChild(upload);
+      remove = h(doc, "button", { type: "button", class: "btn btn-danger", "data-act": "remove-picture", text: L("bg_remove") });
+      body.appendChild(remove);
+      input.addEventListener("change", () => void onFile());
+      remove.addEventListener("click", () => void onRemove());
+    }
+
+    const close = h(doc, "button", { type: "button", class: "btn btn-primary", text: L("dialog_close") });
+    close.addEventListener("click", () => sheet.close());
+    sheet.foot.appendChild(close);
+
+    const isImage = () => draft.background.kind === "image";
+
+    function showProblem(key) {
+      if (!problem) return;
+      problem.textContent = key ? L(key) : "";
+      if (key) {
+        problem.removeAttribute("hidden");
+        input.setAttribute("aria-invalid", "true");
+      } else {
+        problem.setAttribute("hidden", "");
+        input.removeAttribute("aria-invalid");
+      }
+    }
+
+    /** Brings the controls in line with the draft (and with a busy state). */
+    function refresh() {
+      const current = draft.background.kind === "preset" ? draft.background.name : null;
+      for (const radio of radios) {
+        radio.checked = radio.value === current;
+        if (radio.checked) radio.setAttribute("checked", "");
+        else radio.removeAttribute("checked");
+        if (busy) radio.setAttribute("disabled", "");
+        else radio.removeAttribute("disabled");
+      }
+      if (remove) {
+        if (isImage()) remove.removeAttribute("hidden");
+        else remove.setAttribute("hidden", "");
+        if (busy) remove.setAttribute("disabled", "");
+        else remove.removeAttribute("disabled");
+      }
+      if (input) {
+        if (busy) input.setAttribute("disabled", "");
+        else input.removeAttribute("disabled");
+      }
+      body.setAttribute("aria-busy", busy ? "true" : "false");
+    }
+
+    function setStatus(text) {
+      if (status) status.textContent = text;
+    }
+
+    function setBusy(next, text = "") {
+      busy = next;
+      setStatus(text);
+      refresh();
+    }
+
+    function choose(next) {
+      draft = setBackground(draft, next);
+      notice = null;
+      redraw();
+      renderNotice();
+      showProblem(null);
+      refresh();
+    }
+
+    async function onFile() {
+      const file = input.files?.[0];
+      if (!file || busy || saving) return;
+      showProblem(null);
+      const refused = await pictureProblem(file);
+      if (refused) {
+        input.value = "";
+        showProblem(refused);
+        input.focus();
+        return;
+      }
+      setBusy(true, L("bg_uploading"));
+      let result = null;
+      try {
+        result = await background.upload(file);
+      } catch {
+        result = null;
+      }
+      input.value = "";
+      const id = result?.body?.id;
+      if (result?.status === 200 && typeof id === "string" && active) {
+        uploadedId = id;
+        choose({ kind: "image", id });
+        setBusy(false, L("bg_image_set"));
+      } else {
+        setBusy(false);
+        showProblem(result?.status === 413 ? "bg_err_size" : result?.status === 422 ? "bg_err_type" : "bg_err_failed");
+      }
+      if (input.isConnected) input.focus();
+    }
+
+    async function onRemove() {
+      if (busy || saving) return;
+      showProblem(null);
+      setBusy(true, L("bg_removing"));
+      let result = null;
+      try {
+        result = await background.remove();
+      } catch {
+        result = null;
+      }
+      const version = result?.body?.version;
+      if (result?.status === 200 && Number.isFinite(version) && active) {
+        const storedIsImage = JSON.parse(baseline).background?.kind === "image";
+        // The server put a stored layout that used the picture back on the
+        // default preset, and its version moved on by one. Take that in, so
+        // that the next save does not meet a conflict. (Any other version
+        // means somebody else saved: that is left to the conflict.)
+        if (version === draft.version + (storedIsImage ? 1 : 0)) draft = { ...draft, version };
+        if (storedIsImage) baseline = plain({ ...JSON.parse(baseline), background: DEFAULT_PRESET });
+        uploadedId = null;
+        draft = setBackground(draft, DEFAULT_PRESET);
+        notice = null;
+        redraw();
+        renderNotice();
+        setBusy(false, "");
+        radios.find((r) => r.checked)?.focus();
+      } else {
+        setBusy(false);
+        showProblem("bg_err_remove");
+        remove.focus();
+      }
+    }
+
+    sheet.open();
+    refresh();
+    setStatus(isImage() ? L("bg_image_set") : "");
+    (radios.find((r) => r.checked) ?? radios[0]).focus();
+  }
+
+  /**
+   * The picture uploaded in this session is on the server whether or not a
+   * saved layout points at it. When the layout now on the page (`shown`) does
+   * not use it, take it off the server again: nothing is left that nobody uses,
+   * and a stored layout that pointed at the picture it replaced (which is gone)
+   * is put back on the default preset by the server, so that the page has no
+   * dead background and the next save is not refused (`bad_image`).
+   */
+  function settleUpload(shown) {
+    if (uploadedId === null || !background) return;
+    const keep = shown?.background?.kind === "image" && shown.background.id === uploadedId;
+    uploadedId = null;
+    if (keep) return;
+    background
+      .remove()
+      .then((result) => {
+        if (result?.status !== 200) return;
+        // The page may show a picture that is gone now: draw what is stored.
+        if (!active && root.isConnected && !root.hasAttribute("data-editing")) {
+          render(root, getLayout(), { lang, labels: ui.labels });
+        }
+        if (shown?.background?.kind === "image") win.VV?.toast?.(L("bg_gone_toast"), "info");
+      })
+      .catch(() => {});
+  }
+
   // -- actions --
 
   function limitReached(kind) {
@@ -911,6 +1179,8 @@ export function startEditing(root, getLayout, save, opts = {}) {
       if (!limitReached("group")) groupForm(null, trigger);
     } else if (act === "add-bookmark") {
       if (!limitReached("bookmark")) bookmarkForm(null, trigger);
+    } else if (act === "background") {
+      backgroundSheet(trigger);
     } else if (act === "done") {
       done();
     } else if (act === "cancel") {
@@ -1032,9 +1302,24 @@ export function startEditing(root, getLayout, save, opts = {}) {
       setNotice({ type: "conflict" });
       focusControl({ toolbar: "done" });
     } else if (result?.status === 422 && Array.isArray(result.body?.fields)) {
-      const fields = result.body.fields;
+      let fields = result.body.fields;
+      // A background picture that is no longer the user's (it was replaced
+      // from another tab, or after a cancelled upload): back on the default
+      // preset, and one more press on «Done» saves.
+      const gone = fields.some((f) => f.path.startsWith("background") && f.code === "bad_image");
+      if (gone) {
+        fields = fields.filter((f) => !(f.path.startsWith("background") && f.code === "bad_image"));
+        draft = setBackground(draft, DEFAULT_PRESET);
+        redraw();
+      }
       problems = fields;
-      setNotice({ type: "summary", entries: summarise(fields) });
+      if (fields.length === 0) {
+        setNotice({ type: "failed", text: L("bg_gone") });
+      } else {
+        const entries = summarise(fields);
+        if (gone) entries.unshift({ path: "", text: L("bg_gone") });
+        setNotice({ type: "summary", entries });
+      }
       focusControl({ toolbar: "done" });
     } else {
       setNotice({ type: "failed", text: L("save_failed") });
@@ -1063,11 +1348,15 @@ export function startEditing(root, getLayout, save, opts = {}) {
     });
   }
 
-  /** Leaves edit mode and draws `layout` as a plain page. */
-  function finish(layout, { focus = true } = {}) {
+  /**
+   * Leaves edit mode and draws `layout` as a plain page. `settle: false` is for
+   * a draft that is kept (Back and Forward): its picture must stay.
+   */
+  function finish(layout, { focus = true, settle = true } = {}) {
     if (!active) return;
     teardown();
     render(root, layout, { lang, labels: ui.labels });
+    if (settle) settleUpload(layout);
     if (focus && editButton) editButton.focus();
   }
 
@@ -1279,7 +1568,7 @@ export function startEditing(root, getLayout, save, opts = {}) {
     done,
     cancel,
     /** Leaves edit mode without asking or saving (the page is going away). */
-    stop: (options) => finish(getLayout(), options),
+    stop: (options) => finish(getLayout(), { ...options, settle: false }),
     /** Takes the editor's listeners off, without touching the page. */
     dispose: teardown,
     isActive: () => active,

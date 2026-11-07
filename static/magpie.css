@@ -317,6 +317,65 @@ body:has(.main.start) .topbar-inner {
 .mm-swatch-dot[data-colour="brown"] { background: var(--pal-brown); }
 .mm-swatch-dot[data-colour="gray"] { background: var(--pal-gray); }
 
+/* The background picker: four preset previews as a radio group, drawn from a
+   data attribute (no style attributes), then the upload. */
+.mm-bg-presets {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(6.5rem, 1fr));
+  gap: var(--sp-3);
+}
+.mm-bg-preset {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  cursor: pointer;
+}
+.mm-bg-dot {
+  display: block;
+  height: 3.5rem;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  background: var(--bg);
+}
+.mm-bg-dot[data-preset="hedgerow"] {
+  background:
+    radial-gradient(70% 70% at 15% 10%, rgba(139, 125, 255, 0.55), transparent 70%),
+    radial-gradient(70% 70% at 90% 20%, rgba(255, 100, 130, 0.4), transparent 70%),
+    radial-gradient(80% 80% at 50% 100%, rgba(48, 160, 200, 0.45), transparent 70%),
+    var(--bg);
+}
+.mm-bg-dot[data-preset="natt"] {
+  background: #0b0b0d;
+}
+.mm-bg-dot[data-preset="skumring"] {
+  background:
+    radial-gradient(70% 70% at 15% 10%, rgba(139, 92, 246, 0.7), transparent 70%),
+    radial-gradient(70% 70% at 90% 20%, rgba(244, 63, 94, 0.55), transparent 70%),
+    radial-gradient(80% 80% at 50% 100%, rgba(236, 72, 153, 0.4), transparent 70%),
+    #12081c;
+}
+.mm-bg-dot[data-preset="hav"] {
+  background:
+    radial-gradient(70% 70% at 15% 10%, rgba(20, 184, 166, 0.6), transparent 70%),
+    radial-gradient(70% 70% at 90% 20%, rgba(59, 130, 246, 0.55), transparent 70%),
+    radial-gradient(80% 80% at 50% 100%, rgba(6, 182, 212, 0.4), transparent 70%),
+    #061219;
+}
+.mm-bg-name {
+  font-size: 0.8125rem;
+  text-align: center;
+}
+.mm-bg-preset:has(input:checked) .mm-bg-dot {
+  box-shadow: 0 0 0 2px var(--card-raised), 0 0 0 4px var(--text);
+}
+.mm-bg-preset:has(input:focus-visible) .mm-bg-dot {
+  outline: 2px solid var(--brand);
+  outline-offset: 4px;
+}
+.mm-bg-status:empty {
+  display: none;
+}
+
 /* The move menu: one button per move. */
 .mm-move-list {
   display: flex;

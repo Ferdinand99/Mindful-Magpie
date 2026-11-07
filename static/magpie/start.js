@@ -51,6 +51,15 @@ export function drawIfNeeded(doc) {
   draw(doc);
 }
 
+/** Replaces the layout block of the page, so that the page and the next edit start from it. */
+function writeLayoutBlock(doc, layout) {
+  const block = doc.getElementById("mm-layout");
+  if (!block) return;
+  // `<` as an escape: the block lives in HTML, and htmx saves it as HTML for the
+  // history, so no text in it may be able to end it early.
+  block.textContent = JSON.stringify(layout).replace(/</g, "\\u003c");
+}
+
 /**
  * A `save` for edit mode: posts the layout as JSON to `/start/layout` (the
  * `HX-Request` header is the CSRF proof the server asks for besides the cookie)
@@ -74,12 +83,7 @@ export function makeSave(doc, fetchFn = (...args) => fetch(...args)) {
       // Not JSON (a proxy's error page): the status says enough.
     }
     if (response.status === 200 && Number.isFinite(body?.version)) {
-      const block = doc.getElementById("mm-layout");
-      if (block) {
-        // `<` as an escape: the block lives in HTML, and htmx saves it as HTML
-        // for the history, so no text in it may be able to end it early.
-        block.textContent = JSON.stringify({ ...layout, version: body.version }).replace(/</g, "\\u003c");
-      }
+      writeLayoutBlock(doc, { ...layout, version: body.version });
     }
     return { status: response.status, body };
   };
@@ -198,10 +202,56 @@ export function reloadIfDataLost(doc, deps = {}) {
 }
 
 /**
+ * The two calls of the background picture for edit mode, each resolving to
+ * `{ status, body }` (a network failure rejects):
+ *
+ * - `upload(file)`: `POST /start/background`; the picture is on the server at
+ *   once, the layout points at it only when the layout is saved;
+ * - `remove()`: `DELETE /start/background`; the server puts a stored layout that
+ *   used the picture back on the default preset and moves its version on by one,
+ *   and the layout block of the page is changed the same way.
+ */
+export function makeBackground(doc, fetchFn = (...args) => fetch(...args)) {
+  const headers = { "HX-Request": "true" };
+  const answer = async (response) => {
+    let body = null;
+    try {
+      body = await response.json();
+    } catch {
+      // Not JSON: the status says enough.
+    }
+    return { status: response.status, body };
+  };
+  return {
+    async upload(file) {
+      const form = new FormData();
+      form.append("image", file);
+      // No Content-Type: the browser writes it, with the boundary.
+      return answer(await fetchFn("/start/background", { method: "POST", credentials: "same-origin", headers, body: form }));
+    },
+    async remove() {
+      // keepalive: it may be sent as the page is left.
+      const result = await answer(
+        await fetchFn("/start/background", { method: "DELETE", credentials: "same-origin", headers, keepalive: true }),
+      );
+      if (result.status === 200 && Number.isFinite(result.body?.version)) {
+        const layout = readJson(doc, "mm-layout");
+        if (layout) {
+          const next = { ...layout, version: result.body.version };
+          if (layout.background?.kind === "image") next.background = { kind: "preset", name: "hedgerow" };
+          writeLayoutBlock(doc, next);
+        }
+      }
+      return result;
+    },
+  };
+}
+
+/**
  * Wires the Edit button (`#mm-edit`, found at click time, because htmx swaps
  * the body) to edit mode. The module is loaded on the first press. Pressing the
  * button while editing is the same as «Done». `deps`: `load` (gives the module),
- * `save`, `reload`, `navigate`, `storage`, `now` (a clock, for tests). Returns `{ leave, check, offerRestore }`:
+ * `save`, `background`, `reload`, `navigate`, `storage`, `now` (a clock, for tests). Returns `{ leave, check, offerRestore }`:
  *
  * - `leave()`: the page is about to be saved to the history or left by Back or
  *   Forward, which cannot be stopped. Unsaved changes are kept (see above) and
@@ -214,6 +264,7 @@ export function initEditing(doc, deps = {}) {
   const storage = storageOf(doc, deps);
   const now = deps.now ?? (() => Date.now());
   const baseSave = deps.save ?? makeSave(doc);
+  const background = deps.background ?? makeBackground(doc);
   // A saved page has no use for an older draft.
   const save = async (layout) => {
     const result = await baseSave(layout);
@@ -244,6 +295,7 @@ export function initEditing(doc, deps = {}) {
         editButton: button,
         reload: deps.reload,
         navigate: deps.navigate,
+        background,
         draft: restored ?? undefined,
         onDiscard: () => clearStash(storage),
       });
