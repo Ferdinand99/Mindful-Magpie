@@ -175,15 +175,19 @@ pub fn error_label(text: &str) -> String {
 
 fn entry(summary: &ServiceSummary, poller: &PollerHandle) -> ServiceValues {
     match poller.snapshot(summary.id) {
-        Some(snapshot) => ServiceValues {
-            name: summary.name.clone(),
-            kind: summary.kind.clone(),
-            interval_s: summary.interval_s,
-            status: snapshot.status,
-            values: snapshot.values.clone(),
-            fetched_at: Some(snapshot.fetched_at.as_second()),
-            error_label: snapshot.error.as_deref().map(error_label),
-        },
+        Some(snapshot) => {
+            let mut values = snapshot.values.clone();
+            integrations::localize_texts(&summary.kind, &mut values);
+            ServiceValues {
+                name: summary.name.clone(),
+                kind: summary.kind.clone(),
+                interval_s: summary.interval_s,
+                status: snapshot.status,
+                values,
+                fetched_at: Some(snapshot.fetched_at.as_second()),
+                error_label: snapshot.error.as_deref().map(error_label),
+            }
+        }
         None => ServiceValues {
             name: summary.name.clone(),
             kind: summary.kind.clone(),

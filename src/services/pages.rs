@@ -790,11 +790,13 @@ fn describe(kind: &'static dyn Integration, outcome: Result<Snapshot, FetchError
     match outcome {
         Ok(snapshot) => {
             let status = status_name(snapshot.status);
+            let mut values = snapshot.values.clone();
+            integrations::localize_texts(kind.kind(), &mut values);
             let rows = kind
                 .metrics()
                 .iter()
                 .filter_map(|metric| {
-                    snapshot.values.get(metric.id).map(|value| TestRow {
+                    values.get(metric.id).map(|value| TestRow {
                         label: i18n::t(metric.label_key),
                         value: format_value(metric.format, value),
                     })
