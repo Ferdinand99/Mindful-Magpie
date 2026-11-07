@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use common::stub::{self, Answer, Stub};
 use common::{locale, log};
+use mindful_magpie::integrations::block::{self, Bar, Block};
 use mindful_magpie::integrations::{
     self, FetchCtx, FetchError, Integration, Level, Need, Snapshot, Status,
 };
@@ -61,21 +62,25 @@ fn healthy() -> Json {
             "capacity": { "kilobytes": { "used": "6200000000", "total": "10000000000" } },
             "parityCheckStatus": {
                 "running": false, "errors": 0, "date": "2026-11-01T02:00:00.000Z",
+                "duration": 29520,
             },
             "disks": [
-                { "status": "DISK_OK", "fsSize": "4000000000", "fsUsed": "2480000000", "fsFree": "1520000000" },
-                { "status": "DISK_OK", "fsSize": "4000000000", "fsUsed": "1000000000", "fsFree": "3000000000" },
-                { "status": "DISK_NP", "fsSize": null, "fsUsed": null, "fsFree": null },
+                { "name": "disk1", "temp": 34, "status": "DISK_OK", "fsSize": "4000000000", "fsUsed": "2480000000", "fsFree": "1520000000" },
+                { "name": "disk2", "temp": 31, "status": "DISK_OK", "fsSize": "4000000000", "fsUsed": "1000000000", "fsFree": "3000000000" },
+                { "name": "disk3", "temp": null, "status": "DISK_NP", "fsSize": null, "fsUsed": null, "fsFree": null },
             ],
             "caches": [
-                { "status": "DISK_OK", "fsSize": "500000000", "fsUsed": "90000000", "fsFree": "410000000" },
+                { "name": "cache", "temp": null, "status": "DISK_OK", "fsSize": "500000000", "fsUsed": "90000000", "fsFree": "410000000" },
             ],
         },
         "docker": { "containers": [
-            { "state": "RUNNING" }, { "state": "RUNNING" }, { "state": "EXITED" },
+            { "state": "RUNNING", "names": ["/plex"] },
+            { "state": "RUNNING", "names": ["/sonarr"] },
+            { "state": "EXITED", "names": ["/old-thing"] },
         ] },
         "info": { "os": { "hostname": "Tower" } },
         "metrics": { "cpu": { "percentTotal": 7.4 }, "memory": { "percentTotal": 41.2 } },
+        "notifications": { "overview": { "unread": { "total": 1, "alert": 0, "warning": 1 } } },
     } })
 }
 
@@ -906,4 +911,400 @@ async fn the_text_of_a_value_is_looked_up_by_a_safe_key_only() {
     // characters either: a hostile one finds nothing and shows the raw text.
     assert_eq!(value_label("../x", "array", "started"), "started");
     assert_eq!(value_label("unraid", "a.b", "started"), "started");
+}
+
+// ---------------------------------------------------------------------------
+// The details
+
+fn titles(s: &Snapshot) -> Vec<&str> {
+    s.details
+        .iter()
+        .map(|b| match b {
+            Block::List { title_key, .. }
+            | Block::Bars { title_key, .. }
+            | Block::Strip { title_key, .. }
+            | Block::Facts { title_key, .. } => title_key.as_str(),
+        })
+        .collect()
+}
+
+fn bars_of<'a>(s: &'a Snapshot, title: &str) -> Option<&'a Vec<Bar>> {
+    s.details.iter().find_map(|b| match b {
+        Block::Bars { title_key, bars } if title_key == title => Some(bars),
+        _ => None,
+    })
+}
+
+fn facts_of<'a>(s: &'a Snapshot, title: &str) -> Option<Vec<(&'a str, &'a str)>> {
+    s.details.iter().find_map(|b| match b {
+        Block::Facts { title_key, rows } if title_key == title => Some(
+            rows.iter()
+                .map(|r| (r.label_key.as_deref().unwrap_or(""), r.value.as_str()))
+                .collect(),
+        ),
+        _ => None,
+    })
+}
+
+/// `healthy()` as an Unraid without the extras of the full query answers it:
+/// no names or temperatures, no check length, no container names, no
+/// notifications.
+fn plain() -> Json {
+    let mut doc = healthy();
+    for group in ["disks", "caches"] {
+        for disk in doc["data"]["array"][group].as_array_mut().unwrap() {
+            let disk = disk.as_object_mut().unwrap();
+            disk.remove("name");
+            disk.remove("temp");
+        }
+    }
+    doc["data"]["array"]["parityCheckStatus"]
+        .as_object_mut()
+        .unwrap()
+        .remove("duration");
+    for container in doc["data"]["docker"]["containers"].as_array_mut().unwrap() {
+        container.as_object_mut().unwrap().remove("names");
+    }
+    doc["data"].as_object_mut().unwrap().remove("notifications");
+    doc["data"]["metrics"] = json!(null);
+    doc
+}
+
+#[tokio::test]
+async fn the_disks_become_bars_with_size_and_temperature() {
+    let (url, _) = serve(Answer::Json(healthy())).await;
+    let s = fetch(&url).await;
+    let bars = bars_of(&s, "unraid_disks").expect("the disks");
+    let got: Vec<_> = bars
+        .iter()
+        .map(|b| (b.label.as_str(), b.pct.round(), b.text.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("disk1", 62.0, "2.5 / 4.1 TB · 34 °C"),
+            ("disk2", 25.0, "1 / 4.1 TB · 31 °C"),
+            ("cache", 18.0, "92.2 / 512 GB"),
+        ],
+        "the empty slot has no bar, a missing temperature no text"
+    );
+}
+
+#[tokio::test]
+async fn the_parity_check_becomes_facts() {
+    let (url, _) = serve(Answer::Json(healthy())).await;
+    let s = fetch(&url).await;
+    assert_eq!(
+        facts_of(&s, "unraid_parity").expect("the parity facts"),
+        [
+            ("unraid_parity_last", "2026-11-01"),
+            ("unraid_parity_duration", "8 h 12 min"),
+            ("unraid_parity_errors", "0"),
+        ]
+    );
+    // A running check has no finished date or length, its errors stay.
+    let doc = with("/data/array/parityCheckStatus/running", json!(true));
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let s = fetch(&url).await;
+    assert_eq!(
+        facts_of(&s, "unraid_parity").unwrap(),
+        [("unraid_parity_errors", "0")]
+    );
+    // Errors are shown as the count.
+    let doc = with("/data/array/parityCheckStatus/errors", json!(12));
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let s = fetch(&url).await;
+    assert_eq!(
+        facts_of(&s, "unraid_parity").unwrap()[2],
+        ("unraid_parity_errors", "12")
+    );
+}
+
+#[tokio::test]
+async fn the_containers_that_are_not_running_are_listed_greyed() {
+    let doc = with(
+        "/data/docker/containers",
+        json!([
+            { "state": "RUNNING", "names": ["/plex"] },
+            { "state": "EXITED", "names": ["/old-thing"] },
+            { "state": "PAUSED", "names": ["paused-one"] },
+            { "state": "EXITED" },
+        ]),
+    );
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let s = fetch(&url).await;
+    let Some(Block::List { items, .. }) = s
+        .details
+        .iter()
+        .find(|b| matches!(b, Block::List { title_key, .. } if title_key == "unraid_stopped"))
+    else {
+        panic!("the stopped containers")
+    };
+    let got: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+    assert_eq!(
+        got,
+        ["old-thing", "paused-one"],
+        "no leading slash, no nameless"
+    );
+    assert!(items.iter().all(|i| i.status == Some(Status::Unknown)));
+    // The metrics still count all three of them.
+    assert_eq!(num(&s, "containers_stopped"), Some(3.0));
+    // No stopped container, no list.
+    let doc = with(
+        "/data/docker/containers",
+        json!([{ "state": "RUNNING", "names": ["/a"] }]),
+    );
+    let (url, _) = serve(Answer::Json(doc)).await;
+    assert!(!titles(&fetch(&url).await).contains(&"unraid_stopped"));
+}
+
+#[tokio::test]
+async fn unread_notifications_are_facts_only_when_there_are_some() {
+    let (url, _) = serve(Answer::Json(healthy())).await;
+    let s = fetch(&url).await;
+    assert_eq!(
+        facts_of(&s, "unraid_notices").expect("the notifications"),
+        [("unraid_unread", "1"), ("unraid_warnings", "1")]
+    );
+    let doc = with(
+        "/data/notifications/overview/unread",
+        json!({ "total": 3, "alert": 2, "warning": 0 }),
+    );
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let s = fetch(&url).await;
+    assert_eq!(
+        facts_of(&s, "unraid_notices").unwrap(),
+        [("unraid_unread", "3"), ("unraid_alerts", "2")]
+    );
+    let doc = with(
+        "/data/notifications/overview/unread",
+        json!({ "total": 0, "alert": 0, "warning": 0 }),
+    );
+    let (url, _) = serve(Answer::Json(doc)).await;
+    assert!(facts_of(&fetch(&url).await, "unraid_notices").is_none());
+}
+
+#[tokio::test]
+async fn the_blocks_come_in_order_every_key_resolves_and_the_numbers_are_unchanged() {
+    let _app = common::App::new().await;
+    let (url, stub) = serve(Answer::Json(healthy())).await;
+    let s = fetch(&url).await;
+    assert_eq!(
+        titles(&s),
+        [
+            "unraid_disks",
+            "unraid_parity",
+            "unraid_stopped",
+            "unraid_notices"
+        ]
+    );
+    for block in &s.details {
+        for key in block.keys() {
+            assert!(block::key_known(key), "{key}");
+        }
+    }
+    for (lang, file) in locale::LOCALES {
+        for key in [
+            "unraid_disks",
+            "unraid_parity",
+            "unraid_parity_last",
+            "unraid_parity_duration",
+            "unraid_parity_errors",
+            "unraid_stopped",
+            "unraid_notices",
+            "unraid_unread",
+            "unraid_alerts",
+            "unraid_warnings",
+        ] {
+            assert!(locale::has_text(file, "detail", key), "{lang}: {key}");
+        }
+    }
+    assert_eq!(s.status, Status::Ok);
+    assert_eq!(num(&s, "disk_used"), Some(62.0));
+    // The full query asks for what the details read, and still in one call.
+    let hits = stub.seen();
+    assert_eq!(hits.len(), 1);
+    let body: Json = serde_json::from_str(&hits[0].body).unwrap();
+    let query = body["query"].as_str().unwrap();
+    for part in ["temp", "names", "duration", "notifications", "name"] {
+        assert!(query.contains(part), "{part}");
+    }
+}
+
+#[tokio::test]
+async fn an_older_unraid_gives_the_core_figures_and_fewer_blocks() {
+    let full = {
+        let (url, _) = serve(Answer::Json(healthy())).await;
+        fetch(&url).await
+    };
+    // The full query is rejected; the core query is answered without the extras.
+    let core = Answer::Json(plain());
+    let stub_answer = Answer::With(Arc::new(move |hit| {
+        if hit.body.contains("metrics") {
+            validation_failed()
+        } else {
+            core.clone()
+        }
+    }));
+    let (url, stub) = serve(stub_answer).await;
+    let s = fetch(&url).await;
+    assert_eq!(s.status, Status::Ok);
+    assert_eq!(s.error, None);
+    assert_eq!(num(&s, "disk_used"), Some(62.0));
+    assert_eq!(num(&s, "containers_stopped"), Some(1.0));
+    // Only what the core query has: the parity date and errors.
+    assert_eq!(titles(&s), ["unraid_parity"]);
+    assert_eq!(
+        facts_of(&s, "unraid_parity").unwrap(),
+        [
+            ("unraid_parity_last", "2026-11-01"),
+            ("unraid_parity_errors", "0")
+        ]
+    );
+    assert!(s.details.len() < full.details.len());
+    // The core query asks for none of the new fields, so it still works there.
+    let seen = stub.seen();
+    assert_eq!(seen.len(), 2);
+    for part in ["temp", "names", "duration", "notifications", "name"] {
+        assert!(!seen[1].body.contains(part), "{part}: {}", seen[1].body);
+    }
+}
+
+#[tokio::test]
+async fn an_error_about_a_detail_field_is_silent() {
+    let denied = |path: Json| json!([{ "message": "no", "path": path, "extensions": { "code": "FORBIDDEN" } }]);
+    // The key may not read the notifications.
+    let mut doc = healthy();
+    doc["data"]["notifications"] = json!(null);
+    doc["errors"] = denied(json!(["notifications"]));
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let s = fetch(&url).await;
+    assert_eq!(s.status, Status::Ok);
+    assert_eq!(s.error, None);
+    assert!(!titles(&s).contains(&"unraid_notices"));
+    assert!(titles(&s).contains(&"unraid_disks"), "the rest stays");
+    // A disk's temperature, a disk's name, a container's names, the check's length.
+    for path in [
+        json!(["array", "disks", 0, "temp"]),
+        json!(["array", "caches", 0, "name"]),
+        json!(["docker", "containers", 2, "names"]),
+        json!(["array", "parityCheckStatus", "duration"]),
+    ] {
+        let mut doc = healthy();
+        doc["errors"] = denied(path.clone());
+        let (url, _) = serve(Answer::Json(doc)).await;
+        let s = fetch(&url).await;
+        assert_eq!((s.status, s.error.as_deref()), (Status::Ok, None), "{path}");
+    }
+    // An error about a core field of the same part still warns.
+    let mut doc = healthy();
+    doc["errors"] = denied(json!(["array", "disks", 0, "fsSize"]));
+    let (url, _) = serve(Answer::Json(doc)).await;
+    assert_eq!(fetch(&url).await.status, Status::Warn);
+}
+
+#[tokio::test]
+async fn blocks_are_cut_to_eight_keeping_the_fullest_disks_in_order() {
+    let mut doc = healthy();
+    let disks: Vec<Json> = (1..=20)
+        .map(|n| {
+            let used = if n == 13 { 900 } else { 100 + n };
+            json!({ "name": format!("disk{n}"), "fsSize": "1000000", "fsUsed": used.to_string() })
+        })
+        .collect();
+    doc["data"]["array"]["disks"] = json!(disks);
+    doc["data"]["array"]["caches"] = json!([]);
+    doc["data"]["docker"]["containers"] = json!(
+        (0..30)
+            .map(|n| json!({ "state": "EXITED", "names": [format!("/c{n}")] }))
+            .collect::<Vec<_>>()
+    );
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let mut s = fetch(&url).await;
+    s.bound_details();
+    let bars = bars_of(&s, "unraid_disks").unwrap();
+    assert_eq!(bars.len(), 8);
+    let labels: Vec<_> = bars.iter().map(|b| b.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        [
+            "disk13", "disk14", "disk15", "disk16", "disk17", "disk18", "disk19", "disk20"
+        ],
+        "the fullest eight, in the order of the array"
+    );
+    for block in &s.details {
+        let n = match block {
+            Block::List { items, .. } => items.len(),
+            Block::Bars { bars, .. } => bars.len(),
+            Block::Facts { rows, .. } => rows.len(),
+            Block::Strip { cells, .. } => cells.len(),
+        };
+        assert!(n <= block::MAX_ITEMS, "{block:?}");
+    }
+    assert!(s.details.len() <= block::MAX_BLOCKS);
+}
+
+#[tokio::test]
+async fn hostile_names_stay_text_and_out_of_needs_and_values() {
+    let hostile = "<script>alert(1)</script>\u{202E}\n";
+    let long = "d".repeat(500);
+    let mut doc = healthy();
+    doc["data"]["array"]["disks"][0]["name"] = json!(hostile);
+    doc["data"]["array"]["disks"][1]["name"] = json!(long);
+    doc["data"]["docker"]["containers"] = json!([
+        { "state": "EXITED", "names": [format!("/{hostile}")] },
+        { "state": "EXITED", "names": [long] },
+        { "state": "EXITED", "names": "\u{202E}\u{0}" },
+    ]);
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let mut s = fetch(&url).await;
+    s.bound_details();
+    let json = serde_json::to_string(&s.details).unwrap();
+    assert!(
+        !json.contains('\u{202E}') && !json.contains("\\n"),
+        "{json}"
+    );
+    assert!(
+        json.contains("<script>alert(1)</script>"),
+        "text, not removed"
+    );
+    for block in &s.details {
+        if let Block::List { items, .. } = block {
+            assert_eq!(items.len(), 2, "the nameless one is dropped");
+            for item in items {
+                assert!(item.text.chars().count() <= block::TEXT_CHARS);
+            }
+        }
+    }
+    let rest = format!("{:?}{:?}{:?}", s.values, s.needs, s.error);
+    assert!(!rest.contains("script") && !rest.contains("dddd"), "{rest}");
+}
+
+#[tokio::test]
+async fn odd_figures_cost_only_their_own_part_of_the_details() {
+    let mut doc = healthy();
+    doc["data"]["array"]["disks"] = json!([
+        { "name": "a", "temp": "hot", "fsSize": 1000, "fsUsed": 500 },
+        { "name": 5, "fsSize": 1000, "fsUsed": 500 },
+        { "name": "c", "temp": 9999, "fsSize": 0, "fsUsed": 0 },
+        { "name": "d", "temp": -3, "fsSize": 1000, "fsFree": 250 },
+    ]);
+    doc["data"]["array"]["caches"] = json!([]);
+    doc["data"]["array"]["parityCheckStatus"] =
+        json!({ "running": false, "errors": "x", "date": 5, "duration": "long" });
+    doc["data"]["notifications"] = json!({ "overview": { "unread": { "total": "many" } } });
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let s = fetch(&url).await;
+    let bars = bars_of(&s, "unraid_disks").unwrap();
+    let got: Vec<_> = bars
+        .iter()
+        .map(|b| (b.label.as_str(), b.text.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        [("a", "0.5 / 1 MB"), ("d", "0.8 / 1 MB")],
+        "no bar without a name or figures; a bad temperature is not shown"
+    );
+    assert!(!titles(&s).contains(&"unraid_parity"));
+    assert!(!titles(&s).contains(&"unraid_notices"));
 }

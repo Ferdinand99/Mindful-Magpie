@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use common::stub::{self, Answer, Stub};
 use common::{locale, log};
+use mindful_magpie::integrations::block::{self, Bar, Block, ListItem};
 use mindful_magpie::integrations::proxmox::{NodeRow, node_rows};
 use mindful_magpie::integrations::{
     self, FetchCtx, FetchError, Integration, Level, Snapshot, Status,
@@ -688,7 +689,8 @@ fn node_rows_come_from_the_same_answer() {
 async fn the_rows_are_not_in_the_snapshot() {
     let (url, _) = serve(Answer::Json(cluster())).await;
     let s = fetch(&url).await;
-    let all = format!("{s:?}{}", serde_json::to_string(&s).unwrap());
+    // Names are in the detail blocks only, never in a value or a need.
+    let all = format!("{:?}{:?}", s.values, s.needs);
     assert!(!all.contains("pve1") && !all.contains("pve2"), "{all}");
     assert!(s.needs.iter().all(|n| n.key.starts_with("pve:")));
 }
@@ -829,4 +831,279 @@ fn the_texts_read_like_the_other_app_kinds() {
             .unwrap()
             .contains("ASCII")
     );
+}
+
+// ---------------------------------------------------------------------------
+// The details
+
+fn bars_of<'a>(s: &'a Snapshot, title: &str) -> Option<&'a Vec<Bar>> {
+    s.details.iter().find_map(|b| match b {
+        Block::Bars { title_key, bars } if title_key == title => Some(bars),
+        _ => None,
+    })
+}
+
+fn list_of<'a>(s: &'a Snapshot, title: &str) -> Option<&'a Vec<ListItem>> {
+    s.details.iter().find_map(|b| match b {
+        Block::List { title_key, items } if title_key == title => Some(items),
+        _ => None,
+    })
+}
+
+fn titles(s: &Snapshot) -> Vec<&str> {
+    s.details.iter().flat_map(Block::keys).collect()
+}
+
+#[tokio::test]
+async fn the_nodes_become_bars_with_the_figures_in_the_text() {
+    let (url, stub) = serve(Answer::Json(cluster())).await;
+    let s = fetch(&url).await;
+    assert_eq!(stub.seen().len(), 1, "no call besides cluster/resources");
+    let bars = bars_of(&s, "pve_nodes").expect("the bars of the nodes");
+    let got: Vec<_> = bars
+        .iter()
+        .map(|b| (b.label.as_str(), b.pct.round(), b.text.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("pve1 CPU", 10.0, "10 % · 8 CPU"),
+            ("pve1 RAM", 25.0, "16 / 64 GB"),
+            ("pve1 Disk", 20.0, "20 / 100 GB"),
+            ("pve2 CPU", 30.0, "30 % · 8 CPU"),
+            ("pve2 RAM", 75.0, "48 / 64 GB"),
+            ("pve2 Disk", 60.0, "60 / 100 GB"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn one_node_has_bars_without_its_name_and_decimals_where_there_are_some() {
+    let doc = json!({ "data": [
+        { "type": "node", "node": "solo", "status": "online", "cpu": 0.256, "maxcpu": 4,
+          "mem": 25 * GIB + GIB * 6 / 10, "maxmem": 62 * GIB,
+          "disk": 3 * GIB, "maxdisk": 2 * 1024 * GIB },
+    ]});
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let s = fetch(&url).await;
+    let bars = bars_of(&s, "pve_nodes").unwrap();
+    let got: Vec<_> = bars
+        .iter()
+        .map(|b| (b.label.as_str(), b.text.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("CPU", "25.6 % · 4 CPU"),
+            ("RAM", "25.6 / 62 GB"),
+            ("Disk", "0 / 2 TB"),
+        ]
+    );
+    assert!(close(Some(bars[0].pct), 25.6));
+}
+
+#[tokio::test]
+async fn running_guests_are_listed_busiest_first_with_what_they_use() {
+    let mut doc = cluster();
+    doc["data"].as_array_mut().unwrap().push(json!(
+        { "id": "qemu/120", "type": "qemu", "vmid": 120, "name": "build", "node": "pve1",
+          "status": "running", "template": 0, "cpu": 0.382, "maxcpu": 4,
+          "mem": 11 * GIB, "maxmem": 32 * GIB }
+    ));
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let s = fetch(&url).await;
+    let items = list_of(&s, "pve_running").expect("the running guests");
+    let got: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+    assert_eq!(
+        got,
+        [
+            "build (VM 120)",
+            "db (VM 101)",
+            "web (VM 100)",
+            "svc (CT 110)"
+        ]
+    );
+    assert_eq!(items[0].sub.as_deref(), Some("4 vCPU · 11 / 32 GB RAM"));
+    assert_eq!(items[0].right.as_deref(), Some("38 % CPU"));
+    assert_eq!(items[0].status, Some(Status::Ok));
+    assert_eq!(items[1].sub.as_deref(), Some("3 / 8 GB RAM"));
+    assert_eq!(items[3].right.as_deref(), Some("0 % CPU"));
+}
+
+#[tokio::test]
+async fn stopped_guests_are_greyed_and_templates_are_left_out() {
+    let (url, _) = serve(Answer::Json(cluster())).await;
+    let s = fetch(&url).await;
+    let items = list_of(&s, "pve_stopped").expect("the stopped guests");
+    let got: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+    assert_eq!(got, ["old (VM 102)", "idle (CT 111)"], "no template");
+    assert!(items.iter().all(|i| i.status == Some(Status::Unknown)));
+    assert_eq!(items[0].sub.as_deref(), Some("4 GB RAM"));
+    assert_eq!(items[0].right, None);
+}
+
+#[tokio::test]
+async fn storage_is_listed_by_use_with_a_shared_storage_once() {
+    let (url, _) = serve(Answer::Json(cluster())).await;
+    let s = fetch(&url).await;
+    let bars = bars_of(&s, "pve_storage").expect("the storage bars");
+    let got: Vec<_> = bars
+        .iter()
+        .map(|b| (b.label.as_str(), b.pct.round(), b.text.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("local · pve2", 50.0, "50 / 100 GB"),
+            ("local · pve1", 30.0, "30 / 100 GB"),
+            ("nas", 20.0, "40 / 200 GB"),
+        ],
+        "the unavailable one is not there"
+    );
+}
+
+#[tokio::test]
+async fn the_blocks_come_in_the_order_of_the_card_and_every_key_resolves() {
+    let _app = common::App::new().await;
+    let (url, _) = serve(Answer::Json(cluster())).await;
+    let s = fetch(&url).await;
+    assert_eq!(
+        titles(&s),
+        ["pve_nodes", "pve_running", "pve_stopped", "pve_storage"]
+    );
+    let keys = [
+        "pve_nodes",
+        "pve_nodes_short",
+        "pve_running",
+        "pve_stopped",
+        "pve_storage",
+    ];
+    for key in keys {
+        assert!(block::key_known(key), "{key}");
+        for (lang, file) in locales() {
+            assert!(text_of(file, "detail", key).is_some(), "{lang}: {key}");
+        }
+    }
+    // The metrics and needs are as they were.
+    assert_eq!(num(&s, "guests_running"), Some(3.0));
+    assert_eq!(s.status, Status::Ok);
+}
+
+#[tokio::test]
+async fn many_nodes_get_cpu_and_ram_only_and_the_title_says_so() {
+    let node = |n: usize| {
+        json!({ "type": "node", "node": format!("n{n}"), "status": "online",
+                "cpu": 0.5, "mem": GIB, "maxmem": 2 * GIB, "disk": GIB, "maxdisk": 4 * GIB })
+    };
+    let four: Vec<Json> = (1..=4).map(node).collect();
+    let (url, _) = serve(Answer::Json(json!({ "data": four }))).await;
+    let s = fetch(&url).await;
+    assert!(bars_of(&s, "pve_nodes").is_none());
+    let bars = bars_of(&s, "pve_nodes_short").expect("the short title");
+    assert_eq!(bars.len(), 8);
+    assert!(bars.iter().all(|b| !b.label.contains("Disk")));
+    // Two nodes fit with their disks: six bars.
+    let two: Vec<Json> = (1..=2).map(node).collect();
+    let (url, _) = serve(Answer::Json(json!({ "data": two }))).await;
+    let s = fetch(&url).await;
+    assert_eq!(bars_of(&s, "pve_nodes").unwrap().len(), 6);
+}
+
+#[tokio::test]
+async fn the_blocks_are_cut_to_eight_and_keep_the_busiest_guests() {
+    let mut data: Vec<Json> =
+        vec![json!({ "type": "node", "node": "pve1", "status": "online", "cpu": 0.1 })];
+    for i in 0..30 {
+        data.push(
+            json!({ "type": "qemu", "vmid": 100 + i, "name": format!("vm{i}"),
+            "status": "running", "cpu": (i as f64) / 100.0 }),
+        );
+        data.push(
+            json!({ "type": "lxc", "vmid": 300 + i, "name": format!("ct{i}"),
+            "status": "stopped" }),
+        );
+        data.push(
+            json!({ "type": "storage", "storage": format!("s{i}"), "node": "pve1",
+            "status": "available", "disk": i, "maxdisk": 100 }),
+        );
+    }
+    let (url, _) = serve(Answer::Json(json!({ "data": data }))).await;
+    let mut s = fetch(&url).await;
+    s.bound_details();
+    for block in &s.details {
+        let n = match block {
+            Block::List { items, .. } => items.len(),
+            Block::Bars { bars, .. } => bars.len(),
+            other => panic!("{other:?}"),
+        };
+        assert!(n <= block::MAX_ITEMS, "{block:?}");
+    }
+    let running = list_of(&s, "pve_running").unwrap();
+    assert_eq!(running.len(), 8);
+    assert_eq!(running[0].text, "vm29 (VM 129)", "the busiest first");
+    assert_eq!(running[7].text, "vm22 (VM 122)");
+    let storage = bars_of(&s, "pve_storage").unwrap();
+    assert_eq!(storage[0].label, "s29", "the fullest first");
+    assert!(s.details.len() <= block::MAX_BLOCKS);
+}
+
+#[tokio::test]
+async fn hostile_names_stay_text_and_out_of_needs_and_values() {
+    let hostile = "<img src=x onerror=alert(1)>\u{202E}\n";
+    let long = "n".repeat(500);
+    let doc = json!({ "data": [
+        { "type": "node", "node": hostile, "status": "online", "cpu": 0.1,
+          "mem": 1, "maxmem": 2, "disk": 1, "maxdisk": 2 },
+        { "type": "node", "node": long, "status": "offline" },
+        { "type": "qemu", "vmid": 1, "name": hostile, "status": "running", "cpu": 0.5 },
+        { "type": "lxc", "vmid": 2, "name": long, "status": "stopped" },
+        { "type": "storage", "storage": hostile, "node": hostile, "status": "available",
+          "disk": 9, "maxdisk": 10 },
+    ]});
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let mut s = fetch(&url).await;
+    s.bound_details();
+    assert_eq!(s.details.len(), 4);
+    let json = serde_json::to_string(&s.details).unwrap();
+    assert!(
+        !json.contains('\u{202E}') && !json.contains("\\n"),
+        "{json}"
+    );
+    // The markup is only text in a line, and no line is longer than a line may be.
+    assert!(json.contains("<img src=x onerror=alert(1)>"));
+    let Block::List { items, .. } = &s.details[2] else {
+        panic!("the stopped list")
+    };
+    assert!(items[0].text.chars().count() <= block::TEXT_CHARS);
+    assert!(
+        items[0].text.ends_with("(CT 2)"),
+        "the id is kept: {}",
+        items[0].text
+    );
+    // Nothing outside the blocks has a name.
+    let rest = format!("{:?}{:?}{:?}", s.values, s.needs, s.error);
+    assert!(!rest.contains("img") && !rest.contains("nnnn"), "{rest}");
+}
+
+#[tokio::test]
+async fn odd_answers_give_fewer_blocks_and_never_a_panic() {
+    let doc = json!({ "data": [
+        { "type": "node", "node": "a", "status": "online", "cpu": 0.2 },
+    ]});
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let s = fetch(&url).await;
+    assert_eq!(titles(&s), ["pve_nodes"]);
+    assert_eq!(bars_of(&s, "pve_nodes").unwrap().len(), 1, "CPU only");
+    // Odd figures cost only their own bar.
+    let doc = json!({ "data": [
+        { "type": "node", "node": "a", "status": "online", "cpu": "x", "mem": -1, "maxmem": 0,
+          "disk": 1, "maxdisk": 2 },
+        { "type": "storage", "storage": "s", "status": "available", "disk": "x", "maxdisk": 10 },
+        { "type": "qemu", "vmid": "x", "status": "running", "cpu": "y" },
+    ]});
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let s = fetch(&url).await;
+    assert_eq!(bars_of(&s, "pve_nodes").unwrap()[0].label, "Disk");
+    assert_eq!(list_of(&s, "pve_running").unwrap()[0].text, "VM");
+    assert!(bars_of(&s, "pve_storage").is_none());
 }
