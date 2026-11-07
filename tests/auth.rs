@@ -9,6 +9,23 @@ use common::{App, PASSWORD, Web, add_user};
 use vole_kit::auth::session;
 use vole_kit::db::migrate;
 
+/// Closes `/setup` behind the token for the calling thread and puts the
+/// default back on drop, also when the test fails.
+struct SetupClosed;
+
+impl SetupClosed {
+    fn new() -> SetupClosed {
+        session::set_setup_open_for_tests(Some(false));
+        SetupClosed
+    }
+}
+
+impl Drop for SetupClosed {
+    fn drop(&mut self) {
+        session::set_setup_open_for_tests(None);
+    }
+}
+
 /// The `/setup` form of the first administrator.
 fn setup_form(token: &str) -> Vec<(&str, &str)> {
     vec![
@@ -32,7 +49,7 @@ async fn first_run_redirects_to_setup() {
 #[tokio::test]
 async fn setup_creates_the_first_admin() {
     // The kit's default: /setup needs the setup token.
-    session::set_setup_open_for_tests(Some(false));
+    let _closed = SetupClosed::new();
     let token = session::required_setup_token().expect("setup needs a token");
     let app = App::new().await;
     let mut web = Web::anonymous(&app);
@@ -53,7 +70,6 @@ async fn setup_creates_the_first_admin() {
     assert!(web.cookies.contains_key("mm_session"));
     let home = web.get("/").await;
     assert_eq!(home.status, StatusCode::OK, "{}", home.body);
-    session::set_setup_open_for_tests(None);
 }
 
 #[tokio::test]
@@ -165,4 +181,24 @@ async fn data_survives_restart() {
             .await,
         names.len() as i64
     );
+}
+
+#[tokio::test]
+async fn settings_home_goes_to_the_first_tab_the_user_may_open() {
+    let app = App::new().await;
+    let mut ada = Web::new(&app, "ada", "admin").await;
+    let res = ada.get("/settings").await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    assert_eq!(res.header("location"), "/settings/general");
+
+    let mut gina = Web::new(&app, "gina", "viewer").await;
+    let res = gina.get("/settings").await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    assert_eq!(res.header("location"), "/settings/security");
+    assert_eq!(gina.get("/settings/security").await.status, StatusCode::OK);
+
+    let mut anon = Web::anonymous(&app);
+    let res = anon.get("/settings").await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    assert!(res.header("location").starts_with("/login"));
 }

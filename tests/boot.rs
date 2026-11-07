@@ -38,5 +38,7 @@ async fn api_docs_render_for_a_signed_in_admin() {
     let mut web = Web::new(&app, "ada", "admin").await;
     let res = web.get("/api-docs").await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    assert!(res.body.contains("Mindful Magpie"), "{}", res.body);
+    // Only the docs page links the OpenAPI document and the Markdown copy.
+    assert!(res.body.contains("/api/v1/openapi.json"), "{}", res.body);
+    assert!(res.body.contains("/api-docs.md"), "{}", res.body);
 }

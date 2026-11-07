@@ -4,7 +4,7 @@
 use askama::Template;
 use axum::Router;
 use axum::extract::State;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Redirect};
 use axum::routing::get;
 use axum_extra::extract::cookie::SignedCookieJar;
 use vole_kit::auth::CurrentUser;
@@ -15,7 +15,9 @@ use vole_kit::state::Core;
 
 /// Pages for signed-in users (the caller adds the sign-in guard).
 pub fn router() -> Router<Core> {
-    Router::new().route("/", get(start))
+    Router::new()
+        .route("/", get(start))
+        .route("/settings", get(settings_home))
 }
 
 #[derive(Template)]
@@ -39,4 +41,14 @@ async fn start(
     )
     .await;
     Ok((jar, HtmlTemplate(StartPage { ctx })))
+}
+
+/// The Settings nav item: the first tab the user may open (General for
+/// admins, Security for everyone else).
+async fn settings_home(user: CurrentUser) -> Redirect {
+    Redirect::to(if user.is_admin() {
+        "/settings/general"
+    } else {
+        "/settings/security"
+    })
 }
