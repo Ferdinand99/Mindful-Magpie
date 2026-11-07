@@ -4,8 +4,9 @@
 //!
 //! An older Vigilant Vole (before 0.17.0) has no `/summary`: it answers 404.
 //! The kind then asks `GET /api/v1/health`, which has the counts but no uptime
-//! figures, and remembers for an hour that this address is old, so it does not
-//! ask `/summary` again at every poll.
+//! figures, and remembers for a few minutes (see [`api::OLD_FOR`]) that this
+//! address is old, so it does not ask `/summary` again at every poll. Saving or
+//! testing the service makes it ask again at once.
 //!
 //! The service's secret is a read token, sent as `Authorization: Bearer`.
 //! Monitor names come from outside: they are shown only as the text value

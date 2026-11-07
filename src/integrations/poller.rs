@@ -424,7 +424,14 @@ impl Supervisor {
 
     async fn reload(&mut self, id: i64) {
         match store::get(&self.core, id).await {
-            Ok(Some(service)) => self.spawn(service, Duration::ZERO),
+            Ok(Some(service)) => {
+                // Saved again, or announced: an app that was too old a few
+                // minutes ago may have been upgraded since.
+                if let Some(url) = &service.url {
+                    super::api::forget_all_for(url);
+                }
+                self.spawn(service, Duration::ZERO);
+            }
             Ok(None) => self.remove(id).await,
             Err(err) => tracing::warn!(service_id = id, %err, "poller can't read the service"),
         }

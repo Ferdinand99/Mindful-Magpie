@@ -38,7 +38,7 @@ use super::{
 };
 use crate::Magpie;
 use crate::integrations::{
-    self, FetchCtx, FetchError, FieldKind, Format, Integration, Snapshot, Status, Value,
+    self, FetchCtx, FetchError, FieldKind, Format, Integration, Snapshot, Status, Value, api,
 };
 
 /// The most a service form is allowed to send.
@@ -642,6 +642,13 @@ async fn update(
     match result {
         Ok(()) => {
             tracing::info!(admin = %user.username, service_id = id, kind = kind.kind(), "service updated");
+            // An app that was too old a minute ago may not be now.
+            for url in [service.url.as_deref(), parsed.input.url.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                api::forget_all_for(url);
+            }
             announce(&magpie, ServiceEvent::Updated(id));
             Ok(done(jar, "service.saved"))
         }
@@ -865,6 +872,10 @@ async fn test(State(core): State<Core>, user: CurrentUser, body: Bytes) -> ApiRe
     let mut settings = input.settings.as_object().cloned().unwrap_or_default();
     if let Some(url) = &input.url {
         settings.insert("url".into(), Json::String(url.clone()));
+    }
+    // Fetches the kind remembered as too old are asked again.
+    if let Some(url) = &input.url {
+        api::forget_all_for(url);
     }
     let ctx = FetchCtx {
         http: integrations::client().clone(),

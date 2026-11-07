@@ -5,8 +5,9 @@
 //! unresolved, crash-free sessions and today's visitors and app users, added
 //! up over every project, plus each project's newest issue. The endpoint
 //! shipped in Keen Kestrel 0.10.0; an older server answers 404, which this
-//! kind turns into [`FetchError::KkTooOld`] and does not ask again for an
-//! hour.
+//! kind turns into [`FetchError::KkTooOld`] and does not ask again for a few
+//! minutes (see [`api::OLD_FOR`]; saving or testing the service asks again at
+//! once).
 //!
 //! The token is sent as `Authorization: Bearer` and is marked sensitive, so
 //! it stays out of debug output. Nothing here puts a token, an address or a
