@@ -63,6 +63,12 @@ jobs:
         working-directory: web
         run: node --test
 
+      # Mozilla's manifest and code checks for the extension. Errors fail the job. The extension
+      # is signed unlisted (see extension.yml), so this is the self-hosted lint profile.
+      - name: Lint the extension
+        working-directory: web
+        run: npx --no-install web-ext lint --source-dir ../extension --self-hosted
+
   # THIRD-PARTY-NOTICES holds the licence texts of the Rust crates in the image. It is made from
   # the dependencies (scripts/notices.sh), so a changed dependency makes it stale: this job fails
   # then. It also fails when a

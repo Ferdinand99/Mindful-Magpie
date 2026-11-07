@@ -34,3 +34,25 @@ the shared renderer of the start page replaces it in a later task.
 - `placeholder.js`: placeholder drawing and status line (tested).
 - `newtab.*`, `options.*`, `shell.css`: the pages.
 - Tests: `web/extension-*.test.mjs`, run with `npm ci && node --test` in `web/`.
+
+## Signing and installing
+
+Firefox only installs a permanent extension that Mozilla has signed. Magpie signs it on the
+unlisted channel (addons.mozilla.org, "On your own"): it is not in the public catalogue.
+
+To release a new version:
+
+1. Change `version` in `extension/manifest.json` (for example `0.1.0` to `0.2.0`) and merge it to
+   `main`. Mozilla refuses to sign a version twice, so every release needs a new number.
+2. Tag the commit `extension-vX.Y.Z` (the same number) and push the tag.
+   `.github/workflows/extension.yml` then lints, builds, signs and publishes. It fails when the tag
+   and the manifest version differ. A manual run (Actions, Extension, Run workflow, with the
+   version) does the same without a pushed tag.
+
+The signed file is `mindful-magpie-X.Y.Z.xpi` on the release `extension-vX.Y.Z`
+(https://github.com/Ferdinand99/Mindful-Magpie/releases). To install it, open the `.xpi` link in
+Firefox and accept the prompt, or download the file and drag it into a Firefox window. Firefox
+updates are not automatic: install the next `.xpi` over the old one.
+
+The repository secrets `AMO_JWT_ISSUER` and `AMO_JWT_SECRET` (an API key from addons.mozilla.org,
+Developer Hub, Manage API Keys) are used by the sign step only. Nothing signs locally.

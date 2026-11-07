@@ -1,0 +1,148 @@
+# Signs the Firefox extension (extension/) with Mozilla (AMO, unlisted channel) and attaches the
+# signed .xpi to a GitHub release:
+#
+#   push tag extension-vX.Y.Z -> lint, check the manifest version, build, sign, release
+#   manual run                -> same, with the version as an input (Use workflow from: the
+#                                commit to release, normally main); the tag is created by the release
+#
+# The version in extension/manifest.json must equal X.Y.Z. AMO refuses to sign the same version
+# twice, so a failed release after a successful signing needs a new version. Pull requests only
+# run `web-ext lint` (ci.yml). Secrets AMO_JWT_ISSUER and AMO_JWT_SECRET are used by the sign step
+# only and are never printed.
+name: Extension
+
+on:
+  push:
+    tags: ["extension-v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Extension version to sign and release (X.Y.Z, equal to extension/manifest.json)
+        type: string
+        required: true
+
+concurrency:
+  group: extension-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    name: Build and sign
+    runs-on: ubuntu-24.04
+    # AMO unlisted signing normally takes a few minutes; web-ext waits up to 15 minutes for it.
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Install
+        working-directory: web
+        run: npm ci --no-audit --no-fund
+
+      # The tag (or the manual input) names the version; the manifest must agree with it.
+      - name: The manifest version equals the release version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            version="${INPUT_VERSION#extension-v}"
+          elif [ "$REF_TYPE" = "tag" ]; then
+            version="${REF_NAME#extension-v}"
+          else
+            echo "::error::Run this workflow on a tag (extension-vX.Y.Z) or with a version input."
+            exit 1
+          fi
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::'$version' is not a version like 1.2.3."
+            exit 1
+          fi
+          manifest="$(node -p "require('./extension/manifest.json').version")"
+          if [ "$manifest" != "$version" ]; then
+            echo "::error::extension/manifest.json has version $manifest but the release is $version. Bump the manifest, then tag again."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Lint
+        working-directory: web
+        run: npx --no-install web-ext lint --source-dir ../extension --self-hosted
+
+      - name: Tests
+        working-directory: web
+        run: node --test
+
+      - name: Build
+        working-directory: web
+        run: npx --no-install web-ext build --source-dir ../extension --artifacts-dir "$RUNNER_TEMP/build"
+
+      # The secrets go in through the environment of this step only. web-ext does not print them.
+      - name: Sign with Mozilla (unlisted)
+        working-directory: web
+        env:
+          AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
+          AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+        run: |
+          npx --no-install web-ext sign \
+            --source-dir ../extension \
+            --artifacts-dir "$RUNNER_TEMP/signed" \
+            --channel unlisted \
+            --approval-timeout 900000 \
+            --api-key "$AMO_JWT_ISSUER" \
+            --api-secret "$AMO_JWT_SECRET"
+
+      - name: Name the signed file
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          count="$(find "$RUNNER_TEMP/signed" -maxdepth 1 -name '*.xpi' | wc -l)"
+          if [ "$count" -ne 1 ]; then
+            echo "::error::Expected one signed .xpi, found $count."
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/release"
+          mv "$RUNNER_TEMP/signed"/*.xpi "$RUNNER_TEMP/release/mindful-magpie-${VERSION}.xpi"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mindful-magpie-xpi
+          path: ${{ runner.temp }}/release/mindful-magpie-${{ steps.version.outputs.version }}.xpi
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: GitHub release
+    needs: sign
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: mindful-magpie-xpi
+          path: release
+
+      # --latest=false keeps the app release (vX.Y.Z from release-please) as the latest release.
+      # The tag is created on the run's commit when it does not exist (manual run).
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.sign.outputs.version }}
+        run: |
+          gh release create "extension-v${VERSION}" "release/mindful-magpie-${VERSION}.xpi" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Firefox extension ${VERSION}" \
+            --notes "Signed Mindful Magpie extension for Firefox (unlisted, signed by Mozilla). Open mindful-magpie-${VERSION}.xpi in Firefox to install it." \
+            --latest=false

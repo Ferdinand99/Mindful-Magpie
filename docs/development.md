@@ -76,6 +76,26 @@ scripts/test-notices-fail.sh # proves the check stops on a licence that is not a
 A new licence must be added to `accepted` in `about.toml` on purpose. The image carries the file and `LICENSE` in
 `/usr/share/doc/mindful-magpie/`.
 
+## Signing the extension
+
+`extension/` is the Firefox extension. `web/` holds its test tooling, including the pinned `web-ext`. CI runs
+`npx web-ext lint --source-dir ../extension --self-hosted` in the `Web tests (extension)` job on every pull
+request. Run the same commands on the build host:
+
+```bash
+cd web && npm ci
+node --test
+npx web-ext lint --source-dir ../extension --self-hosted
+npx web-ext build --source-dir ../extension --artifacts-dir /tmp/out   # a zip, not signed
+```
+
+Signing happens only in `extension.yml`, never on a workstation. To release: bump `version` in
+`extension/manifest.json`, merge, then push the tag `extension-vX.Y.Z` (same number). The workflow checks the
+manifest version against the tag, builds, signs on the unlisted channel with the secrets `AMO_JWT_ISSUER` and
+`AMO_JWT_SECRET`, and attaches `mindful-magpie-X.Y.Z.xpi` to the release `extension-vX.Y.Z`. That release is not
+marked as latest, so the app release stays the latest one. Mozilla signs a version once: when a run fails after
+signing, bump the version and tag again. Install: open the `.xpi` URL in Firefox or drag the file in.
+
 ## CI and releases
 
 - `ci.yml`: format, clippy with `-D warnings` and tests; the notices check; on pull requests a Docker build for
@@ -85,3 +105,5 @@ A new licence must be added to `accepted` in `about.toml` on purpose. The image 
   Commits). Merging it tags `vX.Y.Z`, creates the release and calls `docker-publish.yml`. The first release is 0.1.0.
 - `docker-publish.yml`: publishes the multi-arch image `ghcr.io/ferdinand99/mindful-magpie` (`:X.Y.Z`, `:X.Y`, `:X`,
   `:latest`) on release tags only, never from `main`.
+- `extension.yml`: on a tag `extension-vX.Y.Z` (or a manual run), signs the Firefox extension with Mozilla and
+  attaches the `.xpi` to a release (see "Signing the extension").
