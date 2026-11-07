@@ -705,6 +705,9 @@ fn is_config_error(snapshot: &Snapshot) -> bool {
             FetchError::Auth,
             // An admin has to upgrade Keen Kestrel.
             FetchError::KkTooOld,
+            // ... or give the key another role.
+            FetchError::NotAdmin,
+            FetchError::NothingVisible,
         ]
         .iter()
         .any(|e| text == e.to_string())

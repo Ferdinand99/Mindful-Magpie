@@ -18,7 +18,6 @@ use std::time::Duration;
 
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp, civil};
-use reqwest::header::HeaderValue;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use url::Url;
@@ -116,7 +115,7 @@ impl Integration for WwKind {
     fn fetch<'a>(&'a self, ctx: &'a FetchCtx) -> BoxFuture<'a, Result<Snapshot, FetchError>> {
         Box::pin(async move {
             let base = api::base_url(&ctx.settings)?;
-            let auth = api::bearer(ctx.secret.as_deref())?;
+            let auth = api::Credential::bearer(ctx.secret.as_deref())?;
 
             let runs_query = format!("limit={RUN_LIMIT}");
             let (servers, updates, runs) = tokio::join!(
@@ -210,7 +209,7 @@ async fn call<T: DeserializeOwned>(
     base: &Url,
     last: &str,
     query: Option<&str>,
-    auth: &HeaderValue,
+    auth: &api::Credential,
 ) -> Result<T, FetchError> {
     let url = api::endpoint(base, &["api", "v1", last], query)?;
     api::get_json(&ctx.http, url, auth).await?.found()

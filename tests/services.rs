@@ -1166,17 +1166,24 @@ async fn test_never_sends_a_stored_secret_to_another_address() {
 }
 
 #[tokio::test]
-async fn a_redirect_to_another_origin_drops_the_authorization_header() {
+async fn a_redirect_to_another_origin_is_refused_when_a_secret_is_sent() {
     let (a, _, log_a) = recorder().await;
     let (_, port_b, log_b) = recorder().await;
     let snap = fetch(&format!("{a}/jump/{port_b}"), Some(SECRET)).await;
+    assert_eq!(snap.status, Status::Bad);
+    assert_eq!(snap.error.as_deref(), Some("redirect not allowed"));
+    assert!(log_a.lock().unwrap().is_empty(), "A only redirected");
+    assert!(log_b.lock().unwrap().is_empty(), "B saw nothing");
+}
+
+#[tokio::test]
+async fn a_redirect_to_another_origin_is_followed_when_no_secret_is_sent() {
+    let (a, _, log_a) = recorder().await;
+    let (_, port_b, log_b) = recorder().await;
+    let snap = fetch(&format!("{a}/jump/{port_b}"), None).await;
     assert_eq!(snap.status, Status::Ok, "{:?}", snap.error);
     assert!(log_a.lock().unwrap().is_empty(), "A only redirected");
-    assert_eq!(
-        *log_b.lock().unwrap(),
-        [None],
-        "B got no Authorization header"
-    );
+    assert_eq!(*log_b.lock().unwrap(), [None], "B was reached");
 }
 
 #[tokio::test]

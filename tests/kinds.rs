@@ -7,6 +7,9 @@ use std::collections::HashMap;
 use mindful_magpie::integrations::{self, Integration};
 
 const KINDS: [&str; 3] = ["vv", "kk", "ww"];
+/// Every kind the build lists: the three above share one form, the others
+/// have their own (and their own tests).
+const ALL: [&str; 7] = ["http", "vv", "kk", "ww", "proxmox", "unraid", "tofa"];
 
 /// The texts of one `[section]` of a locale file.
 fn section(file: &str, wanted: &str) -> HashMap<String, String> {
@@ -46,6 +49,18 @@ fn every_kind_is_registered_once() {
     unique.sort_unstable();
     unique.dedup();
     assert_eq!(unique.len(), names.len());
+}
+
+#[test]
+fn the_build_lists_every_kind_once() {
+    let mut names: Vec<_> = integrations::registry().iter().map(|k| k.kind()).collect();
+    names.sort_unstable();
+    let mut all = ALL.to_vec();
+    all.sort_unstable();
+    assert_eq!(names, all);
+    for name in ALL {
+        assert!(integrations::find(name).is_some(), "{name}");
+    }
 }
 
 #[test]
