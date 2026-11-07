@@ -683,7 +683,7 @@ async fn an_unreadable_layout_reports_the_version_it_was_read_at() {
 }
 
 // ---------------------------------------------------------------------------
-// Cards bound to a service (Plan 4, task 3b)
+// Cards bound to a service
 
 fn bound(metrics: &[&str]) -> ServiceRef {
     ServiceRef {

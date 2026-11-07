@@ -182,7 +182,7 @@ impl<'a> Web<'a> {
     }
 
     /// Adds a user with `role` and signs in (needs the kit auth routes, which
-    /// are mounted from the auth task on).
+    /// are mounted).
     pub async fn new(app: &'a App, name: &'static str, role: &'static str) -> Web<'a> {
         add_user(app, name, role).await;
         let mut b = Web::anonymous(app);

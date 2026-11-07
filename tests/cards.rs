@@ -1,4 +1,4 @@
-//! Cards bound to services (Plan 4, task 3b): the save checks, the `#mm-services`
+//! Cards bound to services: the save checks, the `#mm-services`
 //! embed, the extension's API, and what a user who cannot see a service learns
 //! about it (nothing).
 
@@ -465,7 +465,7 @@ async fn an_old_layout_without_service_loads_and_saves_unchanged() {
     let app = App::new().await;
     let mut admin = Web::new(&app, "ada", "admin").await;
     let ada = user_id(&app, "ada").await;
-    // What Plan 2's page stored: no `service` anywhere.
+    // What a page stored before cards could be bound to services: no `service` anywhere.
     let old = doc(0, vec![bound_card("c1", None)]);
     let stored = serde_json::to_string(&old).unwrap();
     app.magpie
