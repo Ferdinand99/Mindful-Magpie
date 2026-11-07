@@ -5,15 +5,25 @@
 //!
 //! The service's secret, when it has one, is sent as `Authorization: Bearer`,
 //! and then a redirect to another origin is refused.
+//!
+//! **Details.** Facts of the last check (status, response time, when), and,
+//! for a stored service, the shortest, mean and longest response time of the
+//! last hour. The hour is a small window kept in memory per service (at most
+//! [`WINDOW_MAX`] answers; forgotten when the service is saved or tested, see
+//! [`api::on_forget`]) until history is kept in the database.
 
+use std::collections::VecDeque;
 use std::ops::RangeInclusive;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use jiff::{SignedDuration, Timestamp};
 use serde_json::Value as Json;
 use url::Url;
 use vole_kit::net::check_host;
 
 use super::api;
+use super::block::{Block, Fact};
 use super::{
     BoxFuture, FetchCtx, FetchError, Field, FieldKind, Format, Integration, MetricDef,
     SettingError, Snapshot, Status, Value, classify, read_capped,
@@ -27,6 +37,24 @@ pub struct HttpKind;
 
 /// The statuses that count as well when the service names none.
 const DEFAULT_EXPECTED: RangeInclusive<u16> = 200..=399;
+
+/// How far back the window of response times reaches.
+const WINDOW_FOR: SignedDuration = SignedDuration::from_hours(1);
+/// Most answers one service's window holds (a check every 15 s, the shortest
+/// interval, makes 240 in an hour).
+pub const WINDOW_MAX: usize = 300;
+/// Most services whose window is kept; past that the one used longest ago goes.
+pub const MEMORY_MAX: usize = 64;
+
+/// A service as the window knows it: its address (see [`api::service_prefix`])
+/// and its number.
+type WindowKey = (String, i64);
+
+/// The response times of the last hour, in milliseconds, per service.
+static MEMORY: Mutex<VecDeque<(WindowKey, Samples)>> = Mutex::new(VecDeque::new());
+
+/// When each answer came and how long it took, in milliseconds.
+type Samples = VecDeque<(Timestamp, f64)>;
 
 static FIELDS: [Field; 2] = [
     Field {
@@ -84,6 +112,119 @@ pub fn parse_expected(text: &str) -> Option<Vec<RangeInclusive<u16>>> {
         ranges.push(low..=high);
     }
     Some(ranges)
+}
+
+/// The shortest, mean and longest response time of the window, and how many
+/// answers it holds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Range {
+    min: f64,
+    mean: f64,
+    max: f64,
+    count: usize,
+}
+
+/// Takes `latency_ms` (when the site answered) at `now` into the window of
+/// `key` and gives what the window holds. The window is cut to the last hour
+/// and to [`WINDOW_MAX`] answers; the list of windows to [`MEMORY_MAX`], the
+/// one used longest ago going first.
+fn window(key: &WindowKey, now: Timestamp, latency_ms: Option<f64>) -> Option<Range> {
+    // Saving or testing the service forgets its window.
+    api::on_forget(forget);
+    // A panic elsewhere cannot leave the list in a state that matters.
+    let mut list = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut entry = match list.iter().position(|(k, _)| k == key) {
+        Some(at) => list.remove(at).expect("the position is in the list"),
+        None => {
+            while list.len() >= MEMORY_MAX {
+                list.pop_front();
+            }
+            (key.clone(), VecDeque::new())
+        }
+    };
+    let samples = &mut entry.1;
+    if let Some(ms) = latency_ms.filter(|ms| ms.is_finite()) {
+        samples.push_back((now, ms));
+    }
+    samples.retain(|(at, _)| now.duration_since(*at) <= WINDOW_FOR);
+    while samples.len() > WINDOW_MAX {
+        samples.pop_front();
+    }
+    let range = range(samples.iter().map(|(_, ms)| *ms));
+    list.push_back(entry);
+    range
+}
+
+fn range(times: impl Iterator<Item = f64>) -> Option<Range> {
+    let (mut min, mut max, mut sum, mut count) = (f64::INFINITY, f64::NEG_INFINITY, 0.0, 0_usize);
+    for ms in times {
+        min = min.min(ms);
+        max = max.max(ms);
+        sum += ms;
+        count += 1;
+    }
+    (count > 0).then(|| Range {
+        min,
+        mean: sum / count as f64,
+        max,
+        count,
+    })
+}
+
+/// Forgets the window of the service at `prefix` (see [`api::service_prefix`]).
+fn forget(prefix: &str) {
+    MEMORY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|((key, _), _)| key != prefix);
+}
+
+fn fact(label_key: &str, value: String) -> Fact {
+    Fact {
+        label_key: Some(label_key.to_string()),
+        label: None,
+        value,
+    }
+}
+
+/// The blocks of a check: its facts, and the last hour's range when the window
+/// holds at least two answers (one says nothing a range could).
+fn details(
+    code: Option<u16>,
+    latency_ms: Option<f64>,
+    at: Timestamp,
+    hour: Option<Range>,
+) -> Vec<Block> {
+    let mut rows = Vec::new();
+    if let Some(code) = code {
+        rows.push(fact("http_status", code.to_string()));
+    }
+    if let Some(ms) = latency_ms {
+        rows.push(fact("http_latency", format!("{ms:.0} ms")));
+    }
+    // UTC, in a form every language reads; the renderer does not know this
+    // text is a time.
+    rows.push(fact(
+        "http_checked",
+        at.strftime("%Y-%m-%d %H:%M UTC").to_string(),
+    ));
+    let mut blocks = vec![Block::Facts {
+        title_key: "http_last_check".to_string(),
+        rows,
+    }];
+    if let Some(hour) = hour.filter(|r| r.count >= 2) {
+        blocks.push(Block::Facts {
+            title_key: "http_last_hour".to_string(),
+            rows: vec![
+                fact(
+                    "http_latency_range",
+                    format!("{:.0} / {:.0} / {:.0} ms", hour.min, hour.mean, hour.max),
+                ),
+                fact("http_samples", hour.count.to_string()),
+            ],
+        });
+    }
+    blocks
 }
 
 /// `snapshot` with the `checked` metric: when the reading was taken, also when
@@ -163,6 +304,9 @@ impl Integration for HttpKind {
         Box::pin(async move {
             let url = target(&ctx.settings)?;
             let expected = expected(&ctx.settings)?;
+            // The window is kept for a stored service only (a test of a form
+            // has no number).
+            let key: Option<WindowKey> = ctx.service_id().map(|id| (api::service_prefix(&url), id));
             let request = ctx.http.get(url);
             let started = Instant::now();
             let sent = match ctx.secret.as_deref().filter(|s| !s.is_empty()) {
@@ -177,11 +321,18 @@ impl Integration for HttpKind {
                 Ok(response) => response,
                 // The site not answering is the reading, not a failure of ours,
                 // and it was checked: «Last checked» says when.
-                Err(err) => return Ok(checked(Snapshot::failed(&err))),
+                Err(err) => {
+                    let snapshot = checked(Snapshot::failed(&err));
+                    let hour = key
+                        .as_ref()
+                        .and_then(|key| window(key, snapshot.fetched_at, None));
+                    let blocks = details(None, None, snapshot.fetched_at, hour);
+                    return Ok(snapshot.with_details(blocks));
+                }
             };
             let code = response.status().as_u16();
             let body = read_capped(response).await;
-            let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let latency_ms = (started.elapsed().as_secs_f64() * 1000.0).round();
 
             let mut snapshot = checked(Snapshot::new(Status::Ok));
             snapshot
@@ -189,7 +340,7 @@ impl Integration for HttpKind {
                 .insert("status".to_string(), Value::num(f64::from(code)));
             snapshot
                 .values
-                .insert("latency_ms".to_string(), Value::num(latency_ms.round()));
+                .insert("latency_ms".to_string(), Value::num(latency_ms));
             if let Err(err) = body {
                 snapshot.status = Status::Bad;
                 snapshot.error = Some(err.to_string());
@@ -197,14 +348,64 @@ impl Integration for HttpKind {
                 snapshot.status = Status::Bad;
                 snapshot.error = Some(FetchError::Status(code).to_string());
             }
-            Ok(snapshot)
+            let hour = key
+                .as_ref()
+                .and_then(|key| window(key, snapshot.fetched_at, Some(latency_ms)));
+            let blocks = details(Some(code), Some(latency_ms), snapshot.fetched_at, hour);
+            Ok(snapshot.with_details(blocks))
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_expected;
+    use jiff::{SignedDuration, Timestamp};
+
+    use super::{MEMORY_MAX, WINDOW_MAX, parse_expected, window};
+
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_second(1_800_000_000 + secs).unwrap()
+    }
+
+    #[test]
+    fn the_window_holds_the_last_hour_and_is_bounded() {
+        let key = ("http://window-test.example/".to_string(), 1);
+        // Three answers: the range of them.
+        for (secs, ms) in [(0, 100.0), (60, 300.0)] {
+            window(&key, at(secs), Some(ms));
+        }
+        let r = window(&key, at(120), Some(200.0)).unwrap();
+        assert_eq!((r.min, r.mean, r.max, r.count), (100.0, 200.0, 300.0, 3));
+        // A check that got no answer adds nothing, and only reads.
+        assert_eq!(window(&key, at(180), None).unwrap().count, 3);
+        // An hour on, the first two are out.
+        let hour = SignedDuration::from_hours(1).as_secs();
+        let r = window(&key, at(hour + 90), Some(50.0)).unwrap();
+        assert_eq!((r.min, r.max, r.count), (50.0, 200.0, 2));
+        // A burst is cut to WINDOW_MAX answers.
+        let key = ("http://window-test.example/burst/".to_string(), 2);
+        let mut last = None;
+        for i in 0..(WINDOW_MAX as i64 + 50) {
+            last = window(&key, at(10_000 + i), Some(1.0));
+        }
+        assert_eq!(last.unwrap().count, WINDOW_MAX);
+        // A number that is not finite is not kept.
+        assert_eq!(
+            window(&key, at(10_400), Some(f64::NAN)).unwrap().count,
+            WINDOW_MAX
+        );
+        // And only so many services are remembered (in this test, since the
+        // list is shared and eviction would reach the other keys).
+        for n in 0..(MEMORY_MAX + 20) {
+            window(
+                &(format!("http://many-{n}.example/"), n as i64),
+                at(0),
+                Some(1.0),
+            );
+        }
+        let held = super::MEMORY.lock().unwrap().len();
+        assert!(held <= MEMORY_MAX, "{held}");
+    }
 
     /// The ranges as pairs.
     fn pairs(text: &str) -> Option<Vec<(u16, u16)>> {

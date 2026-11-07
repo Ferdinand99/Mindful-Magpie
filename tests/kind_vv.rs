@@ -11,10 +11,14 @@ use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
+use jiff::{SignedDuration, Timestamp};
+use mindful_magpie::integrations::block::{self, Block};
 use mindful_magpie::integrations::{
     self, FetchCtx, FetchError, Integration, Level, Snapshot, Status,
 };
 use serde_json::{Value as Json, json};
+
+mod common;
 
 const TOKEN: &str = "vv-T0ken-Zq81x7w4mK";
 
@@ -727,4 +731,186 @@ async fn a_redirect_to_another_origin_is_refused_and_never_carries_the_token() {
 
     assert_eq!(fetch_err(&origin).await, FetchError::RedirectScheme);
     assert!(target_stub.hits.lock().unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Details
+
+/// `minutes` ago, as Vigilant Vole writes a time (RFC 3339, UTC).
+fn minutes_ago(minutes: i64) -> String {
+    Timestamp::now()
+        .checked_sub(SignedDuration::from_mins(minutes))
+        .unwrap()
+        .to_string()
+}
+
+fn down_monitor(id: i64, name: &str, message: Option<&str>, minutes: i64) -> Json {
+    json!({ "id": id, "name": name, "since": minutes_ago(minutes), "message": message })
+}
+
+fn with_down(list: Vec<Json>) -> Json {
+    let mut body = summary(5, list.len() as u64, 0, 0, 0);
+    body["down"] = Json::Array(list);
+    body
+}
+
+/// What the poller stores: the details cut down, and every key known.
+fn stored(mut snapshot: Snapshot) -> Vec<Block> {
+    // The locale lookup needs the kit's configuration.
+    static KIT: std::sync::Once = std::sync::Once::new();
+    KIT.call_once(mindful_magpie::install);
+    snapshot.bound_details();
+    for block in &snapshot.details {
+        for key in block.keys() {
+            assert!(block::key_known(key), "no text for detail.{key}");
+        }
+    }
+    snapshot.details
+}
+
+fn list<'a>(blocks: &'a [Block], title: &str) -> Option<&'a [block::ListItem]> {
+    blocks.iter().find_map(|b| match b {
+        Block::List { title_key, items } if title_key == title => Some(items.as_slice()),
+        _ => None,
+    })
+}
+
+#[tokio::test]
+async fn the_down_list_has_name_message_age_and_a_bad_status() {
+    let body = with_down(vec![
+        down_monitor(7, "Sylo dashboard", Some("timeout"), 12),
+        down_monitor(9, "Website", None, 3 * 60 + 5),
+    ]);
+    let (url, _) = serve(Answer::Json(body), Answer::Status(500)).await;
+    let blocks = stored(fetch(&url).await);
+    let items = list(&blocks, "vv_down_now").expect("the list");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].text, "Sylo dashboard");
+    assert_eq!(items[0].sub.as_deref(), Some("timeout"));
+    assert_eq!(items[0].status, Some(Status::Bad));
+    assert_eq!(items[0].right.as_deref(), Some("12 min"));
+    assert_eq!(items[0].href, None);
+    assert_eq!(items[1].sub, None);
+    assert_eq!(items[1].right.as_deref(), Some("3 h"));
+    // Nothing has recovered yet.
+    assert!(list(&blocks, "vv_recovered").is_none());
+}
+
+#[tokio::test]
+async fn the_down_list_is_bounded_at_eight() {
+    let many = (0..25)
+        .map(|i| down_monitor(i, &format!("m{i}"), Some("x"), 1))
+        .collect();
+    let (url, _) = serve(Answer::Json(with_down(many)), Answer::Status(500)).await;
+    let blocks = stored(fetch(&url).await);
+    let items = list(&blocks, "vv_down_now").expect("the list");
+    assert_eq!(items.len(), block::MAX_ITEMS);
+    assert_eq!(items[0].text, "m0");
+}
+
+#[tokio::test]
+async fn hostile_monitor_text_stays_text() {
+    let evil = format!(
+        "<script>alert(1)</script>\u{202E}evil\u{7}{}",
+        "z".repeat(500)
+    );
+    let body = with_down(vec![down_monitor(1, &evil, Some(&evil), 1)]);
+    let (url, _) = serve(Answer::Json(body), Answer::Status(500)).await;
+    let snapshot = fetch(&url).await;
+    // Not in the needs, nor in the error.
+    let outside = serde_json::to_string(&(&snapshot.needs, &snapshot.error)).unwrap();
+    assert!(!outside.contains("script"), "{outside}");
+    let blocks = stored(snapshot);
+    let items = list(&blocks, "vv_down_now").expect("the list");
+    for text in [&items[0].text, items[0].sub.as_ref().unwrap()] {
+        assert!(text.starts_with("<script>alert(1)</script>"), "{text}");
+        assert!(!text.contains(['\u{202E}', '\u{7}']), "{text}");
+        assert!(text.chars().count() <= block::TEXT_CHARS);
+    }
+}
+
+#[tokio::test]
+async fn an_old_server_without_a_down_list_gets_no_list() {
+    // A summary with no `down`, or a null one.
+    for strip in [true, false] {
+        let mut body = summary(5, 1, 0, 0, 0);
+        if strip {
+            body.as_object_mut().unwrap().remove("down");
+        } else {
+            body["down"] = Json::Null;
+        }
+        let (url, _) = serve(Answer::Json(body), Answer::Status(500)).await;
+        assert!(stored(fetch(&url).await).is_empty());
+    }
+    // And a server that has only `/health`.
+    let health =
+        json!({ "status": "ok", "monitors": { "total": 3, "by_status": { "up": 2, "down": 1 } } });
+    let (url, _) = serve(Answer::Status(404), Answer::Json(health)).await;
+    let snapshot = fetch(&url).await;
+    assert_eq!(snapshot.values["down"].num, Some(1.0));
+    assert!(stored(snapshot).is_empty());
+}
+
+#[tokio::test]
+async fn monitors_that_left_the_list_are_recovered_until_the_service_is_saved() {
+    use common::stub::{Answer as Reply, serve as serve_stub};
+    let (base, stub) = serve_stub().await;
+    let down = |list: Vec<Json>| stub.route(SUMMARY, Reply::Json(with_down(list)));
+
+    down(vec![
+        down_monitor(1, "Alpha", Some("timeout"), 20),
+        down_monitor(2, "Beta", None, 5),
+    ]);
+    let first = stored(fetch(&base).await);
+    assert!(
+        list(&first, "vv_recovered").is_none(),
+        "not before it was seen down"
+    );
+
+    // Alpha comes back.
+    down(vec![down_monitor(2, "Beta", None, 6)]);
+    let second = stored(fetch(&base).await);
+    let recovered = list(&second, "vv_recovered").expect("Alpha recovered");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].text, "Alpha");
+    assert_eq!(recovered[0].status, Some(Status::Ok));
+    assert_eq!(recovered[0].right.as_deref(), Some("0 s"));
+    // It is still remembered at the next fetch, and Beta is still down.
+    let third = stored(fetch(&base).await);
+    assert_eq!(list(&third, "vv_recovered").unwrap()[0].text, "Alpha");
+    assert_eq!(list(&third, "vv_down_now").unwrap()[0].text, "Beta");
+
+    // Alpha goes down again: no longer «recovered».
+    down(vec![
+        down_monitor(1, "Alpha", None, 0),
+        down_monitor(2, "Beta", None, 7),
+    ]);
+    let again = stored(fetch(&base).await);
+    assert!(list(&again, "vv_recovered").is_none());
+
+    // Beta comes back, then the service is saved: the memory goes.
+    down(vec![down_monitor(1, "Alpha", None, 1)]);
+    assert!(list(&stored(fetch(&base).await), "vv_recovered").is_some());
+    integrations::api::forget_all_for(&base);
+    down(vec![down_monitor(1, "Alpha", None, 2)]);
+    assert!(list(&stored(fetch(&base).await), "vv_recovered").is_none());
+}
+
+#[tokio::test]
+async fn a_cut_short_list_does_not_make_monitors_recovered() {
+    use common::stub::serve as serve_stub;
+    let (base, stub) = serve_stub().await;
+    let named = |n: i64| {
+        (1..=n)
+            .map(|i| down_monitor(i, &format!("m{i}"), None, 1))
+            .collect::<Vec<_>>()
+    };
+    stub.ok(SUMMARY, &with_down(named(3)));
+    stored(fetch(&base).await);
+    // 30 are down but the list names only the first two (the summary caps it).
+    let mut body = with_down(named(2));
+    body["monitors"]["down"] = json!(30);
+    stub.ok(SUMMARY, &body);
+    let blocks = stored(fetch(&base).await);
+    assert!(list(&blocks, "vv_recovered").is_none());
 }
