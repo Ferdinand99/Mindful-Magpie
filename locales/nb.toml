@@ -5,6 +5,10 @@
 [start]
 title = "Startside"
 sub = "Lenkene og tjenestene dine på ett sted."
+needs = "Trenger deg"
+date = "{weekday} {day_month}"
+empty = "Startsiden er tom. Rediger den for å legge til tjenester og bokmerker."
+groups = "Tjenester og bokmerker"
 
 # Tekster kitets sider henter fra produktet
 # (vole_kit::i18n::catalog::PRODUCT_KEYS).

@@ -1,16 +1,18 @@
-//! Magpie's own pages. The start page is a placeholder until the links and
-//! services are built; it already sits behind sign-in.
+//! Magpie's own pages. The start page is empty until the links and services
+//! are built; it already sits behind sign-in.
 
 use askama::Template;
 use axum::Router;
 use axum::extract::State;
-use axum::response::{IntoResponse, Redirect};
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum_extra::extract::cookie::SignedCookieJar;
 use vole_kit::auth::CurrentUser;
 use vole_kit::http::{ApiResult, HtmlTemplate};
 use vole_kit::i18n::{self, Tr as _};
 use vole_kit::page::PageCtx;
+use vole_kit::settings::SiteSettings;
 use vole_kit::state::Core;
 
 /// Pages for signed-in users (the caller adds the sign-in guard).
@@ -24,13 +26,47 @@ pub fn router() -> Router<Core> {
 #[template(path = "start.html")]
 struct StartPage {
     ctx: PageCtx,
+    /// The time now in the site's time zone, `HH:MM`.
+    time: String,
+    /// The date now in the site's time zone, in the page's language.
+    date: String,
+    /// IANA name of the site's time zone (`clock.js` keeps time in it).
+    timezone: String,
+}
+
+/// The time zone, the clock and the date for the page: now, in the site's
+/// time zone (UTC when the setting is missing or no longer valid).
+fn clock_in(timezone: &str) -> (String, String) {
+    let zone = jiff::tz::TimeZone::get(timezone).unwrap_or(jiff::tz::TimeZone::UTC);
+    let now = jiff::Timestamp::now().to_zoned(zone);
+    let date = now.date();
+    let weekday = i18n::weekday_name(now.weekday().to_monday_one_offset(), true);
+    let date = i18n::tf(
+        "start.date",
+        &[
+            ("weekday", weekday),
+            ("day_month", &i18n::fmt_day_month_long(date)),
+        ],
+    );
+    (now.strftime("%H:%M").to_string(), date)
 }
 
 async fn start(
     State(core): State<Core>,
     user: CurrentUser,
+    headers: HeaderMap,
     jar: SignedCookieJar,
-) -> ApiResult<impl IntoResponse> {
+) -> ApiResult<Response> {
+    // The page's stylesheet and clock script are linked from `<head>`, which a
+    // boosted navigation (the Start link in the top bar and the tab bar) does
+    // not load, and htmx does not run scripts it swaps in. Reaching the page
+    // that way makes the browser load it in full.
+    if headers.contains_key("hx-boosted") {
+        return Ok(([("hx-redirect", "/")], ()).into_response());
+    }
+    let site = core.with_conn(|c| SiteSettings::load(c)).await?;
+    let timezone = site.timezone_or_utc().to_string();
+    let (time, date) = clock_in(&timezone);
     let (ctx, jar) = PageCtx::build(
         &core,
         Some(&user),
@@ -40,7 +76,13 @@ async fn start(
         "",
     )
     .await;
-    Ok((jar, HtmlTemplate(StartPage { ctx })))
+    let page = StartPage {
+        ctx,
+        time,
+        date,
+        timezone,
+    };
+    Ok((jar, HtmlTemplate(page)).into_response())
 }
 
 /// The Settings nav item: the first tab the user may open (General for

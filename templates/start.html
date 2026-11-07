@@ -3,8 +3,35 @@
 
 {% block head %}
   <link rel="stylesheet" href="/static/magpie.css">
+  <script src="/static/clock.js" defer></script>
 {% endblock %}
 
+{% block main_class %}start{% endblock %}
+
 {% block content %}
-{% call m::page_header(tr("start.title"), tr("start.sub")) %}{% endcall %}
+{#- Soft colour fields behind the glass cards (the default background). -#}
+<div class="wall" aria-hidden="true"></div>
+
+<h1 class="vh">{{ tr("start.title") }}</h1>
+
+<div class="start-top">
+  <div class="start-clock">
+    <p class="clock" id="clock" data-tz="{{ timezone }}" data-lang="{{ ctx.lang }}">{{ time }}</p>
+    <p class="date" id="date">{{ date }}</p>
+  </div>
+</div>
+
+{#- "Needs you": a row of alerts, shown only when something needs attention. -#}
+<section class="glass needs" id="needs" aria-labelledby="needs-title" hidden>
+  <h2 class="needs-title" id="needs-title">{{ tr("start.needs") }}</h2>
+</section>
+
+<section id="groups" aria-label="{{ tr("start.groups") }}">
+  <div class="glass empty-card">
+    <div class="empty">
+      <div class="empty-icon">{{ m::icon("dashboard") }}</div>
+      <p class="empty-title">{{ tr("start.empty") }}</p>
+    </div>
+  </div>
+</section>
 {% endblock %}

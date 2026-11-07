@@ -1,3 +1,121 @@
 /* Mindful Magpie's own touches on the family design system (style.css is the
    kit's). Only Magpie-specific rules belong here; the brand colour is mint
-   (#63e6e2, assets/brand). */
+   (#63e6e2, assets/brand), used where the brand mark appears. The kit's
+   purple stays the colour of links and focus. */
+
+/* The start page ------------------------------------------------------------
+   Soft colour fields behind the glass cards: the default background (a
+   chosen image replaces it later). */
+.wall {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(60vw 50vh at 12% 8%, light-dark(rgba(139, 125, 255, 0.28), rgba(139, 125, 255, 0.35)), transparent 60%),
+    radial-gradient(55vw 55vh at 88% 18%, light-dark(rgba(255, 100, 130, 0.2), rgba(255, 100, 130, 0.22)), transparent 60%),
+    radial-gradient(70vw 60vh at 50% 100%, light-dark(rgba(48, 160, 200, 0.22), rgba(48, 160, 200, 0.22)), transparent 60%),
+    var(--bg);
+}
+
+/* The kit paints <body> with the page colour, which would cover the wall;
+   <html> keeps the page colour underneath. */
+body:has(.wall) {
+  background: transparent;
+}
+
+/* Glass: a translucent card over the wall. */
+.glass {
+  background: light-dark(rgba(255, 255, 255, 0.62), rgba(28, 28, 31, 0.55));
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  -webkit-backdrop-filter: saturate(180%) blur(24px);
+  backdrop-filter: saturate(180%) blur(24px);
+}
+@media (prefers-reduced-transparency: reduce) {
+  .glass {
+    background: var(--card);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+@media (prefers-contrast: more) {
+  .glass {
+    background: var(--card);
+    border-color: var(--line-strong);
+  }
+}
+
+/* The page fills the width: the grid grows with the screen instead of
+   stopping at the kit's reading width. */
+.main.start {
+  max-width: none;
+  gap: var(--sp-6);
+  padding-left: max(clamp(1rem, 3vw, 3rem), var(--safe-left)); /* rtl-ok: safe-area insets are physical */
+  padding-right: max(clamp(1rem, 3vw, 3rem), var(--safe-right)); /* rtl-ok: safe-area insets are physical */
+}
+body:has(.main.start) .topbar-inner {
+  max-width: none;
+  padding-left: max(clamp(1rem, 3vw, 3rem), var(--safe-left)); /* rtl-ok: safe-area insets are physical */
+  padding-right: max(clamp(1rem, 3vw, 3rem), var(--safe-right)); /* rtl-ok: safe-area insets are physical */
+}
+
+/* Clock and date */
+.start-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-4) var(--sp-6);
+}
+.clock {
+  font-size: 2.75rem;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.date {
+  margin-top: var(--sp-1);
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+.date::first-letter {
+  text-transform: uppercase;
+}
+
+/* "Needs you": one glass row of alerts; hidden while nothing needs you. */
+.needs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2) var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+}
+.needs[hidden] {
+  display: none;
+}
+.needs-title {
+  margin-inline-end: var(--sp-1);
+  color: var(--muted);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+/* The groups: cards in a grid that fills the width (about 260px at least). */
+#groups {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: var(--sp-3);
+  min-width: 0;
+}
+#groups > .empty-card {
+  grid-column: 1 / -1;
+  border-style: solid;
+}
+
+@media (max-width: 720px) {
+  .clock {
+    font-size: 2.25rem;
+  }
+}

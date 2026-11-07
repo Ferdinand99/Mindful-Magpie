@@ -5,6 +5,10 @@
 [start]
 title = "Start"
 sub = "Your links and services in one place."
+needs = "Needs you"
+date = "{weekday}, {day_month}"
+empty = "Your start page is empty. Edit it to add services and bookmarks."
+groups = "Services and bookmarks"
 
 # Texts the kit's pages take from the product
 # (vole_kit::i18n::catalog::PRODUCT_KEYS).
