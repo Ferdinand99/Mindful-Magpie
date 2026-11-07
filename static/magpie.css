@@ -70,8 +70,6 @@ html:root:has(.mm-root)[data-bg="image"] .date {
   text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
 }
 
-<<<<<<< HEAD
-=======
 /* The Edit button on an uploaded picture: its grey fill is faint on a pale
    photo even under the scrim. Give it the dark glass of the cards and a hairline,
    like the date above. (The open state, the inverted pill, keeps its own look.) */
@@ -83,26 +81,6 @@ html:root:has(.mm-root)[data-bg="image"] #mm-edit:not([aria-pressed="true"]) {
   backdrop-filter: saturate(180%) blur(16px);
 }
 
-/* "Needs you": one glass row of alerts; hidden while nothing needs you. */
-.needs {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--sp-2) var(--sp-3);
-  padding: var(--sp-3) var(--sp-4);
-}
-.needs[hidden] {
-  display: none;
-}
-.needs-title {
-  margin-inline-end: var(--sp-1);
-  color: var(--muted);
-  font-size: 0.8125rem;
-  font-weight: 500;
-  letter-spacing: 0;
-}
-
->>>>>>> origin/feat/start-page
 /* The groups: the renderer fills this element with groups of cards (the card
    grid, repeat(auto-fill, minmax(260px, 1fr)), is in magpie/render.css). */
 #groups {
