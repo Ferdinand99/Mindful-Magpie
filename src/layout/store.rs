@@ -63,6 +63,26 @@ pub async fn load(core: &Core, user_id: i64) -> Result<Layout, StoreError> {
     Ok(layout)
 }
 
+/// The user's layout for showing: when the stored document cannot be read,
+/// the empty default at the stored version (so a save over the broken
+/// document is accepted), and `true` for "it was unreadable".
+pub async fn load_or_default(core: &Core, user_id: i64) -> Result<(Layout, bool), DbError> {
+    match load(core, user_id).await {
+        Ok(layout) => Ok((layout, false)),
+        Err(StoreError::Corrupt { version, source }) => {
+            tracing::warn!(user = user_id, "stored layout is unreadable: {source}");
+            Ok((
+                Layout {
+                    version,
+                    ..Layout::default()
+                },
+                true,
+            ))
+        }
+        Err(StoreError::Db(err)) => Err(err),
+    }
+}
+
 /// Stores `layout` as the user's layout when `layout.version` is the stored
 /// version (0 when nothing is stored), and returns the new version. The read,
 /// the comparison and the write happen in one transaction.

@@ -1,0 +1,254 @@
+//! Magpie's REST routes under `/api/v1`, for the browser extension:
+//!
+//! - `GET /api/v1/me/start`: the token owner's start page layout. Only an API
+//!   token opens it. The path is exempt from the CSRF guard, so a session
+//!   cookie, which a foreign page can make the browser send, is never enough.
+//! - `POST /api/v1/extension/token`: the last step of the connect flow (see
+//!   [`crate::connect`]): a one-time code and the PKCE verifier for a
+//!   read-only API token. It takes no credentials; the code is the credential.
+
+use std::net::{IpAddr, Ipv4Addr};
+use std::time::Instant;
+
+use axum::body::{Body, to_bytes};
+use axum::extract::{Extension, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use rusqlite::{OptionalExtension as _, TransactionBehavior, params};
+use serde::Deserialize;
+use serde_json::json;
+use sha2::{Digest as _, Sha256};
+use vole_kit::auth::guard::PeerAddr;
+use vole_kit::auth::totp::ct_eq;
+use vole_kit::auth::{AuthMethod, CurrentUser, TokenScope, session, tokens};
+use vole_kit::db::{self, api_tokens};
+use vole_kit::docs::{ErrorCode, RouteDoc, r};
+use vole_kit::http::ApiError;
+use vole_kit::http::ratelimit::{Rate, too_many_requests};
+use vole_kit::state::Core;
+
+use crate::{Magpie, connect, layout};
+
+/// Token requests one address may make: a person connects once in a while, a
+/// guesser tries many codes.
+pub const TOKEN_RATE: Rate = Rate::per_minute(10);
+/// The largest body the token endpoint reads (two short strings).
+const MAX_TOKEN_BODY: usize = 4096;
+/// The name a connected extension's token gets: the user's token list shows
+/// it, and revoking the token disconnects the extension.
+const TOKEN_NAME_PREFIX: &str = "Utvidelse: ";
+
+const ME_START_EXAMPLE: &str = r##"{"version": 3, "background": {"kind": "preset", "name": "hav"}, "groups": [{"id": "g1", "title": "Services", "cards": [{"id": "c1", "title": "Vigilant Vole", "description": "Uptime", "url": "https://vole.example.com/", "icon": {"emoji": null, "colour": "teal"}}]}], "bookmarks": [{"id": "b1", "title": "Docs", "url": "https://docs.example.com/"}]}"##;
+
+/// Magpie's documented endpoints (the API reference at `/api-docs`).
+pub const ROUTES: &[RouteDoc] = &[
+    r(
+        "GET",
+        "/api/v1/me/start",
+        "viewer",
+        "Start page",
+        "The start page layout of the token's owner, as the page shows it: `version`, `background`, `groups` of cards and `bookmarks`. Any API token opens it (read access is enough); a session cookie never does. If the stored layout is unreadable, the answer is the empty layout at the stored version, as the page shows it. Never cached (`Cache-Control: no-store`).",
+    )
+    .res(ME_START_EXAMPLE),
+    r(
+        "POST",
+        "/api/v1/extension/token",
+        "public",
+        "Extension",
+        "Swaps the one-time code of the browser extension's connect flow (`/connect/extension`, PKCE with S256) for an API token with read access, named `Utvidelse: <device>`, owned by the user who approved. The code lives two minutes, works once and is spent by any attempt. `code_verifier` is the secret whose SHA-256 (base64url) was sent as `code_challenge`. Every failure is the same `400 invalid_grant`; more than 10 requests a minute from one address get `429`. The token shows in the user's API tokens, where it can be revoked.",
+    )
+    .req(r#"{"code": "Zm9yLWV4YW1wbGUtb25seS1ub3QtYS1yZWFsLWNvZGU", "code_verifier": "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"}"#)
+    .res(r#"{"token": "mm_…"}"#),
+];
+
+/// The error codes of the routes above, besides the kit's.
+pub const ERROR_CODES: &[ErrorCode] = &[ErrorCode {
+    code: "invalid_grant",
+    status: 400,
+    when: "`POST /api/v1/extension/token` with a code that is unknown, used, expired or not for this `code_verifier`, or with a body that is not `{code, code_verifier}` (the answer is `{\"error\": \"invalid_grant\"}`, without the usual envelope)",
+    on_page: false,
+}];
+
+/// The routes that take an API token (the caller adds the sign-in guard,
+/// which resolves the token).
+pub fn router() -> Router<Core> {
+    Router::new().route("/api/v1/me/start", get(me_start))
+}
+
+/// The routes without credentials.
+pub fn public_router() -> Router<Core> {
+    Router::new().route("/api/v1/extension/token", post(extension_token))
+}
+
+/// `GET /api/v1/me/start`.
+async fn me_start(
+    State(core): State<Core>,
+    user: CurrentUser,
+    method: Option<Extension<AuthMethod>>,
+) -> Result<Response, ApiError> {
+    // The guard lets a signed-in cookie through on an `/api/` path that sends
+    // no `Authorization` header; this route wants the token itself.
+    if !matches!(method, Some(Extension(AuthMethod::Token { .. }))) {
+        return Err(ApiError::Unauthorized);
+    }
+    if !user.can_read() {
+        return Err(ApiError::Forbidden);
+    }
+    let (layout, _) = layout::load_or_default(&core, user.id).await?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(layout)).into_response())
+}
+
+#[derive(Deserialize)]
+struct TokenRequest {
+    code: String,
+    code_verifier: String,
+}
+
+/// The one answer to every failed exchange.
+fn invalid_grant() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({ "error": "invalid_grant" })),
+    )
+        .into_response()
+}
+
+/// A code is 32 bytes as base64url: 43 characters.
+fn code_shape(code: &str) -> bool {
+    code.len() == 43
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+/// A PKCE verifier (RFC 7636): 43 to 128 characters of `A-Z a-z 0-9 - . _ ~`.
+fn verifier_shape(verifier: &str) -> bool {
+    (43..=128).contains(&verifier.len())
+        && verifier
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
+}
+
+/// `BASE64URL(SHA256(verifier))` is the stored challenge, compared in
+/// constant time.
+fn pkce_matches(verifier: &str, challenge: &str) -> bool {
+    let computed = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    ct_eq(computed.as_bytes(), challenge.as_bytes())
+}
+
+/// `POST /api/v1/extension/token`.
+async fn extension_token(
+    State(core): State<Core>,
+    Extension(magpie): Extension<Magpie>,
+    PeerAddr(peer): PeerAddr,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let ip = session::client_ip(&headers, peer, session::trust_proxy())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    if let Err(wait) = magpie.token_budget.take(&ip, TOKEN_RATE, Instant::now()) {
+        tracing::warn!(%ip, "extension token requests over the budget");
+        return too_many_requests(wait);
+    }
+    let Ok(bytes) = to_bytes(body, MAX_TOKEN_BODY).await else {
+        return invalid_grant();
+    };
+    let Ok(request) = serde_json::from_slice::<TokenRequest>(&bytes) else {
+        return invalid_grant();
+    };
+    // Wrong shapes can't be a real code or verifier: refuse them without
+    // touching the stored codes.
+    if !code_shape(&request.code) || !verifier_shape(&request.code_verifier) {
+        return invalid_grant();
+    }
+    let token = tokens::generate();
+    let (code_hash, token_hash, prefix) = (
+        tokens::hash(&request.code),
+        tokens::hash(&token),
+        tokens::display_prefix(&token),
+    );
+    let verifier = request.code_verifier;
+    let redeemed = db::interact(&core.db, move |c| {
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(i64, String, String, bool)> = tx
+            .query_row(
+                "SELECT c.user_id, c.code_challenge, c.device,
+                        c.expires_at > CAST(strftime('%s','now') AS INTEGER)
+                 FROM extension_codes c JOIN users u ON u.id = c.user_id AND u.active = 1
+                 WHERE c.code_hash = ?1",
+                params![code_hash],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        // Single use: whoever finds the code spends it, right or wrong.
+        tx.execute(
+            "DELETE FROM extension_codes WHERE code_hash = ?1",
+            params![code_hash],
+        )?;
+        connect::purge_expired(&tx)?;
+        let granted = match row {
+            Some((user_id, challenge, device, true)) if pkce_matches(&verifier, &challenge) => {
+                api_tokens::insert(
+                    &tx,
+                    user_id,
+                    &format!("{TOKEN_NAME_PREFIX}{device}"),
+                    &prefix,
+                    &token_hash,
+                    TokenScope::Read,
+                    None,
+                )?;
+                true
+            }
+            _ => false,
+        };
+        tx.commit()?;
+        Ok(granted)
+    })
+    .await;
+    match redeemed {
+        Ok(true) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({ "token": token })),
+        )
+            .into_response(),
+        Ok(false) => invalid_grant(),
+        Err(err) => {
+            tracing::error!("extension token exchange failed: {err}");
+            ApiError::internal(err).into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_rfc_7636_vector_matches() {
+        assert!(pkce_matches(
+            "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        ));
+        assert!(!pkce_matches(
+            "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXl",
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        ));
+    }
+
+    #[test]
+    fn shapes() {
+        assert!(code_shape(&"a".repeat(43)));
+        assert!(!code_shape(&"a".repeat(42)));
+        assert!(!code_shape(&format!("{}+", "a".repeat(42))));
+        assert!(verifier_shape(&"a".repeat(43)));
+        assert!(verifier_shape(&"a".repeat(128)));
+        assert!(!verifier_shape(&"a".repeat(42)));
+        assert!(!verifier_shape(&"a".repeat(129)));
+        assert!(!verifier_shape(&format!("{} ", "a".repeat(43))));
+    }
+}

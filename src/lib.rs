@@ -7,14 +7,18 @@
 
 #![forbid(unsafe_code)]
 
+pub mod api;
 pub mod config;
+pub mod connect;
 pub mod db;
 pub mod layout;
 pub mod pages;
 pub mod product;
 pub mod server;
 
+use std::net::IpAddr;
 use std::path::Path;
+use std::sync::Arc;
 
 use axum::middleware::{from_fn, from_fn_with_state};
 use axum::routing::get;
@@ -22,6 +26,7 @@ use axum::{Extension, Router};
 use vole_kit::auth::{guard, pages as kit_pages};
 use vole_kit::db::settings;
 use vole_kit::http::headers;
+use vole_kit::http::ratelimit::TokenBuckets;
 use vole_kit::state::Core;
 
 pub use product::{VERSION, install};
@@ -33,6 +38,8 @@ pub type StartError = Box<dyn std::error::Error + Send + Sync>;
 #[derive(Clone)]
 pub struct Magpie {
     pub core: Core,
+    /// Budget of the extension's token endpoint, per client address.
+    pub token_budget: Arc<TokenBuckets<IpAddr>>,
 }
 
 /// Installs the configuration, opens and migrates the database in
@@ -66,7 +73,10 @@ pub async fn start(data_dir: &Path, public_url: Option<&str>) -> Result<Magpie, 
         core.with_conn(move |c| settings::set(c, settings::BASE_URL, &url))
             .await?;
     }
-    Ok(Magpie { core })
+    Ok(Magpie {
+        core,
+        token_budget: Arc::new(TokenBuckets::new()),
+    })
 }
 
 /// The whole app: Magpie's pages, the kit's pages, static files and the
@@ -77,12 +87,15 @@ pub fn router(magpie: Magpie) -> Router {
     // (settings, users, tokens, API reference). Sign-in guards them all.
     let protected = Router::new()
         .merge(pages::router())
+        .merge(connect::router())
+        .merge(api::router())
         .merge(kit_pages::router())
         .route_layer(from_fn_with_state(core.clone(), guard::require_auth));
     // Sign-in, first-run setup, logout, health and static files.
     let public = Router::new()
         .route("/healthz", get(vole_kit::http::healthz))
         .route("/static/{*path}", get(vole_kit::http::assets::static_asset))
+        .merge(api::public_router())
         .merge(kit_pages::public_router());
     protected
         .merge(public)

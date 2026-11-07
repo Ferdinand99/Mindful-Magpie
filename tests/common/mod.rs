@@ -245,3 +245,61 @@ impl<'a> Web<'a> {
         self.send(req).await
     }
 }
+
+/// The id of the user called `name`.
+pub async fn user_id(app: &App, name: &'static str) -> i64 {
+    app.magpie
+        .core
+        .with_conn(move |c| {
+            c.query_row("SELECT id FROM users WHERE username = ?1", [name], |r| {
+                r.get(0)
+            })
+        })
+        .await
+        .unwrap()
+}
+
+/// Makes an API token for `user_id` (as the Tokens page does) and returns the
+/// plaintext.
+pub async fn make_token(
+    app: &App,
+    user_id: i64,
+    scope: vole_kit::auth::TokenScope,
+    name: &'static str,
+) -> String {
+    let token = vole_kit::auth::tokens::generate();
+    let (prefix, hash) = (
+        vole_kit::auth::tokens::display_prefix(&token),
+        vole_kit::auth::tokens::hash(&token),
+    );
+    app.magpie
+        .core
+        .with_conn(move |c| {
+            vole_kit::db::api_tokens::insert(c, user_id, name, &prefix, &hash, scope, None)
+        })
+        .await
+        .unwrap();
+    token
+}
+
+/// `GET path` as a program with `Authorization: Bearer token`.
+pub async fn bearer_get(app: &App, path: &str, token: &str) -> Res {
+    app.send(
+        Request::get(path)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+}
+
+/// `POST path` with a JSON body and no credentials.
+pub async fn post_json(app: &App, path: &str, body: &str) -> Res {
+    app.send(
+        Request::post(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await
+}

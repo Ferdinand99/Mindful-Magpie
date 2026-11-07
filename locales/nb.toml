@@ -15,6 +15,15 @@ invalid_link = "ugyldig lenke"
 group_label = "Gruppe: {title}"
 bookmarks_label = "Bokmerker"
 
+[connect]
+title = "Koble til nettleserutvidelsen"
+prompt = "Gi {device} tilgang til å lese startsiden din?"
+help = "Den kan bare lese startsiden din, ingenting annet. Du kan ta tilgangen bort når som helst under Innstillinger → API-tokens."
+approve = "Godkjenn"
+cancel = "Avbryt"
+refused_title = "Kan ikke koble til"
+refused = "Denne forespørselen om tilkobling er ikke gyldig, så ingenting ble delt. Start tilkoblingen på nytt fra utvidelsen."
+
 # Tekster kitets sider henter fra produktet
 # (vole_kit::i18n::catalog::PRODUCT_KEYS).
 

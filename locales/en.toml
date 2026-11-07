@@ -15,6 +15,15 @@ invalid_link = "invalid link"
 group_label = "Group: {title}"
 bookmarks_label = "Bookmarks"
 
+[connect]
+title = "Connect the browser extension"
+prompt = "Give {device} access to read your start page?"
+help = "It can only read your start page, nothing else. You can take the access away at any time under Settings → API tokens."
+approve = "Approve"
+cancel = "Cancel"
+refused_title = "Can't connect"
+refused = "This connection request is not valid, so nothing was shared. Start the connection again from the extension."
+
 # Texts the kit's pages take from the product
 # (vole_kit::i18n::catalog::PRODUCT_KEYS).
 

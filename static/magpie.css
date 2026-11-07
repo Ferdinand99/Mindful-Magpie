@@ -136,3 +136,28 @@ body:has(.main.start) .topbar-inner {
 .mm-notice > div {
   flex: 1 1 18rem;
 }
+
+/* The consent page of the browser extension (/connect/extension) ----------- */
+.connect {
+  max-width: 34rem;
+  margin: 2rem auto;
+  padding: 1.5rem;
+}
+.connect-title {
+  font-size: 1.25rem;
+  margin: 0 0 1rem;
+}
+.connect-prompt {
+  font-size: 1.1rem;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.connect-help {
+  color: var(--text-muted, inherit);
+}
+.connect-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 1.25rem;
+}

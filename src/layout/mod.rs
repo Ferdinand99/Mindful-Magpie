@@ -7,4 +7,4 @@ pub mod store;
 pub use model::{
     Background, Bookmark, Card, FieldError, Group, Icon, Layout, PALETTE, PRESETS, validate,
 };
-pub use store::{SaveError, StoreError, load, save};
+pub use store::{SaveError, StoreError, load, load_or_default, save};

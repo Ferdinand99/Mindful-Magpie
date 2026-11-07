@@ -131,20 +131,7 @@ async fn start(
     // A stored layout that cannot be read (it was changed outside Magpie)
     // must not take the page down: show the empty default, at the stored
     // version so that a save over the broken document is accepted, and say so.
-    let (layout, corrupt) = match layout::load(&core, user.id).await {
-        Ok(layout) => (layout, false),
-        Err(StoreError::Corrupt { version, source }) => {
-            tracing::warn!(user = user.id, "stored layout is unreadable: {source}");
-            (
-                Layout {
-                    version,
-                    ..Layout::default()
-                },
-                true,
-            )
-        }
-        Err(StoreError::Db(err)) => return Err(err.into()),
-    };
+    let (layout, corrupt) = layout::load_or_default(&core, user.id).await?;
     let site = core.with_conn(|c| SiteSettings::load(c)).await?;
     let timezone = site.timezone_or_utc().to_string();
     let (time, date) = clock_in(&timezone);

@@ -16,6 +16,8 @@ src/
   lib.rs              # start() (database, state) and router()
   product.rs          # KitConfig: names, cookies, token prefixes, nav, settings tabs, locales, static files
   pages.rs            # Magpie's own pages: the start page and the Settings redirect
+  api.rs              # REST routes for the extension: GET /api/v1/me/start, POST /api/v1/extension/token
+  connect.rs          # the extension's consent page (GET/POST /connect/extension) and its one-time codes
   config.rs           # flags and MM_* environment variables
   server.rs           # listener, graceful shutdown
   db.rs               # Magpie's migration set (after the kit's core set)
@@ -24,7 +26,7 @@ templates/            # Magpie's pages (extend kit/layout.html)
 static/               # favicon, icons, web manifest, magpie.css, clock.js
 migrations/           # Magpie's migrations
 locales/              # Magpie's strings (en, nb)
-tests/                # boot.rs, auth.rs, start.rs, layout.rs, layout_http.rs; common/ builds an in-process app on a temporary data directory
+tests/                # boot.rs, auth.rs, start.rs, layout.rs, layout_http.rs, api_start.rs, connect.rs; common/ builds an in-process app on a temporary data directory
 Dockerfile            # static musl binary on Alpine
 docker/               # the entrypoint (PUID/PGID)
 about.toml, about.hbs # cargo-about: licence allowlist and template for THIRD-PARTY-NOTICES
@@ -41,7 +43,7 @@ Builds and tests run in Docker on a build host (a shared Docker daemon), not on 
 cargo commands that run inside a Rust 1.99 container with clippy and rustfmt installed.
 
 ```bash
-cargo test --locked                                  # 59 tests: boot, auth and users, start page, layout
+cargo test --locked                                  # 88 tests: boot, auth and users, start page, layout, extension API and connect flow
 cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --all --check
 docker build -t magpie:dev .

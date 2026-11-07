@@ -1,0 +1,24 @@
+{% extends "kit/layout.html" %}
+{% import "kit/macros.html" as m %}
+
+{% block head %}
+  <link rel="stylesheet" href="/static/magpie.css">
+{% endblock %}
+
+{% block content %}
+<section class="card connect" aria-labelledby="connect-title">
+  <h1 class="connect-title" id="connect-title">{{ tr("connect.title") }}</h1>
+  <p class="connect-prompt">{{ prompt }}</p>
+  <p class="connect-help">{{ tr("connect.help") }}</p>
+  {#- A plain form post (not boosted): the answer redirects to the extension's address, outside this site. -#}
+  <form class="connect-actions" method="post" action="/connect/extension" hx-boost="false">
+    <input type="hidden" name="redirect_uri" value="{{ consent.redirect_uri }}">
+    <input type="hidden" name="state" value="{{ consent.state }}">
+    <input type="hidden" name="code_challenge" value="{{ consent.code_challenge }}">
+    <input type="hidden" name="code_challenge_method" value="S256">
+    <input type="hidden" name="device" value="{{ consent.device }}">
+    <button type="submit" name="decision" value="approve" class="btn btn-primary btn-lg">{{ tr("connect.approve") }}</button>
+    <button type="submit" name="decision" value="deny" class="btn btn-secondary btn-lg">{{ tr("connect.cancel") }}</button>
+  </form>
+</section>
+{% endblock %}
