@@ -21,14 +21,14 @@ src/
   config.rs           # flags and MM_* environment variables
   server.rs           # listener, graceful shutdown
   db.rs               # Magpie's migration set (after the kit's core set)
-  layout/             # the start page layout: model and validation, per-user versioned storage
+  layout/             # the start page layout: model and validation, per-user versioned storage, uploaded backgrounds (background.rs)
 templates/            # Magpie's pages (extend kit/layout.html)
 static/               # favicon, icons, web manifest, magpie.css, clock.js
 static/magpie/        # the start page scripts (ES modules: render.js is the shared renderer, edit.js is edit mode with ops.js and rules.js) and render.css
 web/                  # JavaScript tests (node --test, linkedom): renderer, layout operations, edit mode; dev-only
 migrations/           # Magpie's migrations
 locales/              # Magpie's strings (en, nb)
-tests/                # boot.rs, auth.rs, start.rs, layout.rs, layout_http.rs, api_start.rs, connect.rs; common/ builds an in-process app on a temporary data directory
+tests/                # boot.rs, auth.rs, start.rs, layout.rs, layout_http.rs, api_start.rs, background.rs, connect.rs; common/ builds an in-process app on a temporary data directory
 Dockerfile            # static musl binary on Alpine
 docker/               # the entrypoint (PUID/PGID)
 about.toml, about.hbs # cargo-about: licence allowlist and template for THIRD-PARTY-NOTICES

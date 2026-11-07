@@ -5,14 +5,15 @@ use std::collections::BTreeMap;
 
 use askama::Template;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{DefaultBodyLimit, Extension, Multipart, Path, Request, State};
+use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use axum_extra::extract::cookie::SignedCookieJar;
 use serde_json::json;
-use vole_kit::auth::CurrentUser;
+use vole_kit::auth::{CurrentUser, guard, tokens};
 use vole_kit::http::error::ApiError;
 use vole_kit::http::{ApiResult, HtmlTemplate};
 use vole_kit::i18n::{self, Tr as _};
@@ -20,13 +21,20 @@ use vole_kit::page::PageCtx;
 use vole_kit::settings::SiteSettings;
 use vole_kit::state::Core;
 
-use crate::layout::{self, Layout, SaveError, StoreError};
+use crate::Magpie;
+use crate::layout::background::MAX_BYTES;
+use crate::layout::{self, Kind, Layout, SaveError, StoreError};
 
 /// The largest body `POST /start/layout` takes. A document that passes
 /// validation is about 1.2 MB with four-byte characters; 4 MiB leaves room for
 /// text a client writes as `\uXXXX` escapes. A bigger body is refused with 413
 /// before it is read.
 const MAX_LAYOUT_BODY: usize = 4 * 1024 * 1024;
+
+/// Room for the multipart framing around a picture of [`MAX_BYTES`] (the
+/// boundaries and the part's headers): a body over `MAX_BYTES` plus this is
+/// refused with 413 before it is read to the end.
+const MULTIPART_OVERHEAD: usize = 64 * 1024;
 
 /// Pages for signed-in users (the caller adds the sign-in guard).
 pub fn router() -> Router<Core> {
@@ -38,6 +46,20 @@ pub fn router() -> Router<Core> {
             post(save_layout).layer(DefaultBodyLimit::max(MAX_LAYOUT_BODY)),
         )
         .route("/start/layout/reset", post(reset_layout))
+        .route(
+            "/start/background",
+            post(upload_background)
+                .layer(DefaultBodyLimit::max(MAX_BYTES + MULTIPART_OVERHEAD))
+                .delete(delete_background),
+        )
+}
+
+/// `GET /start/background/{id}`, which is outside the sign-in guard: that
+/// guard sends a request without a session to the sign-in page, and the
+/// browser extension fetches the picture with an API token and must not be
+/// redirected (`redirect: "error"`). The handler does its own sign-in check.
+pub fn image_router() -> Router<Core> {
+    Router::new().route("/start/background/{id}", get(background_image))
 }
 
 #[derive(Template)]
@@ -302,6 +324,162 @@ async fn reset_layout(State(core): State<Core>, user: CurrentUser) -> ApiResult<
         }
     }
     Ok(Redirect::to("/"))
+}
+
+/// A JSON answer with an error code and the status that goes with it.
+fn error_json(status: StatusCode, code: &str) -> Response {
+    (status, Json(json!({ "error": code }))).into_response()
+}
+
+/// `POST /start/background`: keeps the uploaded picture (multipart, the field
+/// `image`) as the signed-in user's background, in place of any earlier one.
+/// The format is decided by the first bytes, not by the file name or the
+/// declared type.
+async fn upload_background(
+    State(core): State<Core>,
+    Extension(magpie): Extension<Magpie>,
+    user: CurrentUser,
+    mut multipart: Multipart,
+) -> ApiResult<Response> {
+    let data = loop {
+        match multipart.next_field().await {
+            Ok(Some(field)) if field.name() == Some("image") => match field.bytes().await {
+                Ok(data) => break data,
+                Err(err) => return Ok(multipart_failure(&err)),
+            },
+            // Other fields are not ours.
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(error_json(StatusCode::BAD_REQUEST, "bad_request")),
+            Err(err) => return Ok(multipart_failure(&err)),
+        }
+    };
+    if data.len() > MAX_BYTES {
+        return Ok(error_json(StatusCode::PAYLOAD_TOO_LARGE, "too_large"));
+    }
+    let Some(kind) = Kind::sniff(&data) else {
+        return Ok(error_json(StatusCode::UNPROCESSABLE_ENTITY, "bad_image"));
+    };
+    let id = magpie
+        .backgrounds
+        .store(&core, user.id, kind, &data)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({ "id": id })).into_response())
+}
+
+/// A body that is too big is 413, one that is not multipart or is cut off 400.
+fn multipart_failure(err: &axum::extract::multipart::MultipartError) -> Response {
+    if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        error_json(StatusCode::PAYLOAD_TOO_LARGE, "too_large")
+    } else {
+        error_json(StatusCode::BAD_REQUEST, "bad_request")
+    }
+}
+
+/// `DELETE /start/background`: removes the user's picture, and puts the
+/// layout back on the default preset when it used the picture. The answer is
+/// the layout's version (the layout changed when it used the picture).
+async fn delete_background(
+    State(core): State<Core>,
+    Extension(magpie): Extension<Magpie>,
+    user: CurrentUser,
+) -> ApiResult<Response> {
+    let version = magpie
+        .backgrounds
+        .remove(&core, user.id)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({ "version": version })).into_response())
+}
+
+/// No sign-in, or a token that does not work: 401, never a redirect.
+fn image_unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::WWW_AUTHENTICATE, "Bearer"),
+        ],
+    )
+        .into_response()
+}
+
+/// Every id that is not the signed-in user's own picture is the same answer.
+fn image_not_found() -> Response {
+    (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, "no-store")]).into_response()
+}
+
+/// `GET /start/background/{id}`: the signed-in user's picture, when `id` is
+/// its id. Who is signed in is an API token when the request has an
+/// `Authorization` header (and then only the token counts, as under `/api/`),
+/// otherwise the session cookie. Nothing is revealed about other users'
+/// pictures: another user's id and an id that exists nowhere both give 404.
+async fn background_image(
+    State(core): State<Core>,
+    Extension(magpie): Extension<Magpie>,
+    headers: HeaderMap,
+    jar: SignedCookieJar,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    let user = if tokens::has_authorization(&headers) {
+        guard::authenticate_headers(&core, &headers).await?
+    } else {
+        guard::session_user(&core, &jar).await?
+    };
+    let Some(user) = user else {
+        return Ok(image_unauthorized());
+    };
+    let found = magpie
+        .backgrounds
+        .read(&core, user.id, &id)
+        .await
+        .map_err(ApiError::internal)?;
+    let Some((kind, data)) = found else {
+        return Ok(image_not_found());
+    };
+    Ok((
+        [
+            (header::CONTENT_TYPE, kind.mime()),
+            // The id is the hash of the content: the answer never changes.
+            (
+                header::CACHE_CONTROL,
+                "private, max-age=31536000, immutable",
+            ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        data,
+    )
+        .into_response())
+}
+
+/// The kit deletes a user (and their `backgrounds` row, by `ON DELETE
+/// CASCADE`) at `POST /settings/users/{id}/delete` and has no hook for what
+/// else the product keeps of the user. After an admin's request to that path,
+/// sweep the files of users that have no picture any more.
+pub async fn sweep_after_user_delete(
+    Extension(magpie): Extension<Magpie>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let by_admin = request
+        .extensions()
+        .get::<CurrentUser>()
+        .is_some_and(CurrentUser::is_admin);
+    let deletes_user = request.method() == Method::POST
+        && request
+            .uri()
+            .path()
+            .strip_prefix("/settings/users/")
+            .and_then(|rest| rest.strip_suffix("/delete"))
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()));
+    let response = next.run(request).await;
+    if by_admin
+        && deletes_user
+        && let Err(err) = magpie.backgrounds.reconcile(&magpie.core).await
+    {
+        tracing::warn!("can't sweep the background files: {err}");
+    }
+    response
 }
 
 /// The Settings nav item: the first tab the user may open (General for
