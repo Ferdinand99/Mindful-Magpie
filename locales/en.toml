@@ -236,17 +236,26 @@ http_expected = "Use a status like 200, a range like 200-399, or a list like 200
 
 [kind]
 http = "Website"
+vv = "Vigilant Vole"
 
 [field]
 http_expected = "Expected status"
 http_expected_help = "Which answers count as working. Empty means 200-399."
 http_secret = "Token (optional)"
 http_secret_help = "Sent as Authorization: Bearer. Stored encrypted."
+vv_token = "API token"
+vv_token_help = "Create a read token in Vigilant Vole under Settings → API tokens, with the scope \"Read\". Stored encrypted."
 
 [metric]
 http_status = "HTTP status"
 http_latency = "Response time (ms)"
 http_checked = "Last checked"
+vv_up = "Up"
+vv_down = "Down"
+vv_uptime_30d = "Uptime, 30 days"
+vv_uptime_24h = "Uptime, 24 hours"
+vv_paused = "Paused"
+vv_first_down = "Longest down"
 
 [fetch_err]
 config = "The settings can't be used"
@@ -259,7 +268,9 @@ too_large = "Response too large"
 invalid = "Unexpected answer"
 other = "The request failed"
 secret = "The secret can no longer be read - type it again"
+auth = "The key was refused"
 
 [need]
 http_down = "{name} is not answering"
 service_config = "{name} needs to be set up again"
+vv_down = "{count} down"
