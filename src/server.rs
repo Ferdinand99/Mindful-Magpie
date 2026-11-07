@@ -23,6 +23,8 @@ pub async fn run(config: Config) -> Result<(), crate::StartError> {
     );
     let magpie = crate::Magpie { poller, ..magpie };
 
+    // Open event streams would keep the graceful shutdown waiting for an hour.
+    let stopper = magpie.clone();
     let addr = config.bind_addr();
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -37,7 +39,10 @@ pub async fn run(config: Config) -> Result<(), crate::StartError> {
         listener,
         crate::router(magpie).into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        stopper.begin_shutdown();
+    })
     .await?;
     tracing::info!("stopped");
     Ok(())

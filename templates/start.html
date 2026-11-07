@@ -55,4 +55,6 @@
 <script type="application/json" id="mm-labels">{{ labels_json|safe }}</script>
 {#- Only the services this user may see, with their metrics: no address, no settings, no key. -#}
 <script type="application/json" id="mm-services">{{ services_json|safe }}</script>
+{#- The latest reading of the services bound to this user's cards (and visible to them), as of the moment the page was made; the live stream (static/magpie/start.js) keeps it current. -#}
+<script type="application/json" id="mm-values">{{ values_json|safe }}</script>
 {% endblock %}

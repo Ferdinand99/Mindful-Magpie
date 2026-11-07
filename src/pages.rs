@@ -27,6 +27,7 @@ use crate::Magpie;
 use crate::layout::background::MAX_BYTES;
 use crate::layout::{self, Kind, Layout, SaveError, StoreError};
 use crate::services::services_for;
+use crate::values::values_for;
 
 /// The largest body `POST /start/layout` takes. A document that passes
 /// validation is about 1.2 MB with four-byte characters; 4 MiB leaves room for
@@ -86,6 +87,9 @@ struct StartPage {
     /// The services the user can see (see [`crate::services::ServiceView`]),
     /// for the renderer and the card form. Always there, `[]` when none.
     services_json: String,
+    /// The latest reading of each service bound on the user's layout that they
+    /// may see (see [`crate::values`]), for the renderer.
+    values_json: String,
     /// The stored layout could not be read: say so and offer a fresh start.
     corrupt: bool,
 }
@@ -260,6 +264,7 @@ const VARY: &str = "HX-Boosted";
 
 async fn start(
     State(core): State<Core>,
+    Extension(magpie): Extension<Magpie>,
     user: CurrentUser,
     headers: HeaderMap,
     jar: SignedCookieJar,
@@ -277,6 +282,7 @@ async fn start(
     // version so that a save over the broken document is accepted, and say so.
     let (layout, corrupt) = layout::load_or_default(&core, user.id).await?;
     let services = services_for(&core, &user).await?;
+    let values = values_for(&core, &magpie.poller, &user, &layout).await?;
     let site = core.with_conn(|c| SiteSettings::load(c)).await?;
     let timezone = site.timezone_or_utc().to_string();
     let (time, date) = clock_in(&timezone);
@@ -298,6 +304,7 @@ async fn start(
         user_id: user.id,
         labels_json: json_for_html(&labels()),
         services_json: json_for_html(&services),
+        values_json: json_for_html(&values),
         corrupt,
     };
     // The page holds one person's layout: no cache (the browser's back/forward

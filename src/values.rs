@@ -1,0 +1,375 @@
+//! What the start page and the extension know of a service's latest reading:
+//! the [`ValuesDoc`] (embedded as `#mm-values`, served by
+//! `GET /api/v1/me/values`) and the event stream `GET /start/live` that keeps
+//! a page's copy of it current.
+//!
+//! **What goes in.** Only services that are bound on the user's own layout
+//! *and* visible to them (the layout's bindings intersected with
+//! [`store::visible_to`], the list [`crate::services::services_for`] is built
+//! on). A binding the user can no longer see, or one to a service that is gone,
+//! produces nothing: not even a name. The save keeps old bindings without
+//! checking them again, so this filter is what keeps them quiet.
+//!
+//! **An entry** is `{ name, kind, interval_s, status, values, needs,
+//! fetched_at, error_label? }`. A visible bound service that has no snapshot
+//! yet is there with `status: "unknown"`, no values or needs and
+//! `fetched_at: null` (the renderer shows "waiting"); an entry is therefore
+//! absent only when the user must not know of the service. `error_label` is the
+//! reason of a failed reading in the request's language, taken from the closed
+//! set of texts (see [`error_label`]); the raw error never goes out. Times are
+//! Unix seconds.
+//!
+//! **The stream.** One event name, `values`, whose data is
+//! `{ now, full, services, removed }`: the first event of a stream has
+//! `full: true` and holds every entry (the page replaces what it has); after
+//! that an event holds the entries that changed since the last one and, in
+//! `removed`, the ids the user no longer gets (the service was deleted, hidden
+//! from them or is no longer bound). The server remembers what it sent, so a
+//! change is compared with the document the client actually has, not guessed
+//! from which service announced it. The visibility and the layout are read
+//! again at every wake, the account too: a signed-out, disabled or demoted
+//! user loses the stream or the services.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use axum::Router;
+use axum::extract::{Extension, State};
+use axum::response::sse::Event;
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use futures_util::stream;
+use serde::Serialize;
+use tokio::sync::{broadcast, broadcast::error::RecvError, watch};
+use tokio::task::JoinHandle;
+use vole_kit::auth::{AuthMethod, CurrentUser};
+use vole_kit::db::{DbError, users};
+use vole_kit::http::ApiError;
+use vole_kit::http::live::{self, Changes, StreamLimit};
+use vole_kit::i18n;
+use vole_kit::state::Core;
+
+use crate::Magpie;
+use crate::integrations::poller::{Change, PollerHandle};
+use crate::integrations::{self, Need, Status, Value};
+use crate::layout::{self, Layout};
+use crate::services::{ServiceEvent, ServiceSummary, Viewer, store};
+
+/// Streams open at once, across all users.
+pub const MAX_STREAMS: usize = 64;
+/// The quiet period after a change: a burst of readings is one event.
+pub const QUIET: Duration = Duration::from_secs(1);
+
+static STREAMS: StreamLimit = StreamLimit::new(MAX_STREAMS);
+
+/// One service as a page or the extension sees it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ServiceValues {
+    pub name: String,
+    pub kind: String,
+    pub interval_s: i64,
+    pub status: Status,
+    pub values: BTreeMap<String, Value>,
+    pub needs: Vec<Need>,
+    /// Unix seconds, `null` while the service has no snapshot.
+    pub fetched_at: Option<i64>,
+    /// Why the reading failed, translated; absent when it did not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_label: Option<String>,
+}
+
+/// The values of every bound, visible service, by service id (as text, the
+/// way JSON keys are).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ValuesDoc {
+    /// Unix seconds on the server's clock, for the page's age arithmetic.
+    pub now: i64,
+    pub services: BTreeMap<String, ServiceValues>,
+}
+
+/// The ids of the services the layout's cards are bound to.
+fn bound_ids(layout: &Layout) -> BTreeSet<i64> {
+    layout
+        .groups
+        .iter()
+        .flat_map(|g| &g.cards)
+        .filter_map(|c| c.service.as_ref().map(|s| s.id))
+        .collect()
+}
+
+/// A reason as the page shows it: one of [`integrations::FetchError`]'s fixed
+/// texts translated, `HTTP nnn` as it is, anything else as the general
+/// "the request failed". Stored text is not trusted to be harmless.
+pub fn error_label(text: &str) -> String {
+    if let Some(key) = integrations::error_text_key(text) {
+        return i18n::t(key).to_string();
+    }
+    let status = text.strip_prefix("HTTP ");
+    if status.is_some_and(|s| s.len() == 3 && s.bytes().all(|b| b.is_ascii_digit())) {
+        return text.to_string();
+    }
+    i18n::t("fetch_err.other").to_string()
+}
+
+fn entry(summary: &ServiceSummary, poller: &PollerHandle) -> ServiceValues {
+    match poller.snapshot(summary.id) {
+        Some(snapshot) => ServiceValues {
+            name: summary.name.clone(),
+            kind: summary.kind.clone(),
+            interval_s: summary.interval_s,
+            status: snapshot.status,
+            values: snapshot.values.clone(),
+            needs: snapshot.needs.clone(),
+            fetched_at: Some(snapshot.fetched_at.as_second()),
+            error_label: snapshot.error.as_deref().map(error_label),
+        },
+        None => ServiceValues {
+            name: summary.name.clone(),
+            kind: summary.kind.clone(),
+            interval_s: summary.interval_s,
+            status: Status::Unknown,
+            values: BTreeMap::new(),
+            needs: Vec::new(),
+            fetched_at: None,
+            error_label: None,
+        },
+    }
+}
+
+/// The values document of `viewer` for `layout`: the services the layout's
+/// cards are bound to, minus those `viewer` may not see (see the module).
+/// Labels come in the current request's language.
+pub async fn values_for(
+    core: &Core,
+    poller: &PollerHandle,
+    viewer: impl Into<Viewer>,
+    layout: &Layout,
+) -> Result<ValuesDoc, DbError> {
+    let bound = bound_ids(layout);
+    let mut services = BTreeMap::new();
+    if !bound.is_empty() {
+        for summary in store::visible_to(core, viewer).await? {
+            if bound.contains(&summary.id) {
+                services.insert(summary.id.to_string(), entry(&summary, poller));
+            }
+        }
+    }
+    Ok(ValuesDoc {
+        now: jiff::Timestamp::now().as_second(),
+        services,
+    })
+}
+
+pub fn router() -> Router<Core> {
+    Router::new().route("/start/live", get(live_values))
+}
+
+// ---------------------------------------------------------------------------
+// The stream
+
+/// Stops a task when it is dropped: the stream's, so it goes with the stream.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Wakes one stream (`wake`) for what the poller or the services announce.
+/// A channel that fell behind is noted in `lagged`: the stream then sends
+/// everything again. Ends when the stream is gone or both sources are closed.
+async fn forward(
+    mut readings: broadcast::Receiver<Change>,
+    mut services: broadcast::Receiver<ServiceEvent>,
+    wake: broadcast::Sender<()>,
+    lagged: Arc<AtomicBool>,
+) {
+    let (mut readings_open, mut services_open) = (true, true);
+    while readings_open || services_open {
+        let lag = tokio::select! {
+            r = readings.recv(), if readings_open => match r {
+                Ok(_) => false,
+                Err(RecvError::Lagged(_)) => true,
+                Err(RecvError::Closed) => { readings_open = false; continue }
+            },
+            r = services.recv(), if services_open => match r {
+                Ok(_) => false,
+                Err(RecvError::Lagged(_)) => true,
+                Err(RecvError::Closed) => { services_open = false; continue }
+            },
+        };
+        if lag {
+            lagged.store(true, Ordering::Release);
+        }
+        if wake.send(()).is_err() {
+            return;
+        }
+    }
+}
+
+struct Open {
+    core: Core,
+    poller: PollerHandle,
+    user_id: i64,
+    session_version: i64,
+    changes: Changes<()>,
+    /// What the client has: each entry as it was sent.
+    sent: HashMap<i64, String>,
+    first: bool,
+    lagged: Arc<AtomicBool>,
+    shutdown: watch::Receiver<bool>,
+    _slot: live::StreamSlot,
+    _forwarder: AbortOnDrop,
+}
+
+/// What a wake came to.
+enum Turn {
+    Send(Event),
+    /// Nothing the client does not already have.
+    Nothing,
+    /// The stream must end (the account is gone, disabled or signed out).
+    End,
+}
+
+impl Open {
+    async fn turn(&mut self, full: bool) -> Turn {
+        let (id, version) = (self.user_id, self.session_version);
+        let user = match self.core.with_conn(move |c| users::get_user(c, id)).await {
+            Ok(Some(u)) if u.active && u.session_version == version => u,
+            Ok(_) => return Turn::End,
+            Err(err) => {
+                tracing::warn!(%err, "live values: could not read the user; ending the stream");
+                return Turn::End;
+            }
+        };
+        let viewer = Viewer::new(user.id, user.role.is_admin());
+        let doc = match layout::load_or_default(&self.core, id).await {
+            Ok((layout, _)) => values_for(&self.core, &self.poller, viewer, &layout).await,
+            Err(err) => Err(err),
+        };
+        let doc = match doc {
+            Ok(doc) => doc,
+            Err(err) => {
+                tracing::warn!(%err, "live values: could not read the values; ending the stream");
+                return Turn::End;
+            }
+        };
+
+        // (Not `full || take(..)`: that would leave `first` set.)
+        let first = std::mem::take(&mut self.first);
+        let full = full || first;
+        let mut current: HashMap<i64, String> = HashMap::new();
+        let mut entries = BTreeMap::new();
+        for (key, value) in &doc.services {
+            let Ok(id) = key.parse::<i64>() else { continue };
+            let text = serde_json::to_string(value).unwrap_or_default();
+            if full || self.sent.get(&id) != Some(&text) {
+                entries.insert(key.clone(), value);
+            }
+            current.insert(id, text);
+        }
+        let mut removed: Vec<i64> = if full {
+            Vec::new()
+        } else {
+            self.sent
+                .keys()
+                .filter(|id| !current.contains_key(id))
+                .copied()
+                .collect()
+        };
+        removed.sort_unstable();
+        self.sent = current;
+        if !full && entries.is_empty() && removed.is_empty() {
+            return Turn::Nothing;
+        }
+        let data = serde_json::json!({
+            "now": doc.now,
+            "full": full,
+            "services": entries,
+            "removed": removed,
+        });
+        Turn::Send(Event::default().event("values").data(data.to_string()))
+    }
+}
+
+/// `GET /start/live`: the signed-in session's values, as events (see the
+/// module). Only a session opens it, as with the page itself.
+async fn live_values(
+    State(core): State<Core>,
+    Extension(magpie): Extension<Magpie>,
+    user: CurrentUser,
+    method: Option<Extension<AuthMethod>>,
+) -> Response {
+    if !matches!(method, Some(Extension(AuthMethod::Session))) {
+        return ApiError::Unauthorized.into_response();
+    }
+    let Some(slot) = STREAMS.acquire() else {
+        tracing::warn!(
+            max = MAX_STREAMS,
+            "too many live value streams; refusing a new one"
+        );
+        return live::busy();
+    };
+    let id = user.id;
+    let session_version = match core.with_conn(move |c| users::get_user(c, id)).await {
+        Ok(Some(u)) if u.active => u.session_version,
+        Ok(_) => return ApiError::Unauthorized.into_response(),
+        Err(err) => return err.into_response(),
+    };
+
+    // Subscribe before the first document is read, so nothing between the two
+    // is missed.
+    let (wake, wake_rx) = broadcast::channel(1);
+    let lagged = Arc::new(AtomicBool::new(false));
+    let forwarder = tokio::spawn(forward(
+        magpie.poller.subscribe(),
+        magpie.service_events.subscribe(),
+        wake,
+        lagged.clone(),
+    ));
+    let shutdown = magpie.shutdown_signal();
+
+    let state = Open {
+        core,
+        poller: magpie.poller.clone(),
+        user_id: id,
+        session_version,
+        changes: Changes::all(wake_rx).quiet(QUIET),
+        sent: HashMap::new(),
+        first: true,
+        lagged,
+        shutdown,
+        _slot: slot,
+        _forwarder: AbortOnDrop(forwarder),
+    };
+    // The stream is polled after this handler returned, outside the request's
+    // language scope: carry the language along.
+    let lang = i18n::current();
+    let events = stream::unfold(state, move |mut st| async move {
+        loop {
+            let full = if st.first {
+                true
+            } else {
+                let stopped = async {
+                    let _ = st.shutdown.wait_for(|stop| *stop).await;
+                };
+                tokio::select! {
+                    changed = st.changes.next() => {
+                        changed?;
+                        st.lagged.swap(false, Ordering::AcqRel)
+                    }
+                    _ = stopped => return None,
+                }
+            };
+            match i18n::scope(lang, st.turn(full)).await {
+                Turn::Send(event) => return Some((event, st)),
+                Turn::Nothing => {}
+                Turn::End => return None,
+            }
+        }
+    });
+    live::sse(events)
+}

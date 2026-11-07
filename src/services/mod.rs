@@ -98,6 +98,14 @@ impl Viewer {
     }
 }
 
+impl Viewer {
+    /// Who a request made with an API token acts as. (The review round of the
+    /// cards task narrows this to tokens that carry the `start:owner` scope.)
+    pub fn for_token(user: &CurrentUser) -> Self {
+        Viewer::new(user.id, user.account_role.is_admin())
+    }
+}
+
 impl From<&CurrentUser> for Viewer {
     /// Admin by the account's own role, not the request's: a read-only API
     /// token caps `CurrentUser::role` at viewer, but the extension that holds it

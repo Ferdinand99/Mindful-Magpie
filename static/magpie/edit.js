@@ -23,7 +23,9 @@
 // resolves to `{ status, body }` like `save`. Without it the picker offers the
 // four presets only) and `services` (the services the person may use, from
 // #mm-services: `[{ id, name, kind, interval_s, metrics: [{ id, label, format }] }]`;
-// the card form binds a card to one of them, see `serviceField`).
+// the card form binds a card to one of them, see `serviceField`), `getValues`
+// (gives the readings of the services, from #mm-values, that the page is drawn with
+// when edit mode ends) and `onEnd` (called when edit mode has ended, however).
 import {
   addBookmark,
   addCard,
@@ -326,7 +328,16 @@ export function startEditing(root, getLayout, save, opts = {}) {
   // The services the card form offers; without the list a card cannot be bound here.
   const services = Array.isArray(opts.services) ? opts.services : [];
   // The page is drawn with them again when edit mode ends, so bound cards keep their numbers.
-  const pageOpts = () => ({ lang, labels: ui.labels, ...(Array.isArray(opts.services) ? { services: opts.services } : {}) });
+  // `getValues` gives the page's latest readings, which the plain page is drawn with.
+  const pageOpts = () => {
+    const values = typeof opts.getValues === "function" ? opts.getValues() : undefined;
+    return {
+      lang,
+      labels: ui.labels,
+      ...(Array.isArray(opts.services) ? { services: opts.services } : {}),
+      ...(values && typeof values === "object" ? { values } : {}),
+    };
+  };
   // The picture the stored layout uses, if any, and the one uploaded in this
   // session. The server keeps one picture per user, and is asked to remove one
   // (by id, see cleanupPictures) only when this editor is done with it.
@@ -1512,6 +1523,7 @@ export function startEditing(root, getLayout, save, opts = {}) {
     host.remove();
     root.removeAttribute("data-editing");
     if (editButton) editButton.setAttribute("aria-pressed", "false");
+    opts.onEnd?.();
   }
 
   // Unsaved changes. The browser prompt covers leaving the page (a reload, a

@@ -1,8 +1,10 @@
 // Mindful Magpie: the start page script. It reads the layout and the interface
 // strings the server embedded in the page as data (#mm-layout, #mm-labels) and
 // draws them with the shared renderer. It never moves focus. Edit mode (edit.js)
-// is loaded only when the person presses the Edit button.
-import { render } from "./render.js";
+// is loaded only when the person presses the Edit button. Numbers of bound
+// cards come from #mm-values and stay current through an event stream (see
+// initLive).
+import { render, tickAges, updateValues } from "./render.js";
 
 function readJson(doc, id) {
   const block = doc.getElementById(id);
@@ -26,6 +28,16 @@ function servicesOpt(doc) {
 }
 
 /**
+ * The values block of the page (`#mm-values`: the latest reading of each service
+ * a card of this page is bound to) as the renderer's `values` option, or no
+ * option when the block is missing or not an object.
+ */
+function valuesOpt(doc) {
+  const values = readJson(doc, "mm-values");
+  return values && typeof values === "object" && !Array.isArray(values) ? { values } : {};
+}
+
+/**
  * Draws the layout embedded in `doc` into #groups. On a page without #groups
  * (the body of another page was swapped in) it takes the background off <html>
  * instead, because htmx swaps only the body and <html> would keep it.
@@ -44,7 +56,7 @@ export function draw(doc) {
   // An unreadable layout draws as the empty page; the notice above says why.
   const layout = readJson(doc, "mm-layout");
   const labels = readJson(doc, "mm-labels") ?? {};
-  render(root, layout, { lang: doc.documentElement.lang, labels, ...servicesOpt(doc) });
+  render(root, layout, { lang: doc.documentElement.lang, labels, ...servicesOpt(doc), ...valuesOpt(doc) });
 }
 
 /**
@@ -62,13 +74,18 @@ export function drawIfNeeded(doc) {
   draw(doc);
 }
 
-/** Replaces the layout block of the page, so that the page and the next edit start from it. */
-function writeLayoutBlock(doc, layout) {
-  const block = doc.getElementById("mm-layout");
+/** Replaces the data block `id` of the page with `value` as JSON. */
+function writeBlock(doc, id, value) {
+  const block = doc.getElementById(id);
   if (!block) return;
   // `<` as an escape: the block lives in HTML, and htmx saves it as HTML for the
   // history, so no text in it may be able to end it early.
-  block.textContent = JSON.stringify(layout).replace(/</g, "\\u003c");
+  block.textContent = JSON.stringify(value).replace(/</g, "\\u003c");
+}
+
+/** Replaces the layout block of the page, so that the page and the next edit start from it. */
+function writeLayoutBlock(doc, layout) {
+  writeBlock(doc, "mm-layout", layout);
 }
 
 /**
@@ -308,7 +325,12 @@ export function initEditing(doc, deps = {}) {
         background,
         draft: restored ?? undefined,
         onDiscard: () => clearStash(storage),
+        // The page is drawn with the numbers again when edit mode ends.
+        getValues: () => readJson(doc, "mm-values") ?? undefined,
+        onEnd: () => deps.onEditingChange?.(),
       });
+      // The stream is closed while the page is being edited.
+      deps.onEditingChange?.();
     } catch (error) {
       // Only a draft that edit mode cannot use is dropped.
       if (restored) clearStash(storage);
@@ -398,6 +420,220 @@ export function initEditing(doc, deps = {}) {
   };
 }
 
+// ---- live values ------------------------------------------------------------
+
+export const LIVE_URL = "/start/live";
+/** How often the ages on the cards are brought up to date. */
+export const TICK_MS = 30 * 1000;
+/** How long to wait before opening the stream again after the server refused it. */
+export const RETRY_MS = 30 * 1000;
+
+/** A time as epoch milliseconds: epoch seconds, epoch milliseconds or an ISO string; else null. */
+function toMs(value) {
+  let n = Number.NaN;
+  if (typeof value === "number") {
+    n = value;
+  } else if (typeof value === "string" && value.trim() !== "") {
+    n = Number(value);
+    if (Number.isNaN(n)) return Number.isFinite(Date.parse(value)) ? Date.parse(value) : null;
+  }
+  if (!Number.isFinite(n)) return null;
+  // Seconds until about the year 5138, milliseconds beyond that.
+  return Math.abs(n) < 1e11 ? n * 1000 : n;
+}
+
+/**
+ * Merges a stream event into the values the page has. A `full` event replaces
+ * them; any other event adds and replaces the entries it carries and drops the
+ * ids in `removed`. Returns `{ values, removed }`, `removed` being every id the
+ * person no longer gets (the service was deleted, hidden or unbound), so that
+ * the caller can drop it from the services list too. Neither argument is
+ * changed.
+ */
+export function mergeValues(current, update) {
+  const before = current && typeof current.services === "object" && current.services ? current.services : {};
+  const sent = update && typeof update.services === "object" && update.services ? update.services : {};
+  const listed = Array.isArray(update?.removed) ? update.removed.map(String) : [];
+  const services = update?.full ? {} : { ...before };
+  for (const id of listed) delete services[id];
+  Object.assign(services, sent);
+  const removed = new Set(listed);
+  if (update?.full) {
+    for (const id of Object.keys(before)) if (!(id in sent)) removed.add(id);
+  }
+  return { values: { now: update?.now ?? current?.now, services }, removed: [...removed] };
+}
+
+/** The services list after an event: the removed ones gone, names and intervals as the event has them. */
+function mergeServices(list, values, removed) {
+  const gone = new Set(removed);
+  return list
+    .filter((s) => !gone.has(String(s?.id)))
+    .map((s) => {
+      const entry = values.services[String(s?.id)];
+      if (!entry) return s;
+      return { ...s, name: entry.name ?? s.name, interval_s: entry.interval_s ?? s.interval_s };
+    });
+}
+
+/** Whether any card of the layout shows a service. */
+function hasBoundCards(layout) {
+  return (Array.isArray(layout?.groups) ? layout.groups : []).some(
+    (g) => Array.isArray(g?.cards) && g.cards.some((c) => c && typeof c === "object" && c.service),
+  );
+}
+
+/**
+ * Keeps the numbers on the cards current. The page holds the latest readings in
+ * `#mm-values`; while the page is visible and not being edited, an EventSource
+ * on `/start/live` brings changes (the first event of a stream is the whole
+ * document, so a stream opened after a long hidden spell, a reconnect or a
+ * save catches up at once). Each event is merged into the block, and the cards
+ * are updated in place (`updateValues`: no element a person may be standing on
+ * is replaced, so focus stays); only when the page and the layout differ in
+ * more than numbers is it drawn again. Nothing is redrawn while edit mode is
+ * open (it owns the page); the stream is closed then, and opens again when edit
+ * mode ends.
+ *
+ * A timer every 30 s brings the ages up to date, counted on the server's clock:
+ * the offset between it and this one is taken from each event's `now`.
+ *
+ * The stream is closed when the page is hidden, when the body is swapped
+ * (`htmx:beforeSwap`, a boosted visit) or when `#groups` is no longer in the
+ * document, so nothing stays open across navigation. A server that refuses a
+ * stream (an `EventSource` does not retry those) is asked again after
+ * `RETRY_MS`.
+ *
+ * `deps` (for tests): `EventSource`, `now`, `setInterval`, `clearInterval`,
+ * `setTimeout`, `clearTimeout`. Returns `{ sync, close, tick, apply, isOpen }`:
+ * `sync()` opens or closes the stream as the page's state asks (call it when
+ * anything that matters changed), `tick()` is the timer's work.
+ */
+export function initLive(doc, deps = {}) {
+  const win = doc.defaultView;
+  const EventSourceCtor = deps.EventSource ?? win?.EventSource ?? globalThis.EventSource;
+  const now = deps.now ?? (() => Date.now());
+  const every = deps.setInterval ?? ((fn, ms) => globalThis.setInterval(fn, ms));
+  const stopEvery = deps.clearInterval ?? ((id) => globalThis.clearInterval(id));
+  const later = deps.setTimeout ?? ((fn, ms) => globalThis.setTimeout(fn, ms));
+  const stopLater = deps.clearTimeout ?? ((id) => globalThis.clearTimeout(id));
+  let source = null;
+  let timer = null;
+  let retry = null;
+  // Server clock minus this one, in ms; null until a page or an event says.
+  let offset = null;
+
+  const rootEl = () => doc.getElementById("groups");
+  const editing = () => rootEl()?.hasAttribute("data-editing") === true;
+
+  function learnClock(values) {
+    const server = toMs(values?.now);
+    if (server !== null) offset = server - now();
+  }
+  learnClock(readJson(doc, "mm-values"));
+
+  function wanted() {
+    const root = rootEl();
+    if (!root || !root.isConnected || editing() || typeof EventSourceCtor !== "function") return false;
+    if (doc.visibilityState !== "visible") return false;
+    if (!readJson(doc, "mm-values")) return false;
+    return hasBoundCards(readJson(doc, "mm-layout"));
+  }
+
+  function close() {
+    if (source) {
+      const old = source;
+      source = null;
+      old.close();
+    }
+    if (timer !== null) {
+      stopEvery(timer);
+      timer = null;
+    }
+    if (retry !== null) {
+      stopLater(retry);
+      retry = null;
+    }
+  }
+
+  function ages() {
+    const labels = readJson(doc, "mm-labels") ?? {};
+    tickAges(rootEl(), { now: now() + (offset ?? 0), lang: doc.documentElement.lang, labels });
+  }
+
+  function tick() {
+    // The page may have gone while the timer ran.
+    if (!wanted()) return sync();
+    ages();
+  }
+
+  function open() {
+    const mine = new EventSourceCtor(LIVE_URL);
+    source = mine;
+    mine.addEventListener("values", (event) => {
+      if (source !== mine) return;
+      let update = null;
+      try {
+        update = JSON.parse(event.data);
+      } catch {
+        // Not ours to read: the next event will do.
+      }
+      if (update && typeof update === "object") apply(update);
+    });
+    mine.addEventListener("error", () => {
+      if (source !== mine) return;
+      // The browser reconnects by itself unless the server answered with
+      // something other than a stream (a refusal, a sign-out): that is final.
+      if (mine.readyState === 2) {
+        source = null;
+        if (retry === null) {
+          retry = later(() => {
+            retry = null;
+            sync();
+          }, RETRY_MS);
+        }
+      }
+    });
+  }
+
+  function sync() {
+    if (!wanted()) return close();
+    if (!source && retry === null) open();
+    if (timer === null) {
+      timer = every(tick, TICK_MS);
+      // The page may have been hidden for a while: the ages are old.
+      ages();
+    }
+  }
+
+  /** Takes an update (an event's data) into the page: the blocks first, then the cards. */
+  function apply(update) {
+    const { values, removed } = mergeValues(readJson(doc, "mm-values"), update);
+    writeBlock(doc, "mm-values", values);
+    const listed = readJson(doc, "mm-services");
+    if (Array.isArray(listed)) writeBlock(doc, "mm-services", mergeServices(listed, values, removed));
+    learnClock(values);
+    // Edit mode owns the page; the blocks are current for when it ends.
+    if (editing()) return;
+    const root = rootEl();
+    const layout = readJson(doc, "mm-layout");
+    if (!root || !layout) return;
+    const options = {
+      lang: doc.documentElement.lang,
+      labels: readJson(doc, "mm-labels") ?? {},
+      ...servicesOpt(doc),
+      values,
+    };
+    if (!updateValues(root, layout, options)) draw(doc);
+  }
+
+  doc.addEventListener("visibilitychange", sync);
+  // A boosted visit swaps the body: nothing may stay open for the old page.
+  doc.addEventListener("htmx:beforeSwap", close);
+
+  return { sync, close, tick, apply, isOpen: () => source !== null };
+}
+
 /**
  * Wires a page: edit mode, the first draw and what htmx does to the body. Returns
  * `{ editing, start }`; `start()` draws the page (call it when the document is
@@ -413,25 +649,30 @@ export function initEditing(doc, deps = {}) {
  * reloaded in full.
  */
 export function wirePage(doc, deps = {}) {
-  const editing = initEditing(doc, deps);
+  // `deps.live` goes to `initLive`; edit mode tells it when it opens and closes.
+  const live = initLive(doc, deps.live ?? {});
+  const editing = initEditing(doc, { ...deps, onEditingChange: () => live.sync() });
   const start = () => {
     // A start page with its data takes off the mark of an earlier reload.
     reloadIfDataLost(doc, deps);
     draw(doc);
     editing.offerRestore();
+    live.sync();
   };
   doc.addEventListener("htmx:afterSettle", () => {
     if (reloadIfDataLost(doc, deps)) return;
     editing.check();
     drawIfNeeded(doc);
     editing.offerRestore();
+    live.sync();
   });
   doc.addEventListener("htmx:historyRestore", () => {
     if (reloadIfDataLost(doc, deps)) return;
     drawIfNeeded(doc);
     editing.offerRestore();
+    live.sync();
   });
-  return { editing, start };
+  return { editing, start, live };
 }
 
 if (typeof document !== "undefined") {

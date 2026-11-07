@@ -3,6 +3,8 @@
 //! - `GET /api/v1/me/start`: the token owner's start page layout. Only an API
 //!   token opens it. The path is exempt from the CSRF guard, so a session
 //!   cookie, which a foreign page can make the browser send, is never enough.
+//! - `GET /api/v1/me/values`: the latest readings of the services bound to the
+//!   cards on that layout (same rules; see [`crate::values`]).
 //! - `POST /api/v1/extension/token`: the last step of the connect flow (see
 //!   [`crate::connect`]): a one-time code and the PKCE verifier for a
 //!   read-only API token. It takes no credentials; the code is the credential.
@@ -32,7 +34,8 @@ use vole_kit::http::ratelimit::{Rate, too_many_requests};
 use vole_kit::state::Core;
 
 use crate::layout::Layout;
-use crate::services::{ServiceView, services_for};
+use crate::services::{ServiceView, Viewer, services_for};
+use crate::values::values_for;
 use crate::{Magpie, connect, layout};
 
 /// Token requests one address may make: a person connects once in a while, a
@@ -49,6 +52,8 @@ const MAX_TOKENS_PER_USER: i64 = 50;
 
 const ME_START_EXAMPLE: &str = r##"{"version": 3, "background": {"kind": "preset", "name": "hav"}, "groups": [{"id": "g1", "title": "Services", "cards": [{"id": "c1", "title": "Vigilant Vole", "description": "Uptime", "url": "https://vole.example.com/", "icon": {"emoji": null, "colour": "teal"}, "service": {"id": 1, "metrics": ["status", "latency_ms"]}}]}], "bookmarks": [{"id": "b1", "title": "Docs", "url": "https://docs.example.com/"}], "services": [{"id": 1, "name": "Blog", "kind": "http", "interval_s": 60, "metrics": [{"id": "status", "label": "HTTP status", "format": "number"}, {"id": "latency_ms", "label": "Response time (ms)", "format": "number"}]}]}"##;
 
+const ME_VALUES_EXAMPLE: &str = r##"{"now": 1760000090, "services": {"1": {"name": "Blog", "kind": "http", "interval_s": 60, "status": "ok", "values": {"status": {"num": 200.0, "text": null}, "latency_ms": {"num": 84.0, "text": null}}, "needs": [], "fetched_at": 1760000060}, "2": {"name": "Wiki", "kind": "http", "interval_s": 60, "status": "bad", "values": {}, "needs": [], "fetched_at": 1760000070, "error_label": "Timeout"}}}"##;
+
 /// Magpie's documented endpoints (the API reference at `/api-docs`).
 pub const ROUTES: &[RouteDoc] = &[
     r(
@@ -59,6 +64,14 @@ pub const ROUTES: &[RouteDoc] = &[
         "The start page layout of the token's owner, as the page shows it: `version`, `background`, `groups` of cards and `bookmarks`, and `services`: the services the owner may see, each `{id, name, kind, interval_s, metrics: [{id, label, format}]}` (`label` in the request's language, `format` one of `number`, `percent`, `bytes`, `bytes_per_sec`, `duration`, `since`, `text`), never an address, a setting or a key. A card bound to a service has `service: {id, metrics: [ids]}`; the id may not be in `services` (the service was removed or is no longer visible). Any API token opens it (read access is enough); a session cookie never does. If the stored layout is unreadable, the answer is the empty layout at the stored version, as the page shows it. A picture background that is no longer the user's picture is shown as the `hedgerow` preset, with the stored version. Never cached (`Cache-Control: no-store`).",
     )
     .res(ME_START_EXAMPLE),
+    r(
+        "GET",
+        "/api/v1/me/values",
+        "viewer",
+        "Service values",
+        "The latest reading of every service that is bound to a card on the token owner's start page and that the owner may see: `{now, services}`, `now` being the server's clock in Unix seconds and `services` an object by service id with `{name, kind, interval_s, status, values, needs, fetched_at, error_label}` for each. `status` is `ok`, `warn`, `bad` or `unknown`; `values` maps a metric id to `{num, text}` (either may be `null`); `needs` lists what needs the owner's attention (`{key, level, label_key, params, score}`); `fetched_at` is the time of the reading in Unix seconds, or `null` while the service has not been read yet (then `status` is `unknown` and `values` is empty); `error_label` is present when the last reading failed and says why in the request's language (a fixed set of texts, never the raw error). A service the owner may not see is left out entirely. Pages and the extension never wait for the service itself: this is the stored reading, and its age is `now - fetched_at`. Any API token opens it (read access is enough); a session cookie never does. Never cached (`Cache-Control: no-store`).",
+    )
+    .res(ME_VALUES_EXAMPLE),
     r(
         "POST",
         "/api/v1/extension/token",
@@ -81,7 +94,9 @@ pub const ERROR_CODES: &[ErrorCode] = &[ErrorCode {
 /// The routes that take an API token (the caller adds the sign-in guard,
 /// which resolves the token).
 pub fn router() -> Router<Core> {
-    Router::new().route("/api/v1/me/start", get(me_start))
+    Router::new()
+        .route("/api/v1/me/start", get(me_start))
+        .route("/api/v1/me/values", get(me_values))
 }
 
 /// The routes without credentials.
@@ -121,6 +136,26 @@ async fn me_start(
         Json(StartDoc { layout, services }),
     )
         .into_response())
+}
+
+/// `GET /api/v1/me/values`: the readings of the services bound on the token
+/// owner's layout and visible to them, whole (see [`crate::values`]). Only a
+/// token opens it, as with `/api/v1/me/start`.
+async fn me_values(
+    State(core): State<Core>,
+    Extension(magpie): Extension<Magpie>,
+    user: CurrentUser,
+    method: Option<Extension<AuthMethod>>,
+) -> Result<Response, ApiError> {
+    if !matches!(method, Some(Extension(AuthMethod::Token { .. }))) {
+        return Err(ApiError::Unauthorized);
+    }
+    if !user.can_read() {
+        return Err(ApiError::Forbidden);
+    }
+    let (layout, _) = layout::load_or_default(&core, user.id).await?;
+    let doc = values_for(&core, &magpie.poller, Viewer::for_token(&user), &layout).await?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(doc)).into_response())
 }
 
 #[derive(Deserialize)]

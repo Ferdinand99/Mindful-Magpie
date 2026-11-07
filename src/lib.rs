@@ -17,6 +17,7 @@ pub mod pages;
 pub mod product;
 pub mod server;
 pub mod services;
+pub mod values;
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -56,6 +57,23 @@ pub struct Magpie {
     /// The latest snapshot of every service (see [`integrations::poller`]).
     /// Idle until the server starts the poller; pages only read from it.
     pub poller: integrations::poller::PollerHandle,
+    /// Set when the server is told to stop: open event streams (see
+    /// [`values`]) end, because the server waits for every connection to
+    /// finish before it exits.
+    pub shutdown: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl Magpie {
+    /// Tells the open event streams to end (the server calls it when it is
+    /// told to stop).
+    pub fn begin_shutdown(&self) {
+        self.shutdown.send_replace(true);
+    }
+
+    /// A receiver that turns `true` when [`Magpie::begin_shutdown`] is called.
+    pub fn shutdown_signal(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.shutdown.subscribe()
+    }
 }
 
 /// Installs the configuration, opens and migrates the database in
@@ -112,6 +130,7 @@ pub async fn start_with(
         backgrounds,
         service_events: tokio::sync::broadcast::channel(64).0,
         poller: integrations::poller::PollerHandle::idle(),
+        shutdown: Arc::new(tokio::sync::watch::channel(false).0),
     })
 }
 
@@ -126,6 +145,7 @@ pub fn router(magpie: Magpie) -> Router {
         .merge(connect::router())
         .merge(api::router())
         .merge(services::pages::router())
+        .merge(values::router())
         .merge(kit_pages::router())
         // Inside the sign-in guard: sees who is signed in (see the function).
         .route_layer(from_fn(pages::sweep_after_user_delete))
