@@ -14,6 +14,12 @@
 // every 30 s (an EventSource cannot send the token, so there is no stream). Hiding the tab stops
 // the timer, showing it refreshes at once and starts it again.
 //
+// The cache belongs to one server and one token. Values and the old-server back-off are tagged with
+// the server address and trusted only for that server. Before anything is written, the saved
+// server and token are read again: a tab that outlives a change of either stops and writes nothing,
+// so it cannot put another server's numbers into the cache. `connection.onChange(cb)` lets the page
+// tell the sequence about a change at once.
+//
 // A storage failure never leaves the page blank: a failed read draws the "not connected" state, a
 // failed write is ignored because the page is already drawn.
 import {
@@ -33,6 +39,8 @@ export const REFRESH_MS = 30_000;
 export const MISSING_BACKOFF_MS = 5 * 60_000;
 // Showing the tab again refreshes at once, unless the last attempt is this recent.
 const MIN_GAP_MS = 10_000;
+// The values cache is not written when it is bigger than this many characters of JSON.
+export const MAX_CACHED_VALUES = 256 * 1024;
 
 const defaultTimers = {
   set: (fn, ms) => setInterval(fn, ms),
@@ -56,6 +64,7 @@ export async function start({
   update = draw,
   tick = () => {},
   visibility = null,
+  connection = null,
   timers = defaultTimers,
   now = Date.now,
 }) {
@@ -70,17 +79,47 @@ export async function start({
   const conn = { serverUrl: stored.serverUrl, token: stored.token };
   const connected = Boolean(conn.serverUrl && conn.token);
 
+  // ---- Control of the refresh (declared first: everything below may stop it) ----
+  let stopped = false;
+  let timer = null;
+  let inFlight = null;
+  let lastAttempt = now();
+  let blocked = false; // the token was rejected: no point in asking again
+  let bound = false;
+  const unschedule = () => {
+    if (timer !== null) timers.clear(timer);
+    timer = null;
+  };
+  const stop = () => {
+    stopped = true;
+    unschedule();
+  };
+  if (connection) connection.onChange(stop);
+
+  // The saved server and token, read again: false when either differs from what this page started
+  // with (or cannot be read).
+  async function sameConnection() {
+    try {
+      const current = await storage.local.get(["serverUrl", "token"]);
+      return current?.serverUrl === conn.serverUrl && current?.token === conn.token;
+    } catch {
+      return false;
+    }
+  }
+
   // Values, with the offset between the server's clock and this device's clock (server minus
-  // device, in ms). A cache without a usable offset is not trusted: its ages would be wrong.
+  // device, in ms). A cache from another server, or without a usable offset, is not trusted: its
+  // numbers belong elsewhere, or its ages would be wrong.
   const cv = stored.lastValues;
-  const haveCache = isValidValues(cv?.values) && Number.isFinite(cv?.offsetMs);
+  const haveCache =
+    connected && cv?.serverUrl === conn.serverUrl && isValidValues(cv?.values) && Number.isFinite(cv?.offsetMs);
   let values = haveCache ? cv.values : null;
   let offsetMs = haveCache ? cv.offsetMs : 0;
-  let missingAt = Number.isFinite(stored.valuesMissing) ? stored.valuesMissing : null;
+  const vm = stored.valuesMissing;
+  let missingAt = connected && vm?.serverUrl === conn.serverUrl && Number.isFinite(vm?.at) ? vm.at : null;
   let baseStatus;
   let status;
   let data = cached;
-  let blocked = false; // the token was rejected: no point in asking again
 
   const inBackoff = () => missingAt !== null && now() - missingAt < MISSING_BACKOFF_MS;
   const clock = () => now() + offsetMs;
@@ -102,27 +141,39 @@ export async function start({
     fetchData(fetchImpl, conn.serverUrl, conn.token),
     asking ? fetchValues(fetchImpl, conn.serverUrl, conn.token) : undefined,
   ]);
+  const controller = { refresh: () => refresh(), stop };
+  // The settings changed while the requests ran: the answers belong to the old connection.
+  if (stopped || !(await sameConnection())) {
+    stop();
+    return controller;
+  }
   const view = nextView(cached, startResult);
   data = view.data;
   baseStatus = view.status;
-  const bound = hasBound(data);
+  bound = hasBound(data);
 
   // Takes in the answer of a values fetch: keeps, stores or drops the values and returns the kind
-  // (fresh, cached, network, unauthorized, missing).
+  // (fresh, cached, network, unauthorized, missing, or stale when the settings changed meanwhile).
   async function absorb(result) {
+    if (!(await sameConnection())) {
+      stop();
+      return "stale";
+    }
     const next = nextValues(values, result);
     values = next.values;
     try {
       if (next.kind === "fresh") {
         offsetMs = serverNowMs(values) - now();
-        await storage.local.set({ lastValues: { values, offsetMs } });
+        const entry = { serverUrl: conn.serverUrl, values, offsetMs };
+        if (JSON.stringify(entry).length <= MAX_CACHED_VALUES) await storage.local.set({ lastValues: entry });
+        else await storage.local.remove("lastValues"); // too big to keep; an older copy would be wrong
         if (missingAt !== null) await storage.local.remove("valuesMissing");
         missingAt = null;
       } else if (next.kind === "missing") {
         offsetMs = 0;
         missingAt = now();
         await storage.local.remove("lastValues");
-        await storage.local.set({ valuesMissing: missingAt });
+        await storage.local.set({ valuesMissing: { serverUrl: conn.serverUrl, at: missingAt } });
       }
     } catch {
       // The cache is an optimisation; the page is already drawn.
@@ -131,17 +182,21 @@ export async function start({
     return next.kind;
   }
 
+  // The back-off must be recorded even for a layout with no bound cards: an old server has none.
+  // Only a page with bound cards is marked or polled because of the answer.
   let kind;
-  if (bound && asking) {
-    kind = await absorb(valuesResult);
+  if (asking) {
+    const answer = await absorb(valuesResult);
+    if (bound) kind = answer;
   } else if (bound && connected) {
     // Inside the back-off of an old server: draw without values, as for any 404.
     values = null;
     kind = "missing";
   }
+  if (stopped) return controller;
   status = statusWithValues(baseStatus, kind);
   draw(buildView(), conn);
-  if (view.status === "fresh") {
+  if (view.status === "fresh" && (await sameConnection())) {
     try {
       await storage.local.set({ last: view.data });
     } catch {
@@ -149,22 +204,20 @@ export async function start({
     }
   }
   if (status === "unauthorized") blocked = true;
+  lastAttempt = now();
 
   // ---- Refresh while the tab is visible ----
-  let stopped = false;
-  let timer = null;
-  let inFlight = null;
-  let lastAttempt = now();
-
-  const polling = () => !stopped && bound && connected && !blocked;
-  const hidden = () => (visibility ? visibility.isHidden() : false);
-  const unschedule = () => {
-    if (timer !== null) timers.clear(timer);
-    timer = null;
-  };
-  const schedule = () => {
-    if (timer === null && polling() && !hidden()) timer = timers.set(refresh, REFRESH_MS);
-  };
+  function polling() {
+    return !stopped && bound && connected && !blocked;
+  }
+  function hidden() {
+    return visibility ? visibility.isHidden() : false;
+  }
+  function schedule() {
+    if (timer === null && polling() && !hidden()) {
+      timer = timers.set(() => refresh().catch(() => {}), REFRESH_MS);
+    }
+  }
 
   async function run() {
     lastAttempt = now();
@@ -174,6 +227,7 @@ export async function start({
     const result = await fetchValues(fetchImpl, conn.serverUrl, conn.token);
     if (stopped) return;
     const answer = await absorb(result);
+    if (answer === "stale" || stopped) return;
     status = statusWithValues(baseStatus, answer);
     if (blocked) unschedule();
     update(buildView(), conn);
@@ -190,23 +244,21 @@ export async function start({
 
   if (visibility) {
     visibility.onChange(async () => {
-      if (stopped) return;
-      if (hidden()) {
-        unschedule();
-        return;
+      try {
+        if (stopped) return;
+        if (hidden()) {
+          unschedule();
+          return;
+        }
+        if (!polling()) return;
+        if (now() - lastAttempt >= MIN_GAP_MS) await refresh();
+      } catch {
+        // A failed refresh leaves the page as it is; the timer tries again.
       }
-      if (!polling()) return;
-      if (now() - lastAttempt >= MIN_GAP_MS) await refresh();
       schedule();
     });
   }
   schedule();
 
-  return {
-    refresh,
-    stop() {
-      stopped = true;
-      unschedule();
-    },
-  };
+  return controller;
 }

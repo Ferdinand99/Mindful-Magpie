@@ -66,10 +66,12 @@ start page. `/api/v1/me/start` carries the service catalogue (`services`); `GET
 
 `browser.storage.local` holds the server address, the token, the last layout, the service catalogue
 that came with it (service names and metric labels), the last service values (names, numbers and
-status) and the clock offset. The storage is private to the extension and is not synced. All of it
-is dropped when the server address or the token changes. The extension sends nothing anywhere
-except to the configured server, and it collects no data (`data_collection_permissions` is
-`none`).
+status) and the clock offset. The values and the clock offset are tagged with the server address
+and used only for that server. The storage is private to the extension and is not synced. The
+cached layout, catalogue and values are dropped when the server address or the token changes, and
+a tab that is still open then stops refreshing and writes nothing. A values cache bigger than
+256 KiB is not kept. The extension sends nothing anywhere except to the configured server, and it
+collects no data (`data_collection_permissions` is `none`).
 
 ## Image backgrounds
 

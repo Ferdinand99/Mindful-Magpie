@@ -89,9 +89,9 @@ export function createView({
       imageBase: serverOrigin(conn.serverUrl) ?? undefined,
       services: view.services,
       values: view.values ?? undefined,
-      // The extension's token is read-only, so there is no acknowledge button here. When the
-      // renderer has one (opts.canAck), pass `canAck: false`; web/extension-values.test.mjs has
-      // the matching assertion to flip.
+      // The extension's token is read-only, so no acknowledge button is drawn here. (Older
+      // renderers ignore the option.)
+      canAck: false,
     };
   }
 

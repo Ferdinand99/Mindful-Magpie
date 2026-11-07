@@ -21,6 +21,14 @@ const TOKEN = "mm_SECRET_VALUES_TOKEN";
 const SERVER = "http://10.0.3.152:8099";
 const read = (name) => readFileSync(new URL(`../extension/${name}`, import.meta.url), "utf8");
 
+// Real-world magnitudes: the server clock in epoch seconds (about 1.7e9), the device clock in epoch
+// milliseconds (about 1.7e12), and a device that runs 5 s ahead of the server.
+const SERVER_NOW = 1_700_000_000;
+const DEVICE_T = 1_700_000_005_000;
+const OFFSET = SERVER_NOW * 1000 - DEVICE_T;
+const cache = (v = values(), offsetMs = OFFSET, serverUrl = SERVER) => ({ serverUrl, values: v, offsetMs });
+const missing = (at, serverUrl = SERVER) => ({ serverUrl, at });
+
 const SERVICES = [
   {
     id: 1,
@@ -56,7 +64,7 @@ const layout = (over = {}) => ({
   ...over,
 });
 const values = (over = {}) => ({
-  now: 1000,
+  now: SERVER_NOW,
   services: {
     1: {
       name: "Blog",
@@ -65,7 +73,7 @@ const values = (over = {}) => ({
       status: "ok",
       values: { status: { num: 200, text: null }, latency_ms: { num: 84, text: null } },
       needs: [],
-      fetched_at: 990,
+      fetched_at: SERVER_NOW - 10,
       ...over,
     },
   },
@@ -91,6 +99,7 @@ test("isValidValues accepts the values document and rejects other shapes", () =>
 
 test("serverNowMs reads epoch seconds, epoch milliseconds and ISO text", () => {
   assert.equal(serverNowMs({ now: 1000 }), 1_000_000);
+  assert.equal(serverNowMs({ now: SERVER_NOW }), 1_700_000_000_000);
   assert.equal(serverNowMs({ now: 1_700_000_000_000 }), 1_700_000_000_000);
   assert.equal(serverNowMs({ now: "1970-01-01T00:16:40Z" }), 1_000_000);
   assert.equal(serverNowMs({ now: "soon" }), null);
@@ -176,7 +185,7 @@ test("statusWithValues marks a failed values fetch, and a token problem wins", (
 
 // ---------------------------------------------------------------- newtab-core.js
 
-function env({ stored = {}, startReply, valuesReply, hidden = false, t = 5_000_000 } = {}) {
+function env({ stored = {}, startReply, valuesReply, hidden = false, t = DEVICE_T, connection = true } = {}) {
   const store = { serverUrl: SERVER, token: TOKEN, ...stored };
   const clock = { t };
   const fetches = [];
@@ -216,8 +225,17 @@ function env({ stored = {}, startReply, valuesReply, hidden = false, t = 5_000_0
       return Promise.all(this.listeners.map((cb) => cb()));
     },
   };
+  const changes = {
+    listeners: [],
+    onChange(cb) {
+      this.listeners.push(cb);
+    },
+    fire() {
+      for (const cb of this.listeners) cb();
+    },
+  };
   const e = {
-    store, clock, fetches, draws, updates, ticks, sets, removes, timers, visibility,
+    changes, store, clock, fetches, draws, updates, ticks, sets, removes, timers, visibility,
     startReply: startReply ?? (() => reply(200, layout())),
     valuesReply: valuesReply ?? (() => reply(200, values())),
     deps: {
@@ -238,6 +256,7 @@ function env({ stored = {}, startReply, valuesReply, hidden = false, t = 5_000_0
       update: (view, conn) => updates.push({ view, conn }),
       tick: (nowMs) => ticks.push(nowMs),
       visibility,
+      ...(connection ? { connection: changes } : {}),
       timers,
       now: () => clock.t,
     },
@@ -247,14 +266,14 @@ function env({ stored = {}, startReply, valuesReply, hidden = false, t = 5_000_0
 const valuesFetches = (e) => e.fetches.filter((u) => u.endsWith("/api/v1/me/values")).length;
 
 test("cached values are drawn before any fetch, with ages counted from the estimated server clock", async () => {
-  const e = env({ stored: { last: layout(), lastValues: { values: values(), offsetMs: -4_000_000 } }, t: 5_300_000 });
+  const e = env({ stored: { last: layout(), lastValues: cache() }, t: DEVICE_T + 300_000 });
   await start(e.deps);
   const first = e.draws[0];
   assert.equal(first.fetchesSoFar, 0);
   assert.equal(first.view.status, "cached");
   assert.deepEqual(first.view.services, SERVICES);
-  // 5 300 000 ms on the device clock, offset -4 000 000 ms: the server is at 1300 s, not at 1000.
-  assert.equal(first.view.values.now, 1300);
+  // 300 s after the cache was made the server is at SERVER_NOW + 300, whatever the document says.
+  assert.equal(first.view.values.now, SERVER_NOW + 300);
   assert.deepEqual(first.view.values.services, values().services);
 });
 
@@ -265,24 +284,24 @@ test("a fresh fetch draws the new layout and values and stores both with the clo
   assert.equal(last.status, "fresh");
   assert.deepEqual(last.values.services, values().services);
   assert.deepEqual(last.services, SERVICES);
-  assert.deepEqual(e.store.lastValues, { values: values(), offsetMs: 1_000_000 - 5_000_000 });
+  assert.deepEqual(e.store.lastValues, { serverUrl: SERVER, values: values(), offsetMs: OFFSET });
   assert.deepEqual(e.store.last, layout());
 });
 
 test("the offset clock: ages tick against the server's clock, not the device's", async () => {
-  const e = env({ t: 5_000_000 });
+  const e = env();
   await start(e.deps);
   e.valuesReply = () => new TypeError("offline");
-  e.clock.t = 5_060_000;
+  e.clock.t = DEVICE_T + 60_000;
   await e.timers.fire();
-  assert.deepEqual(e.ticks, [1_060_000]);
-  assert.equal(e.updates.at(-1).view.values.now, 1060);
+  assert.deepEqual(e.ticks, [SERVER_NOW * 1000 + 60_000]);
+  assert.equal(e.updates.at(-1).view.values.now, SERVER_NOW + 60);
 });
 
 test("a values fetch failure keeps the cached values and marks the page offline", async () => {
-  const cached = values({ fetched_at: 100 });
+  const cached = values({ fetched_at: SERVER_NOW - 5000 });
   const e = env({
-    stored: { last: layout(), lastValues: { values: cached, offsetMs: -4_000_000 } },
+    stored: { last: layout(), lastValues: cache(cached) },
     valuesReply: () => new TypeError("NetworkError"),
   });
   await start(e.deps);
@@ -295,7 +314,7 @@ test("a values fetch failure keeps the cached values and marks the page offline"
 
 test("a values fetch that answers 500 or junk is a failure too", async () => {
   for (const r of [() => reply(500, null), () => reply(200, { nope: true })]) {
-    const e = env({ stored: { lastValues: { values: values(), offsetMs: 0 } }, valuesReply: r });
+    const e = env({ stored: { lastValues: cache() }, valuesReply: r });
     await start(e.deps);
     assert.equal(e.draws.at(-1).view.status, "offline");
     assert.ok(e.draws.at(-1).view.values);
@@ -312,7 +331,7 @@ test("a layout with no bound cards ignores a failing values fetch", async () => 
 
 test("a 401 or 403 from values reads like a 401 from start and stops the refresh", async () => {
   for (const code of [401, 403]) {
-    const e = env({ stored: { lastValues: { values: values(), offsetMs: 0 } }, valuesReply: () => reply(code, {}) });
+    const e = env({ stored: { lastValues: cache() }, valuesReply: () => reply(code, {}) });
     await start(e.deps);
     const view = e.draws.at(-1).view;
     assert.equal(view.status, "unauthorized");
@@ -323,7 +342,7 @@ test("a 401 or 403 from values reads like a 401 from start and stops the refresh
 
 test("old servers: 404 draws without values and is not asked again for five minutes", async () => {
   const e = env({
-    stored: { lastValues: { values: values(), offsetMs: 0 } },
+    stored: { lastValues: cache() },
     valuesReply: () => reply(404, { error: "not_found" }),
   });
   await start(e.deps);
@@ -331,7 +350,7 @@ test("old servers: 404 draws without values and is not asked again for five minu
   assert.equal(view.values, null);
   assert.equal(view.status, "fresh");
   assert.equal("lastValues" in e.store, false);
-  assert.equal(e.store.valuesMissing, 5_000_000);
+  assert.deepEqual(e.store.valuesMissing, missing(DEVICE_T));
   assert.equal(valuesFetches(e), 1);
 
   e.clock.t += 60_000;
@@ -340,13 +359,13 @@ test("old servers: 404 draws without values and is not asked again for five minu
   await e.timers.fire();
   assert.equal(valuesFetches(e), 1, "still inside the back-off");
 
-  e.clock.t = 5_000_000 + 5 * 60_000;
+  e.clock.t = DEVICE_T + 5 * 60_000;
   await e.timers.fire();
   assert.equal(valuesFetches(e), 2, "asked again after five minutes");
 });
 
 test("a new tab inside the back-off does not ask an old server at all", async () => {
-  const e = env({ stored: { valuesMissing: 4_900_000 }, t: 5_000_000 });
+  const e = env({ stored: { valuesMissing: missing(DEVICE_T - 100_000) } });
   await start(e.deps);
   assert.equal(valuesFetches(e), 0);
   assert.equal(e.draws.at(-1).view.values, null);
@@ -354,7 +373,7 @@ test("a new tab inside the back-off does not ask an old server at all", async ()
 });
 
 test("an old server that gets values later: the back-off ends and the values are kept", async () => {
-  const e = env({ stored: { valuesMissing: 1 }, t: 5_000_000 });
+  const e = env({ stored: { valuesMissing: missing(1) } });
   await start(e.deps);
   assert.equal(valuesFetches(e), 1);
   assert.equal("valuesMissing" in e.store, false);
@@ -424,9 +443,142 @@ test("the token is never in a draw, an update or a stored value", async () => {
   assert.equal(seen.includes(TOKEN), false);
 });
 
+test("a layout with no bound cards still records an old server's 404, and the next tab does not ask", async () => {
+  const plain = layout({ groups: [{ id: "g", title: "Plain", cards: [bound("wiki", "Wiki")] }], services: undefined });
+  delete plain.services;
+  const e = env({ startReply: () => reply(200, plain), valuesReply: () => reply(404, { error: "not_found" }) });
+  await start(e.deps);
+  assert.equal(valuesFetches(e), 1);
+  assert.deepEqual(e.store.valuesMissing, missing(DEVICE_T));
+  assert.equal(e.draws.at(-1).view.status, "fresh");
+  assert.equal(e.timers.active.size, 0, "nothing bound, nothing to poll");
+
+  e.clock.t += 4 * 60_000;
+  await start(e.deps);
+  assert.equal(valuesFetches(e), 1, "inside the five minutes");
+  e.clock.t += 61_000;
+  await start(e.deps);
+  assert.equal(valuesFetches(e), 2, "asked again after five minutes");
+});
+
+test("a values cache or back-off from another server is never drawn or obeyed", async () => {
+  const e = env({
+    stored: {
+      last: layout(),
+      lastValues: cache(values(), OFFSET, "http://other.example:1"),
+      valuesMissing: missing(DEVICE_T, "http://other.example:1"),
+    },
+    valuesReply: () => new TypeError("down"),
+  });
+  await start(e.deps);
+  assert.equal(e.draws[0].view.values, null, "the first paint has no foreign numbers");
+  assert.equal(e.draws.at(-1).view.values, null);
+  assert.equal(valuesFetches(e), 1, "the foreign back-off does not apply");
+});
+
+test("a server or token that changes between the fetch and the write leaves no write", async () => {
+  for (const change of [{ serverUrl: "http://other.example:1" }, { token: "another-token" }]) {
+    const e = env({
+      valuesReply: () => {
+        Object.assign(e.store, change);
+        return reply(200, values());
+      },
+    });
+    await start(e.deps);
+    assert.deepEqual(e.sets, [], JSON.stringify(change));
+    assert.deepEqual(e.removes, []);
+    assert.equal(e.timers.active.size, 0);
+    assert.equal(e.draws.length, 1, "only the cached first paint: the answers were for the old connection");
+  }
+});
+
+test("a 404 for the old connection is not recorded for the new one", async () => {
+  const e = env({
+    valuesReply: () => {
+      e.store.serverUrl = "http://new.example:1";
+      return reply(404, {});
+    },
+  });
+  await start(e.deps);
+  assert.equal("valuesMissing" in e.store, false);
+  assert.deepEqual(e.sets, []);
+});
+
+test("a refresh that finishes after a server change writes nothing and updates nothing", async () => {
+  const e = env();
+  await start(e.deps);
+  const sets = e.sets.length;
+  const updates = e.updates.length;
+  e.valuesReply = () => {
+    e.store.serverUrl = "http://other.example:1";
+    return reply(200, values({ status: "bad" }));
+  };
+  await e.timers.fire();
+  assert.equal(e.sets.length, sets);
+  assert.equal(e.updates.length, updates);
+  assert.equal(e.timers.active.size, 0);
+});
+
+test("a storage change of the server or token stops the refresh at once", async () => {
+  const e = env();
+  const ctl = await start(e.deps);
+  assert.equal(e.timers.active.size, 1);
+  e.changes.fire();
+  assert.equal(e.timers.active.size, 0);
+  const before = e.fetches.length;
+  await ctl.refresh();
+  await e.visibility.set(true);
+  await e.visibility.set(false);
+  assert.equal(e.fetches.length, before);
+  assert.equal(e.timers.active.size, 0);
+});
+
+test("a values document over 256 KiB is shown but not cached, and drops the older copy", async () => {
+  const big = values();
+  big.services[1].error_label = "x".repeat(300 * 1024);
+  const e = env({ stored: { lastValues: cache() }, valuesReply: () => reply(200, big) });
+  await start(e.deps);
+  assert.ok(e.draws.at(-1).view.values);
+  assert.equal("lastValues" in e.store, false);
+  const small = env({ valuesReply: () => reply(200, values()) });
+  await start(small.deps);
+  assert.ok(small.store.lastValues);
+});
+
+test("an exception inside a refresh or a visibility callback does not escape", async () => {
+  const e = env();
+  e.deps.update = () => {
+    throw new Error("renderer broke");
+  };
+  await start(e.deps);
+  await assert.doesNotReject(e.timers.fire());
+  e.clock.t += 60_000;
+  await assert.doesNotReject(e.visibility.set(true));
+  await assert.doesNotReject(e.visibility.set(false));
+});
+
+test("through the real view: a cached page ten minutes later reads Last updated, with exact text", async () => {
+  const v = makeView();
+  const e = env({
+    stored: { last: layout(), lastValues: cache() },
+    t: DEVICE_T + 600_000,
+    startReply: () => new TypeError("offline"),
+    valuesReply: () => new TypeError("offline"),
+  });
+  e.deps.draw = v.draw;
+  e.deps.update = v.draw.update;
+  e.deps.tick = v.draw.tick;
+  await start(e.deps);
+  const rtf = new Intl.RelativeTimeFormat("en", { numeric: "auto", style: "short" });
+  // Fetched 10 s before the cache was made, plus 600 s since: 610 s is 10 whole minutes.
+  assert.equal(v.root.querySelector(".mm-age").textContent, `Last updated ${rtf.format(-10, "minute")}`);
+  assert.equal(v.root.querySelector(".mm-bound").hasAttribute("data-stale"), true);
+  assert.equal(v.statusEl.textContent, statusText.offline);
+});
+
 test("a token or server change clears the values cache (options page)", async () => {
   const { saveConnection } = await import("../extension/options-core.js");
-  const store = { serverUrl: SERVER, token: "old", last: layout(), lastValues: { values: values(), offsetMs: 0 }, valuesMissing: 5 };
+  const store = { serverUrl: SERVER, token: "old", last: layout(), lastValues: cache(), valuesMissing: missing(5) };
   const storage = {
     local: {
       get: async (keys) => Object.fromEntries([].concat(keys).map((k) => [k, store[k]])),
@@ -520,16 +672,15 @@ test("update with a different layout draws again instead of updating", () => {
   assert.deepEqual(calls, ["render", "render"]);
 });
 
-test("the renderer gets services and values; acks stay off in v0.3 (hook for opts.canAck)", () => {
+test("the renderer gets services and values, and canAck is false (read-only token)", () => {
   const seen = [];
   const renderer = { render: (root, data, opts) => { seen.push(opts); return render(root, data, opts); }, updateValues, tickAges };
   const v = makeView(renderer);
   v.draw(viewOf(values()), CONN);
   assert.deepEqual(seen[0].services, SERVICES);
-  assert.equal(seen[0].values.now, 1000);
-  // The extension token is read-only. When the renderer has an ack button (opts.canAck), this must
-  // be false: change this assertion to `assert.equal(seen[0].canAck, false)` then.
-  assert.notEqual(seen[0].canAck, true);
+  assert.equal(seen[0].values.now, SERVER_NOW);
+  // The extension token is read-only: no acknowledge button.
+  assert.equal(seen[0].canAck, false);
 });
 
 test("tick moves the ages without drawing again", () => {
@@ -538,10 +689,14 @@ test("tick moves the ages without drawing again", () => {
   const v = makeView(renderer);
   v.draw(viewOf(values()), CONN);
   const age = () => v.root.querySelector(".mm-age").textContent;
-  const before = age();
-  v.draw.tick(1000_000 + 10 * 60_000);
-  assert.deepEqual(calls, [1_600_000]);
-  assert.notEqual(age(), before);
+  const rtf = new Intl.RelativeTimeFormat("en", { numeric: "auto", style: "short" });
+  assert.equal(age(), rtf.format(-10, "second"));
+  assert.equal(v.root.querySelector(".mm-bound").hasAttribute("data-stale"), false);
+  // Ten minutes later: fetched 610 s ago, more than three intervals of 60 s, so stale.
+  v.draw.tick(SERVER_NOW * 1000 + 10 * 60_000);
+  assert.deepEqual(calls, [SERVER_NOW * 1000 + 600_000]);
+  assert.equal(age(), `Last updated ${rtf.format(-10, "minute")}`);
+  assert.equal(v.root.querySelector(".mm-bound").hasAttribute("data-stale"), true);
 });
 
 test("the token is not in the DOM, the status line or any thrown error", async () => {
@@ -585,4 +740,11 @@ test("the page script wires the refresh to the page's visibility", () => {
   const src = read("newtab.js");
   assert.ok(src.includes("visibilitychange"));
   assert.ok(src.includes("document.hidden"));
+});
+
+test("the page script stops the refresh when the saved server or token changes", () => {
+  const src = read("newtab.js");
+  assert.ok(src.includes("storage.onChanged"));
+  assert.ok(src.includes("changes.serverUrl") && src.includes("changes.token"));
+  assert.ok(src.includes("connection"));
 });

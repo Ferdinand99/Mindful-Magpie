@@ -16,6 +16,14 @@ document.addEventListener("DOMContentLoaded", () => {
     isHidden: () => document.hidden,
     onChange: (callback) => document.addEventListener("visibilitychange", callback),
   };
+  // A new server or token makes this tab's data stale: stop refreshing at once (newtab-core.js also
+  // checks the saved settings before every write).
+  const connection = {
+    onChange: (callback) =>
+      browser.storage.onChanged.addListener((changes, area) => {
+        if (area === "local" && (changes.serverUrl || changes.token)) callback();
+      }),
+  };
   start({
     storage: browser.storage,
     fetchImpl: fetch,
@@ -23,5 +31,6 @@ document.addEventListener("DOMContentLoaded", () => {
     update: draw.update,
     tick: draw.tick,
     visibility,
+    connection,
   });
 });
