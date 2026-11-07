@@ -11,11 +11,12 @@ use std::time::Duration;
 
 use common::App;
 use mindful_magpie::history::{self, History, MAX_POINTS, Write};
-use mindful_magpie::integrations::poller::{Options, Poller};
+use mindful_magpie::integrations::poller::{Change, Options, Poller};
 use mindful_magpie::integrations::{
-    self, BoxFuture, FetchCtx, FetchError, Field, Integration, MetricDef, Snapshot, Status, Value,
+    self, BoxFuture, FetchCtx, FetchError, Field, Format, Integration, MetricDef, Snapshot, Status,
+    Value,
 };
-use mindful_magpie::services::{SecretChange, ServiceInput, Visibility, store};
+use mindful_magpie::services::{SecretChange, ServiceEvent, ServiceInput, Visibility, store};
 use serde_json::json;
 
 /// A Monday, 00:00 UTC, a multiple of 300 s.
@@ -273,7 +274,12 @@ struct Reader;
 static READER: Reader = Reader;
 static CALLS: Mutex<usize> = Mutex::new(0);
 static NO_FIELDS: [Field; 0] = [];
-static NO_METRICS: [MetricDef; 0] = [];
+/// `ts` is a moment: a timestamp makes no curve.
+static METRICS: [MetricDef; 1] = [MetricDef {
+    id: "ts",
+    label_key: "kind.stub",
+    format: Format::Since,
+}];
 
 impl Integration for Reader {
     fn kind(&self) -> &'static str {
@@ -286,7 +292,7 @@ impl Integration for Reader {
         &NO_FIELDS
     }
     fn metrics(&self) -> &'static [MetricDef] {
-        &NO_METRICS
+        &METRICS
     }
     fn default_interval(&self) -> Duration {
         Duration::from_secs(60)
@@ -305,6 +311,9 @@ impl Integration for Reader {
             let mut snapshot = Snapshot::new(if bad { Status::Unknown } else { Status::Ok });
             snapshot.values.insert("n".into(), Value::num(n as f64));
             snapshot.values.insert("label".into(), Value::text("up"));
+            snapshot
+                .values
+                .insert("ts".into(), Value::num(1_762_900_000.0));
             snapshot.values.insert("nan".into(), Value::num(f64::NAN));
             snapshot
                 .values
@@ -389,7 +398,7 @@ async fn the_poller_records_numbers_only_and_not_for_a_reading_that_is_not_good(
     // Numbers are there, rounded; text, NaN and infinity are not.
     assert_eq!(rows(&app, good, "both").await.len(), 1);
     assert_eq!(rows(&app, good, "both").await[0].1, 2.5);
-    for skipped in ["label", "nan", "inf"] {
+    for skipped in ["label", "nan", "inf", "ts"] {
         assert!(rows(&app, good, skipped).await.is_empty(), "{skipped}");
         assert!(
             daily_rows(&app, good, skipped).await.is_empty(),
@@ -413,7 +422,7 @@ async fn the_poller_records_numbers_only_and_not_for_a_reading_that_is_not_good(
             .is_empty()
     );
     // The daily row has the reading.
-    assert_eq!(daily_rows(&app, good, "both").await[0].4 >= 1, true);
+    assert!(daily_rows(&app, good, "both").await[0].4 >= 1);
 }
 
 #[tokio::test]
@@ -458,4 +467,37 @@ async fn a_restart_loads_the_last_24_hours_back() {
     let series = poller.history(id, &set(&["m"]), now);
     assert_eq!(series["m"].len(), 1, "{series:?}");
     assert_eq!(series["m"][0].value, 2.0);
+}
+
+#[tokio::test]
+async fn deleting_a_service_through_the_poller_frees_its_history_in_memory() {
+    let app = App::new().await;
+    let id = reader(&app, "Doomed", false).await;
+    let poller = start(&app).await;
+    let now = jiff::Timestamp::now().as_second();
+    eventually("a point in memory", async || {
+        !poller.history(id, &set(&["n"]), now).is_empty()
+    })
+    .await;
+    eventually("the point in the table", async || {
+        !rows(&app, id, "n").await.is_empty()
+    })
+    .await;
+
+    let mut rx = poller.subscribe();
+    assert!(store::delete(&app.magpie.core, id).await.unwrap());
+    app.magpie
+        .service_events
+        .send(ServiceEvent::Deleted(id))
+        .unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
+            Ok(Ok(Change::Removed(got))) if got == id => break,
+            Ok(_) => {}
+            Err(_) => panic!("the service was not announced as removed"),
+        }
+    }
+    assert!(poller.history(id, &set(&["n", "both"]), now).is_empty());
+    assert!(rows(&app, id, "n").await.is_empty());
+    assert!(daily_rows(&app, id, "n").await.is_empty());
 }

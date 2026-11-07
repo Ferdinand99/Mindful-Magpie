@@ -12,6 +12,9 @@
 //!   per 5-minute slot, its time is the start of the slot (a multiple of 300 s)
 //!   and the latest reading of the slot wins. A service polled every 5 minutes or
 //!   slower has a point per reading, at the time of the reading.
+//! * A metric the kind declares as a moment (`Format::Since`) is not recorded,
+//!   and a service keeps at most [`MAX_METRICS`] (64) distinct series: a new
+//!   name over that is dropped until an old series has aged out.
 //! * One row per metric and UTC day for [`DAILY_DAYS`] (30) days: the lowest,
 //!   highest and mean reading of the day. Every reading counts, also those the
 //!   24-hour series thins away.
@@ -49,7 +52,7 @@ use serde::{Serialize, Serializer, ser::SerializeTuple};
 use vole_kit::db::{self, DbError};
 use vole_kit::state::Core;
 
-use crate::integrations::{Snapshot, Status};
+use crate::integrations::{Format, MetricDef, Snapshot, Status};
 
 /// How far back the series reach: 24 hours.
 pub const WINDOW_S: i64 = 86_400;
@@ -60,8 +63,9 @@ pub const MAX_POINTS: usize = 288;
 pub const SLOT_S: i64 = 300;
 /// How many days the daily rows reach, today included.
 pub const DAILY_DAYS: i64 = 30;
-/// The most metrics recorded from one reading (a kind has a few; this keeps a
-/// wild one from growing the tables).
+/// The most distinct metrics kept for one service (a kind has a few; this
+/// keeps a wild one from growing memory and tables). A new name over the cap is
+/// dropped until an old series has aged out of the window.
 pub const MAX_METRICS: usize = 64;
 
 /// One point of a series: Unix seconds and the value. Serialised as the pair
@@ -125,14 +129,21 @@ pub fn round4(value: f64) -> f64 {
 
 /// The numbers of a reading worth keeping: none for a reading that is not
 /// good (status unknown, or an error), else every finite number, rounded, by
-/// metric name (at most [`MAX_METRICS`]).
-pub fn numbers(snapshot: &Snapshot) -> Vec<(String, f64)> {
+/// metric name (at most [`MAX_METRICS`]). A metric the kind declares in
+/// `metrics` as a moment (`Format::Since`, Unix seconds) is left out: a
+/// timestamp makes no curve.
+pub fn numbers(snapshot: &Snapshot, metrics: &[MetricDef]) -> Vec<(String, f64)> {
     if snapshot.status == Status::Unknown || snapshot.error.is_some() {
         return Vec::new();
     }
     snapshot
         .values
         .iter()
+        .filter(|(metric, _)| {
+            !metrics
+                .iter()
+                .any(|m| m.id == metric.as_str() && m.format == Format::Since)
+        })
         .filter_map(|(metric, v)| {
             let n = v.num.filter(|n| n.is_finite())?;
             Some((metric.clone(), round4(n)))
@@ -160,6 +171,20 @@ type Series = VecDeque<Point>;
 #[derive(Default)]
 pub struct History {
     inner: Mutex<HashMap<i64, HashMap<String, Series>>>,
+}
+
+/// How a series stands against the point a page last had (see
+/// [`History::tail`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Tail {
+    /// The newest point of the series.
+    pub last: Point,
+    /// How many points are newer than the one the page has.
+    pub newer: usize,
+    /// The value the series has now at the time of the point the page has
+    /// (`None` when that point is gone), to tell a rewritten point from an
+    /// unchanged one.
+    pub known_value: Option<f64>,
 }
 
 /// What one reading adds to the tables, made by [`History::record`].
@@ -191,37 +216,42 @@ impl History {
         let cutoff = at - WINDOW_S;
         let mut all = self.lock();
         let service = all.entry(id).or_default();
+        // Old series go first, so that their names make room for new ones.
+        service.retain(|_, series| {
+            while series.front().is_some_and(|p| p.at < cutoff) {
+                series.pop_front();
+            }
+            !series.is_empty()
+        });
         let mut points = Vec::new();
-        for (metric, value) in &readings {
+        let mut kept = Vec::new();
+        for (metric, value) in readings {
+            if !service.contains_key(&metric) && service.len() >= MAX_METRICS {
+                continue;
+            }
             let series = service.entry(metric.clone()).or_default();
-            let point = Point {
-                at: slot_at,
-                value: *value,
-            };
+            kept.push((metric.clone(), value));
+            let point = Point { at: slot_at, value };
             match series.back_mut() {
                 // The slot's latest reading wins.
-                Some(last) if last.at == slot_at => last.value = *value,
+                Some(last) if last.at == slot_at => last.value = value,
                 // A reading from before the newest point (the clock went
                 // back): nothing to add.
                 Some(last) if last.at > slot_at => continue,
                 _ => series.push_back(point),
             }
-            points.push((metric.clone(), point));
-        }
-        service.retain(|_, series| {
-            while series.front().is_some_and(|p| p.at < cutoff) {
-                series.pop_front();
-            }
             while series.len() > MAX_POINTS {
                 series.pop_front();
             }
-            !series.is_empty()
-        });
+            points.push((metric, point));
+        }
+        // A series that only holds the new point and no old one stays; one
+        // the window emptied was removed above.
         Write {
             service_id: id,
             at,
             points,
-            readings,
+            readings: kept,
         }
     }
 
@@ -252,6 +282,49 @@ impl History {
             .collect()
     }
 
+    /// What changed in the series of `metrics` of service `id` since the page
+    /// last had the point `known` of each (metrics it has no point of are left
+    /// out: ask for their [`History::series`]). Looks only at the points after
+    /// `known`, so it holds the lock for a few steps, not a copy of the series.
+    pub fn tail(
+        &self,
+        id: i64,
+        known: &BTreeMap<String, Point>,
+        metrics: &BTreeSet<String>,
+        now: i64,
+    ) -> BTreeMap<String, Tail> {
+        let cutoff = now - WINDOW_S;
+        let all = self.lock();
+        let Some(service) = all.get(&id) else {
+            return BTreeMap::new();
+        };
+        let mut out = BTreeMap::new();
+        for metric in metrics {
+            let (Some(sent), Some(series)) = (known.get(metric), service.get(metric)) else {
+                continue;
+            };
+            let Some(last) = series.back().copied().filter(|p| p.at >= cutoff) else {
+                continue;
+            };
+            let newer = series.iter().rev().take_while(|p| p.at > sent.at).count();
+            let known_value = series
+                .iter()
+                .rev()
+                .nth(newer)
+                .filter(|p| p.at == sent.at)
+                .map(|p| p.value);
+            out.insert(
+                metric.clone(),
+                Tail {
+                    last,
+                    newer,
+                    known_value,
+                },
+            );
+        }
+        out
+    }
+
     /// Forgets a service (it was deleted).
     pub fn forget(&self, id: i64) {
         self.lock().remove(&id);
@@ -266,7 +339,11 @@ impl History {
             if !value.is_finite() {
                 continue;
             }
-            let series = all.entry(id).or_default().entry(metric).or_default();
+            let service = all.entry(id).or_default();
+            if !service.contains_key(&metric) && service.len() >= MAX_METRICS {
+                continue;
+            }
+            let series = service.entry(metric).or_default();
             series.push_back(Point { at, value });
             while series.len() > MAX_POINTS {
                 series.pop_front();
@@ -488,12 +565,97 @@ mod tests {
         s.values.insert("nan".into(), Value::num(f64::NAN));
         s.values.insert("inf".into(), Value::num(f64::INFINITY));
         s.values.insert("text".into(), Value::text("up"));
-        assert_eq!(numbers(&s), vec![("a".to_string(), 1.235)]);
+        assert_eq!(numbers(&s, &[]), vec![("a".to_string(), 1.235)]);
         s.status = Status::Unknown;
-        assert!(numbers(&s).is_empty());
+        assert!(numbers(&s, &[]).is_empty());
         s.status = Status::Bad;
         s.error = Some("timeout".into());
-        assert!(numbers(&s).is_empty());
+        assert!(numbers(&s, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_moment_is_not_a_curve() {
+        use crate::integrations::Value;
+        let mut s = Snapshot::new(Status::Ok);
+        s.values.insert("age".into(), Value::num(1_762_900_000.0));
+        s.values.insert("load".into(), Value::num(1.5));
+        let defs = [
+            MetricDef {
+                id: "age",
+                label_key: "x",
+                format: Format::Since,
+            },
+            MetricDef {
+                id: "load",
+                label_key: "x",
+                format: Format::Number,
+            },
+        ];
+        assert_eq!(numbers(&s, &defs), vec![("load".to_string(), 1.5)]);
+    }
+
+    #[test]
+    fn a_service_keeps_at_most_64_series_and_new_names_over_it_are_dropped() {
+        let h = History::default();
+        let base = 1_760_000_000;
+        let many = |from: usize, to: usize| -> Vec<(String, f64)> {
+            (from..to).map(|k| (format!("m{k:03}"), 1.0)).collect()
+        };
+        let w = h.record(1, 60, base, many(0, 70));
+        assert_eq!(w.points.len(), MAX_METRICS);
+        assert_eq!(
+            w.readings.len(),
+            MAX_METRICS,
+            "no daily row for a dropped name"
+        );
+        let all: BTreeSet<String> = (0..70).map(|k| format!("m{k:03}")).collect();
+        assert_eq!(h.series(1, &all, base).len(), MAX_METRICS);
+        // Still full: a name that is not there is dropped, one that is, kept.
+        let w = h.record(1, 60, base + 60, many(60, 70));
+        assert_eq!(w.points.len(), 4);
+        // A day later the old series have aged out and make room.
+        let w = h.record(1, 60, base + WINDOW_S + 600, many(64, 70));
+        assert_eq!(w.points.len(), 6);
+    }
+
+    #[test]
+    fn the_tail_tells_a_new_point_from_a_rewritten_one_without_a_copy() {
+        let h = History::default();
+        let base = 1_760_000_100 - 1_760_000_100 % SLOT_S;
+        let m = |name: &str| -> BTreeSet<String> { [name.to_string()].into() };
+        h.record(1, 60, base + 5, r("m", 1.0));
+        let sent = Point {
+            at: base,
+            value: 1.0,
+        };
+        let known: BTreeMap<String, Point> = [("m".to_string(), sent)].into();
+        let now = base + 10;
+
+        let t = h.tail(1, &known, &m("m"), now)["m"];
+        assert_eq!((t.last, t.newer, t.known_value), (sent, 0, Some(1.0)));
+
+        // The same slot rewritten: no newer point, the point changed.
+        h.record(1, 60, base + 20, r("m", 2.0));
+        let t = h.tail(1, &known, &m("m"), now)["m"];
+        assert_eq!(
+            t.last,
+            Point {
+                at: base,
+                value: 2.0
+            }
+        );
+        assert_eq!((t.newer, t.known_value), (0, Some(2.0)));
+
+        // A rewrite and then a new slot: one newer point, and the point the
+        // page has is not what it had.
+        h.record(1, 60, base + 305, r("m", 3.0));
+        let t = h.tail(1, &known, &m("m"), now)["m"];
+        assert_eq!(t.newer, 1);
+        assert_ne!(t.known_value, Some(1.0));
+
+        // Metrics the page has no point of are left out.
+        assert!(h.tail(1, &BTreeMap::new(), &m("m"), now).is_empty());
+        assert!(h.tail(2, &known, &m("m"), now).is_empty());
     }
 
     #[test]

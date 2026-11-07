@@ -46,6 +46,7 @@
 //! [`FetchError`] text, which is a fixed set.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -55,8 +56,8 @@ use tokio::task::{AbortHandle, JoinSet};
 use vole_kit::db;
 use vole_kit::state::Core;
 
-use super::{FetchError, Integration, Level, Need, Snapshot, Status};
-use crate::history::{self, History, Point};
+use super::{FetchError, Integration, Level, MetricDef, Need, Snapshot, Status};
+use crate::history::{self, History, Point, Tail};
 use crate::services::{Service, ServiceEvent, store};
 
 /// How long one fetch may take before the poller gives up on it. The HTTP
@@ -126,6 +127,9 @@ struct Shared {
     state: RwLock<State>,
     /// The series of every number the services report (see [`crate::history`]).
     history: History,
+    /// Seconds added to the clock the pages read ([`PollerHandle::now`]); only
+    /// tests move it.
+    skew: AtomicI64,
     changes: broadcast::Sender<Change>,
 }
 
@@ -134,6 +138,7 @@ impl Shared {
         Arc::new(Shared {
             state: RwLock::new(State::default()),
             history: History::default(),
+            skew: AtomicI64::new(0),
             changes: broadcast::channel(256).0,
         })
     }
@@ -163,6 +168,7 @@ impl Shared {
         id: i64,
         generation: u64,
         interval_s: i64,
+        metrics: &[MetricDef],
         snapshot: Arc<Snapshot>,
     ) -> Option<history::Write> {
         let write = {
@@ -170,7 +176,7 @@ impl Shared {
             if state.live.get(&id) != Some(&generation) {
                 return None;
             }
-            let numbers = history::numbers(&snapshot);
+            let numbers = history::numbers(&snapshot, metrics);
             let write = (!numbers.is_empty()).then(|| {
                 self.history
                     .record(id, interval_s, snapshot.fetched_at.as_second(), numbers)
@@ -270,6 +276,32 @@ impl PollerHandle {
         self.shared.history.series(service_id, metrics, now)
     }
 
+    /// What changed in the series of `metrics` since the page had the point
+    /// `known` of each (see [`History::tail`]). Never copies a series.
+    pub fn history_tail(
+        &self,
+        service_id: i64,
+        known: &BTreeMap<String, Point>,
+        metrics: &BTreeSet<String>,
+        now: i64,
+    ) -> BTreeMap<String, Tail> {
+        self.shared.history.tail(service_id, known, metrics, now)
+    }
+
+    /// The clock the pages and the history read: Unix seconds. (Tests move it
+    /// with [`PollerHandle::advance_clock_for_tests`].)
+    pub fn now(&self) -> i64 {
+        jiff::Timestamp::now().as_second() + self.shared.skew.load(Ordering::Relaxed)
+    }
+
+    /// Moves [`PollerHandle::now`] on by `seconds`, for this poller only: a
+    /// stream that has been open for days, without waiting. **For tests only**
+    /// (hidden from the docs).
+    #[doc(hidden)]
+    pub fn advance_clock_for_tests(&self, seconds: i64) {
+        self.shared.skew.fetch_add(seconds, Ordering::Relaxed);
+    }
+
     /// A [`Change`] each time a service gets a new snapshot or is removed (also
     /// when its deletion arrives as a service event). A receiver that falls far
     /// behind gets `Lagged` and should read every snapshot again.
@@ -283,7 +315,7 @@ impl PollerHandle {
     /// snapshot. **For tests only** (hidden from the docs).
     #[doc(hidden)]
     pub fn record_history_for_tests(&self, service_id: i64, interval_s: i64, snapshot: &Snapshot) {
-        let numbers = history::numbers(snapshot);
+        let numbers = history::numbers(snapshot, &[]);
         if !numbers.is_empty() {
             self.shared.history.record(
                 service_id,
@@ -666,6 +698,7 @@ impl Job {
                 self.service.id,
                 self.generation,
                 i64::try_from(interval.as_secs()).unwrap_or(i64::MAX),
+                self.kind.metrics(),
                 Arc::new(snapshot),
             );
             if let Some(written) = written

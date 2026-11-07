@@ -1563,18 +1563,6 @@ async fn the_first_event_has_the_history_and_a_later_one_only_the_new_point() {
     feed(&w.app, w.a, now, 12.5);
     feed(&w.app, w.c, now, 4243.5);
     live.nothing().await;
-
-    // A reading in the slot of the last point (a fast service rewrites the
-    // slot's point): the append has the time of the point it replaces.
-    let fast = reading(now + 100, 99.0);
-    w.app.magpie.poller.record_history_for_tests(w.a, 60, &fast);
-    w.app.magpie.poller.set_snapshot_for_tests(w.a, fast);
-    let update = live.event().await;
-    let slot = (now + 100) - (now + 100) % 300;
-    assert_eq!(
-        update["services"][w.a.to_string()]["history_append"],
-        json!({ "latency_ms": [slot, 99] })
-    );
 }
 
 #[tokio::test]
@@ -1684,5 +1672,260 @@ async fn one_service_with_eight_metrics_stays_near_40_kib_of_history() {
     assert!(
         size < 44 * 1024,
         "{size} bytes of history for one service with 8 metrics"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// History on a stream that stays open
+
+/// Moves the poller's clock so that it reads 12:00 UTC (a test that moves it
+/// on by minutes or days then never runs into midnight by accident); the
+/// clock as the poller has it.
+fn noon(app: &App) -> i64 {
+    let now = app.magpie.poller.now();
+    app.magpie
+        .poller
+        .advance_clock_for_tests((43_200 - now.rem_euclid(86_400)).rem_euclid(86_400));
+    app.magpie.poller.now()
+}
+
+/// [`feed`] for a service polled every minute: its points are 5-minute slots.
+fn feed_fast(app: &App, id: i64, at: i64, latency: f64) {
+    let s = reading(at, latency);
+    app.magpie.poller.record_history_for_tests(id, 60, &s);
+    app.magpie.poller.set_snapshot_for_tests(id, s);
+}
+
+#[tokio::test]
+async fn a_new_utc_day_sends_the_history_and_the_daily_rows_again() {
+    let w = world().await;
+    let mut bob = Web::new(&w.app, "bob", "viewer").await;
+    save(
+        &mut bob,
+        &doc(0, vec![card("c1", Some(bind(w.a, &["latency_ms"])))]),
+    )
+    .await;
+    let now = noon(&w.app);
+    feed(&w.app, w.a, now - 600, 10.0);
+    feed(&w.app, w.a, now - 300, 11.0);
+    store_daily(&w.app, w.a, now - 300, 10.0).await;
+    let mut live = open_live(&bob, "en").await;
+    let first = live.event().await;
+    assert_eq!(first["full"], true);
+    tokio::task::yield_now().await;
+    tokio::time::pause();
+
+    // Two days later, with the stream open all the time.
+    w.app.magpie.poller.advance_clock_for_tests(2 * 86_400);
+    let later = w.app.magpie.poller.now();
+    store_daily(&w.app, w.a, later, 20.0).await;
+    feed(&w.app, w.a, later, 20.0);
+    let update = live.event().await;
+    assert_eq!(update["full"], false);
+    let a = &update["services"][w.a.to_string()];
+    // The whole series of the new day (the old points are more than 24 h
+    // old), not an append, and both days' rows.
+    assert_eq!(a["history"], json!({ "latency_ms": [[later, 20]] }), "{a}");
+    assert!(a.get("history_append").is_none(), "{a}");
+    assert_eq!(
+        a["history_daily"]["latency_ms"].as_array().unwrap().len(),
+        2
+    );
+    live.nothing().await;
+}
+
+#[tokio::test]
+async fn the_daily_rows_are_sent_again_every_15_minutes_at_most() {
+    let w = world().await;
+    let mut bob = Web::new(&w.app, "bob", "viewer").await;
+    save(
+        &mut bob,
+        &doc(0, vec![card("c1", Some(bind(w.a, &["latency_ms"])))]),
+    )
+    .await;
+    let mut now = noon(&w.app);
+    feed(&w.app, w.a, now - 300, 10.0);
+    store_daily(&w.app, w.a, now - 300, 10.0).await;
+    let mut live = open_live(&bob, "en").await;
+    live.event().await;
+    tokio::task::yield_now().await;
+    tokio::time::pause();
+
+    // A minute on: a point, no daily rows.
+    now += 60;
+    w.app.magpie.poller.advance_clock_for_tests(60);
+    feed(&w.app, w.a, now, 11.0);
+    let a = live.event().await["services"][w.a.to_string()].clone();
+    assert_eq!(a["history_append"]["latency_ms"][1], 11, "{a}");
+    assert!(a.get("history_daily").is_none(), "{a}");
+
+    // A quarter of an hour after the first: the point and today's row (which
+    // has grown) as a delta, not the series.
+    now += 900;
+    w.app.magpie.poller.advance_clock_for_tests(900);
+    store_daily(&w.app, w.a, now, 30.0).await;
+    feed(&w.app, w.a, now, 12.0);
+    let a = live.event().await["services"][w.a.to_string()].clone();
+    assert_eq!(a["history_append"]["latency_ms"][1], 12, "{a}");
+    assert!(a.get("history").is_none(), "{a}");
+    let day = &a["history_daily"]["latency_ms"];
+    assert_eq!(day.as_array().unwrap().len(), 1, "{a}");
+    assert_eq!(day[0][2], 30, "the highest of today: {a}");
+
+    // And not again a minute later.
+    now += 60;
+    w.app.magpie.poller.advance_clock_for_tests(60);
+    feed(&w.app, w.a, now, 13.0);
+    let a = live.event().await["services"][w.a.to_string()].clone();
+    assert!(a.get("history_daily").is_none(), "{a}");
+}
+
+#[tokio::test]
+async fn a_rewritten_slot_and_a_new_slot_between_two_events_send_the_series() {
+    let w = world().await;
+    let mut bob = Web::new(&w.app, "bob", "viewer").await;
+    save(
+        &mut bob,
+        &doc(0, vec![card("c1", Some(bind(w.a, &["latency_ms"])))]),
+    )
+    .await;
+    let now = now_s();
+    let slot = now - now % 300;
+    feed_fast(&w.app, w.a, slot + 5, 10.0);
+    let mut live = open_live(&bob, "en").await;
+    let first = live.event().await;
+    assert_eq!(
+        first["services"][w.a.to_string()]["history"],
+        json!({ "latency_ms": [[slot, 10]] })
+    );
+    tokio::task::yield_now().await;
+    tokio::time::pause();
+
+    // The slot the client has is rewritten, and the next slot starts, before
+    // the stream looks: an append of the new slot alone would leave the
+    // client with the old value of the first.
+    feed_fast(&w.app, w.a, slot + 20, 11.0);
+    feed_fast(&w.app, w.a, slot + 305, 12.0);
+    let update = live.event().await;
+    let a = &update["services"][w.a.to_string()];
+    assert_eq!(
+        a["history"],
+        json!({ "latency_ms": [[slot, 11], [slot + 300, 12]] }),
+        "{a}"
+    );
+    assert!(a.get("history_append").is_none(), "{a}");
+    live.nothing().await;
+
+    // A rewrite of the newest slot alone is an append with the slot's time.
+    feed_fast(&w.app, w.a, slot + 330, 13.0);
+    let update = live.event().await;
+    assert_eq!(
+        update["services"][w.a.to_string()]["history_append"],
+        json!({ "latency_ms": [slot + 300, 13] })
+    );
+    assert!(update["services"][w.a.to_string()].get("history").is_none());
+}
+
+#[tokio::test]
+async fn a_metric_bound_while_the_stream_is_open_arrives_as_a_whole_series() {
+    let w = world().await;
+    let mut bob = Web::new(&w.app, "bob", "viewer").await;
+    save(
+        &mut bob,
+        &doc(0, vec![card("c1", Some(bind(w.a, &["latency_ms"])))]),
+    )
+    .await;
+    let now = now_s();
+    feed(&w.app, w.a, now - 600, 10.0);
+    feed(&w.app, w.a, now - 300, 11.0);
+    let mut live = open_live(&bob, "en").await;
+    let first = live.event().await;
+    let a = &first["services"][w.a.to_string()];
+    assert_eq!(a["history"].as_object().unwrap().len(), 1);
+    tokio::task::yield_now().await;
+    tokio::time::pause();
+
+    // The card gets a second number (a save from another tab); the next
+    // wake has its whole series, and the first one's new point only.
+    save(
+        &mut bob,
+        &doc(
+            1,
+            vec![card("c1", Some(bind(w.a, &["latency_ms", "status"])))],
+        ),
+    )
+    .await;
+    feed(&w.app, w.a, now, 12.0);
+    let update = live.event().await;
+    let a = &update["services"][w.a.to_string()];
+    assert_eq!(
+        a["history"],
+        json!({ "status": [[now - 600, 200], [now - 300, 200], [now, 200]] }),
+        "{a}"
+    );
+    assert_eq!(
+        a["history_append"],
+        json!({ "latency_ms": [now, 12] }),
+        "{a}"
+    );
+}
+
+#[tokio::test]
+async fn a_metric_unbound_while_the_stream_is_open_gets_no_more_points() {
+    let w = world().await;
+    let mut bob = Web::new(&w.app, "bob", "viewer").await;
+    save(
+        &mut bob,
+        &doc(
+            0,
+            vec![card("c1", Some(bind(w.a, &["latency_ms", "status"])))],
+        ),
+    )
+    .await;
+    let now = now_s();
+    feed(&w.app, w.a, now - 600, 10.0);
+    let mut live = open_live(&bob, "en").await;
+    let first = live.event().await;
+    assert_eq!(
+        first["services"][w.a.to_string()]["history"]
+            .as_object()
+            .unwrap()
+            .len(),
+        2
+    );
+    tokio::task::yield_now().await;
+    tokio::time::pause();
+
+    save(
+        &mut bob,
+        &doc(1, vec![card("c1", Some(bind(w.a, &["latency_ms"])))]),
+    )
+    .await;
+    feed(&w.app, w.a, now - 300, 11.0);
+    let update = live.event().await;
+    let a = &update["services"][w.a.to_string()];
+    assert_eq!(
+        a["history_append"],
+        json!({ "latency_ms": [now - 300, 11] }),
+        "{a}"
+    );
+    assert!(a.get("history").is_none(), "{a}");
+
+    // Bound again: the whole series of it comes back, with what it gained.
+    save(
+        &mut bob,
+        &doc(
+            2,
+            vec![card("c1", Some(bind(w.a, &["latency_ms", "status"])))],
+        ),
+    )
+    .await;
+    feed(&w.app, w.a, now, 12.0);
+    let update = live.event().await;
+    let a = &update["services"][w.a.to_string()];
+    assert_eq!(
+        a["history"],
+        json!({ "status": [[now - 600, 200], [now - 300, 200], [now, 200]] }),
+        "{a}"
     );
 }

@@ -78,7 +78,16 @@
 //! entry as a whole: its history fields are merged as just said. A metric that
 //! becomes bound while the stream is open, or one that gained several points
 //! between two events, arrives as `history` (and `history_daily`) for that
-//! metric alone in a delta: replace that metric's series. The visibility and the layout are read
+//! metric alone in a delta: replace that metric's series. So does a point that
+//! was rewritten while a newer slot started between two events (an append of
+//! the new slot alone would leave the page with the old value).
+//!
+//! A stream that stays open is kept right across days: when the UTC day
+//! changes, the next event sends `history` and `history_daily` again for every
+//! bound metric, as a full event does (without `full: true`); and every 15
+//! minutes ([`DAILY_REFRESH_S`]) an event also carries `history_daily` for the
+//! bound metrics, because today's row keeps changing. A page replaces the
+//! daily rows of a metric whenever it has some. The visibility and the layout are read
 //! again at every wake, the account too: a signed-out, disabled or demoted
 //! user loses the stream or the services.
 
@@ -115,6 +124,10 @@ use crate::services::{ServiceEvent, ServiceSummary, ServiceView, Viewer, store, 
 pub const MAX_STREAMS: usize = 64;
 /// The quiet period after a change: a burst of readings is one event.
 pub const QUIET: Duration = Duration::from_secs(1);
+
+/// How often a stream sends the daily rows again (seconds): today's row keeps
+/// changing while the stream is open.
+pub const DAILY_REFRESH_S: i64 = 900;
 
 /// Streams one user may have open at once (the tabs of one person).
 pub const MAX_STREAMS_PER_USER: usize = 8;
@@ -323,7 +336,7 @@ async fn doc_of(
     poller: &PollerHandle,
 ) -> Result<ValuesDoc, DbError> {
     Ok(ValuesDoc {
-        now: jiff::Timestamp::now().as_second(),
+        now: poller.now(),
         services: summaries
             .iter()
             .map(|s| (s.id.to_string(), entry(s, poller)))
@@ -405,6 +418,14 @@ struct Open {
     /// The newest point of each metric's series as last sent (whole or as an
     /// append): what the next event's new points are measured against.
     sent_history: HashMap<i64, BTreeMap<String, Point>>,
+    /// The UTC day (`YYYY-MM-DD`) of the last event, empty before the first:
+    /// when it changes, every bound metric's history and daily rows go out
+    /// again (the old day's last row and the dropped 31st day are stale).
+    sent_day: String,
+    /// When the daily rows were last sent (Unix seconds): today's row grows
+    /// with every reading, so they are sent again at most this often
+    /// ([`DAILY_REFRESH_S`]) in a later event.
+    daily_at: i64,
     /// The needs list as last sent, serialised.
     sent_needs: String,
     first: bool,
@@ -468,38 +489,63 @@ impl Open {
         // are in the entry already.
         let mut new_sent: HashMap<i64, BTreeMap<String, Point>> = HashMap::new();
         let mut whole: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
+        // A new UTC day sends the history again, as a full event does (the
+        // daily rows have moved a day); within a day the daily rows are sent
+        // again every quarter of an hour.
+        let today = history::day_of(doc.now);
+        let day_changed = !self.sent_day.is_empty() && self.sent_day != today;
+        let refresh_daily = !full && !day_changed && doc.now - self.daily_at >= DAILY_REFRESH_S;
+        let from_scratch = full || day_changed;
+        let no_points = BTreeMap::new();
         for (key, value) in &doc.services {
             let Ok(id) = key.parse::<i64>() else { continue };
             let text = serde_json::to_string(value).unwrap_or_default();
             let mut entry = value.clone();
             let mut changed = full || self.sent.get(&id) != Some(&text);
             if let Some(metrics) = bound.get(&id) {
-                let known = self.sent_history.get(&id);
-                for (metric, points) in self.poller.history(id, metrics, doc.now) {
-                    let Some(last) = points.last().copied() else {
-                        continue;
-                    };
-                    let before = if full {
-                        None
+                let known = if from_scratch {
+                    &no_points
+                } else {
+                    self.sent_history.get(&id).unwrap_or(&no_points)
+                };
+                // The metrics the client has a point of: only what is after
+                // that point is looked at (no copy of the series).
+                let mut again: BTreeSet<String> = BTreeSet::new();
+                for (metric, tail) in self.poller.history_tail(id, known, metrics, doc.now) {
+                    let sent = known[&metric];
+                    if tail.last == sent {
+                        new_sent.entry(id).or_default().insert(metric, sent);
+                    } else if tail.newer == 0 && tail.last.at == sent.at {
+                        // The slot's point was rewritten: the same time.
+                        entry.history_append.insert(metric.clone(), tail.last);
+                        new_sent.entry(id).or_default().insert(metric, tail.last);
+                        changed = true;
+                    } else if tail.newer == 1 && tail.known_value == Some(sent.value) {
+                        entry.history_append.insert(metric.clone(), tail.last);
+                        new_sent.entry(id).or_default().insert(metric, tail.last);
+                        changed = true;
                     } else {
-                        known.and_then(|m| m.get(&metric)).copied()
-                    };
-                    match before {
-                        Some(sent) if sent == last => {}
-                        Some(sent)
-                            if last.at >= sent.at
-                                && points.iter().filter(|p| p.at > sent.at).count() < 2 =>
-                        {
-                            entry.history_append.insert(metric.clone(), last);
-                            changed = true;
-                        }
-                        _ => {
-                            whole.entry(id).or_default().insert(metric.clone());
-                            entry.history.insert(metric.clone(), points);
-                            changed = true;
-                        }
+                        // Two or more new points, a point the client has that
+                        // was rewritten as well, or a clock that went back:
+                        // the series, not a guess.
+                        again.insert(metric);
                     }
-                    new_sent.entry(id).or_default().insert(metric, last);
+                }
+                // Those and the metrics the client has nothing of (new on a
+                // card, or everything in a full event): the whole series.
+                again.extend(metrics.iter().filter(|m| !known.contains_key(*m)).cloned());
+                for (metric, points) in self.poller.history(id, &again, doc.now) {
+                    if let Some(last) = points.last().copied() {
+                        new_sent.entry(id).or_default().insert(metric.clone(), last);
+                        whole.entry(id).or_default().insert(metric.clone());
+                        entry.history.insert(metric, points);
+                        changed = true;
+                    }
+                }
+                if refresh_daily {
+                    let held = new_sent.get(&id).into_iter().flat_map(|m| m.keys());
+                    whole.entry(id).or_default().extend(held.cloned());
+                    changed = true;
                 }
             }
             if changed {
@@ -507,6 +553,10 @@ impl Open {
             }
             current.insert(id, text);
         }
+        if full || day_changed || refresh_daily {
+            self.daily_at = doc.now;
+        }
+        self.sent_day = today;
         if let Err(err) = attach_daily(&self.core, &mut entries, whole, doc.now).await {
             tracing::warn!(%err, "live values: could not read the daily history; ending the stream");
             return Turn::End;
@@ -624,6 +674,8 @@ async fn live_values(
         changes: Changes::all(wake_rx).quiet(QUIET),
         sent: HashMap::new(),
         sent_history: HashMap::new(),
+        sent_day: String::new(),
+        daily_at: 0,
         viewed: BTreeMap::new(),
         sent_needs: String::new(),
         first: true,
