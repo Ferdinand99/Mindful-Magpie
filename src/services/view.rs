@@ -1,6 +1,9 @@
 //! What a page or the extension may know about a service it can see: its
-//! number, name, kind, interval and the metrics a card can show. Never the
-//! address, the settings or the secret (none of them is a field here).
+//! number, name, kind, interval, the metrics a card can show and the link a
+//! card may point at. Never the address, the settings or the secret (none of
+//! them is a field here; the link is the service's «Lenke på kort», or the
+//! origin of its address when there is none, which is the part of the address
+//! a browser needs to open it and no more).
 
 use serde::Serialize;
 use vole_kit::db::DbError;
@@ -32,6 +35,9 @@ pub struct ServiceView {
     /// The kind's metrics, in its own order. Empty for a kind this build does
     /// not have (a service made by a newer version).
     pub metrics: Vec<MetricView>,
+    /// Where a card of the service links when it has no link of its own.
+    /// Empty when the service has no link and no address.
+    pub link: String,
 }
 
 /// The services `viewer` may see, by name, with their metrics. Labels come in
@@ -67,5 +73,6 @@ pub fn view_of(s: &ServiceSummary) -> ServiceView {
         kind: s.kind.clone(),
         interval_s: s.interval_s,
         metrics,
+        link: s.link.clone(),
     }
 }

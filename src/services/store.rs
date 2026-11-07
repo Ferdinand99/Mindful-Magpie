@@ -11,7 +11,7 @@ use vole_kit::state::Core;
 
 use super::{
     FieldError, SECRET_PURPOSE, SecretChange, Service, ServiceInput, ServiceSummary, Viewer,
-    Visibility, same_origin,
+    Visibility, card_link, same_origin,
 };
 use crate::integrations::{FetchCtx, FetchError};
 
@@ -125,7 +125,7 @@ pub async fn visible_to(
     let viewer = viewer.into();
     db::interact(&core.db, move |c| {
         let mut stmt = c.prepare(
-            "SELECT id, kind, name, interval_s FROM services s
+            "SELECT id, kind, name, interval_s, url, settings FROM services s
              WHERE ?1 = 1 OR s.visibility = 'all'
                 OR (s.visibility = 'users' AND EXISTS (
                       SELECT 1 FROM service_users su
@@ -133,11 +133,15 @@ pub async fn visible_to(
              ORDER BY name COLLATE NOCASE, id",
         )?;
         stmt.query_map(params![viewer.admin, viewer.id], |r| {
+            let url: Option<String> = r.get(4)?;
+            let settings: String = r.get(5)?;
+            let settings = serde_json::from_str::<Json>(&settings).unwrap_or(Json::Null);
             Ok(ServiceSummary {
                 id: r.get(0)?,
                 kind: r.get(1)?,
                 name: r.get(2)?,
                 interval_s: r.get(3)?,
+                link: card_link(&settings, url.as_deref()),
             })
         })?
         .collect()

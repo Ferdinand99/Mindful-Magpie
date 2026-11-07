@@ -33,8 +33,8 @@ use vole_kit::state::Core;
 
 use super::store::{self, StoreError};
 use super::{
-    FieldError, SecretChange, Service, ServiceEvent, ServiceInput, Visibility, same_origin,
-    without_userinfo,
+    FieldError, LINK_KEY, SecretChange, Service, ServiceEvent, ServiceInput, Visibility,
+    same_origin, without_userinfo,
 };
 use crate::Magpie;
 use crate::integrations::{
@@ -116,6 +116,13 @@ fn parse(form: &Raw, kind: &'static dyn Integration) -> Parsed {
                 }),
             },
         }
+    }
+
+    // «Lenke på kort»: kept in the settings next to the kind's own, and checked
+    // with them (`ServiceInput::check_connection`).
+    let link = form.get(LINK_KEY).trim().to_string();
+    if !link.is_empty() {
+        settings.insert(LINK_KEY.to_string(), Json::String(link));
     }
 
     let secret = if !kind.fields().iter().any(|f| f.secret) {
@@ -272,6 +279,8 @@ struct FormView {
     name: String,
     url: String,
     url_required: bool,
+    /// «Lenke på kort».
+    link: String,
     interval: String,
     interval_default: u64,
     interval_min: u64,
@@ -284,6 +293,7 @@ struct FormView {
     users: Vec<UserChoice>,
     name_error: String,
     url_error: String,
+    link_error: String,
     interval_error: String,
     visibility_error: String,
     secret_error: String,
@@ -300,6 +310,7 @@ struct FormPage {
 struct Shown {
     name: String,
     url: String,
+    link: String,
     interval: String,
     settings: BTreeMap<&'static str, String>,
     visibility: Visibility,
@@ -312,6 +323,7 @@ impl Shown {
         Shown {
             name: String::new(),
             url: String::new(),
+            link: String::new(),
             interval: String::new(),
             settings: BTreeMap::new(),
             visibility: Visibility::Admin,
@@ -325,6 +337,11 @@ impl Shown {
         Shown {
             name: service.name.clone(),
             url: service.url.clone().unwrap_or_default(),
+            link: settings
+                .and_then(|s| s.get(LINK_KEY))
+                .and_then(Json::as_str)
+                .unwrap_or_default()
+                .to_string(),
             interval: service.interval_s.to_string(),
             settings: service
                 .integration()
@@ -354,6 +371,7 @@ impl Shown {
             name: parsed.input.name,
             // The address is shown again without a user name and password.
             url: without_userinfo(form.get("url").trim()),
+            link: form.get(LINK_KEY).trim().to_string(),
             interval: parsed.interval,
             settings: parsed.settings,
             visibility: parsed.input.visibility,
@@ -428,11 +446,13 @@ async fn form_view(
         users: user_choices(core, &shown.users).await?,
         name_error: error("name"),
         url_error: error("url"),
+        link_error: error("link"),
         interval_error: error("interval"),
         visibility_error: error("visibility"),
         secret_error: error("secret"),
         name: shown.name.clone(),
         url: shown.url.clone(),
+        link: shown.link.clone(),
         interval: shown.interval.clone(),
         visibility: shown.visibility,
         settings,
@@ -459,6 +479,7 @@ fn chooser() -> FormView {
         name: String::new(),
         url: String::new(),
         url_required: false,
+        link: String::new(),
         interval: String::new(),
         interval_default: 0,
         interval_min: 0,
@@ -470,6 +491,7 @@ fn chooser() -> FormView {
         users: Vec::new(),
         name_error: String::new(),
         url_error: String::new(),
+        link_error: String::new(),
         interval_error: String::new(),
         visibility_error: String::new(),
         secret_error: String::new(),

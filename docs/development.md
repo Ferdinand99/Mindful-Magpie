@@ -25,7 +25,7 @@ src/
   integrations/       # the integration contract (mod.rs: the Integration trait, Snapshot, FetchCtx, the guarded HTTP client, the registry), the helpers the app kinds share (api.rs: address check, endpoint, bearer header, get_json, the memory of addresses that answered 404, clean_text), the kinds (http_kind.rs: "Nettside"; vv.rs: Vigilant Vole; kk.rs: Keen Kestrel; ww_kind.rs: Wise Wren, each read with a read token) and the background poller (poller.rs: fetches every service on its interval, keeps the latest snapshot in memory and in service_snapshots, follows the service events)
   values.rs           # the values document (#mm-values, GET /api/v1/me/values) and the event stream GET /start/live: only services bound on the user's layout and visible to them, diffed against what the client has
   needs.rs            # «Trenger deg»: the needs of those services for one user (the config need for admins only), the per-user acknowledgements (table acks) and POST /start/needs/ack and /unack
-  services/           # admin-managed services: store.rs (tables, sealed secrets, who sees what), pages.rs (Settings → Services and «Test»), mod.rs (types and checks)
+  services/           # admin-managed services: store.rs (tables, sealed secrets, who sees what), pages.rs (Settings → Services and «Test»), view.rs (what a page may know of a service, including the link a card opens), mod.rs (types and checks; the optional «Lenke på kort» is the `link` setting)
 templates/            # Magpie's pages (extend kit/layout.html)
 static/               # favicon, icons, web manifest, magpie.css, clock.js
 static/magpie/        # the start page scripts (ES modules: render.js is the shared renderer, edit.js is edit mode with ops.js and rules.js) and render.css
@@ -50,10 +50,10 @@ Builds and tests run in Docker on a build host (a shared Docker daemon), not on 
 cargo commands that run inside a Rust 1.99 container with clippy and rustfmt installed.
 
 ```bash
-cargo test --locked                                  # 408 Rust tests: boot, auth and users, start page, layout, backgrounds and migrations, extension API and connect flow, services, the poller, the needs, the three app kinds
+cargo test --locked                                  # 414 Rust tests: boot, auth and users, start page, layout, backgrounds and migrations, extension API and connect flow, services, the poller, the needs, the three app kinds
 cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --all --check
-cd web && npm ci && node --test                     # 422 JavaScript tests: renderer, live numbers and needs, operations, rules, edit mode and page wiring, the extension (node:22 container; linkedom stands in for the DOM)
+cd web && npm ci && node --test                     # 432 JavaScript tests: renderer, live numbers and needs, operations, rules, edit mode and page wiring, the extension (node:22 container; linkedom stands in for the DOM)
 cd web && npm run build:extension                    # copies the renderer into extension/vendor/; git must show no change
 docker build -t magpie:dev .
 docker run --rm magpie:dev --help     # every flag and its MM_ variable

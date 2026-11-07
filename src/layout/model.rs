@@ -151,6 +151,33 @@ fn plain_authority(value: &str) -> bool {
         .is_some_and(|host| !host.starts_with(['/', '\\']))
 }
 
+/// What is wrong with a link that a browser is to follow (a card's, a
+/// bookmark's, a service's), as the error code: `required`, `too_long`,
+/// `bad_url` or `bad_scheme`. `None` for a well-formed `http` or `https` URL.
+/// Nothing is fetched from it, so no address is refused for what it points at.
+pub fn link_problem(value: &str) -> Option<&'static str> {
+    if value.trim().is_empty() {
+        return Some("required");
+    }
+    if value.chars().count() > MAX_URL {
+        return Some("too_long");
+    }
+    // The URL parser strips tabs and line breaks and trims the ends, so what
+    // is stored could differ from what a browser follows: refuse it.
+    if value != value.trim() || value.chars().any(char::is_control) {
+        return Some("bad_url");
+    }
+    match url::Url::parse(value) {
+        Err(_) => Some("bad_url"),
+        Ok(u) if !matches!(u.scheme(), "http" | "https") => Some("bad_scheme"),
+        Ok(u) if u.host_str().is_none_or(str::is_empty) => Some("bad_url"),
+        // `https:example.com` and `https:///example.com` parse as links too;
+        // keep only the plain `scheme://host` shape.
+        Ok(_) if !plain_authority(value) => Some("bad_url"),
+        Ok(_) => None,
+    }
+}
+
 /// Characters of Unicode category Cf (format): invisible, and a few reverse
 /// the text or glue it together.
 pub fn is_format(c: char) -> bool {
@@ -244,25 +271,8 @@ impl Checker {
 
     /// A link: present, not too long, a well-formed `http` or `https` URL.
     fn url(&mut self, path: String, value: &str) {
-        if value.trim().is_empty() {
-            return self.err(path, "required");
-        }
-        if value.chars().count() > MAX_URL {
-            return self.err(path, "too_long");
-        }
-        // The URL parser strips tabs and line breaks and trims the ends, so
-        // what is stored could differ from what a browser follows: refuse it.
-        if value != value.trim() || value.chars().any(char::is_control) {
-            return self.err(path, "bad_url");
-        }
-        match url::Url::parse(value) {
-            Err(_) => self.err(path, "bad_url"),
-            Ok(u) if !matches!(u.scheme(), "http" | "https") => self.err(path, "bad_scheme"),
-            Ok(u) if u.host_str().is_none_or(str::is_empty) => self.err(path, "bad_url"),
-            // `https:example.com` and `https:///example.com` parse as links
-            // too; keep only the plain `scheme://host` shape.
-            Ok(_) if !plain_authority(value) => self.err(path, "bad_url"),
-            Ok(_) => {}
+        if let Some(code) = link_problem(value) {
+            self.err(path, code);
         }
     }
 
@@ -364,7 +374,11 @@ pub fn validate(layout: &Layout) -> Result<(), Vec<FieldError>> {
                 MAX_DESCRIPTION,
                 false,
             );
-            c.url(format!("{cp}.url"), &card.url);
+            // A card with a service may have no link of its own: the page
+            // links it to the service's. A card without one needs a link.
+            if !(card.url.is_empty() && card.service.is_some()) {
+                c.url(format!("{cp}.url"), &card.url);
+            }
             c.icon(&format!("{cp}.icon"), &card.icon);
             if let Some(service) = &card.service {
                 c.service(&cp, service);

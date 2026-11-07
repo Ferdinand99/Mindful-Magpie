@@ -14,8 +14,10 @@ use serde_json::{Value, json};
 use vole_kit::auth::TokenScope;
 
 const SECRET: &str = "s3cr3t-Tok3n-cards-1a2b3c";
-const URL_HOST: &str = "10.77.88.99";
 const URL: &str = "http://10.77.88.99:8123/health-check-path";
+/// What a card of the service links to when nobody gave a link: the address
+/// up to the port.
+const ORIGIN: &str = "http://10.77.88.99:8123";
 const SETTING: &str = "250-251";
 
 // ---------------------------------------------------------------------------
@@ -112,13 +114,9 @@ fn names(services: &Value) -> Vec<String> {
 }
 
 fn assert_no_secrets(text: &str, what: &str) {
-    for needle in [
-        SECRET,
-        URL_HOST,
-        "health-check-path",
-        SETTING,
-        "expected_status",
-    ] {
+    // The host and port are the service's `link` (see the tests of the link);
+    // the path of the address, the settings and the key are never shown.
+    for needle in [SECRET, "health-check-path", SETTING, "expected_status"] {
         assert!(!text.contains(needle), "{what} leaks {needle:?}");
     }
 }
@@ -552,7 +550,11 @@ async fn the_embed_has_only_what_the_user_may_see_and_never_a_secret() {
         .map(String::as_str)
         .collect();
     keys.sort_unstable();
-    assert_eq!(keys, ["id", "interval_s", "kind", "metrics", "name"]);
+    assert_eq!(
+        keys,
+        ["id", "interval_s", "kind", "link", "metrics", "name"]
+    );
+    assert_eq!(first["link"], ORIGIN);
     assert_eq!(first["id"], admins);
     assert_eq!(first["kind"], "http");
     assert_eq!(first["interval_s"], 60);
@@ -688,6 +690,8 @@ async fn me_start_adds_services_next_to_the_layout_and_keeps_its_shape() {
     // The admin's own extension token shows the admin's services.
     assert_eq!(names(&body["services"]), ["Admins-Only-Svc", "For all"]);
     assert_eq!(body["services"][1]["metrics"][0]["format"], "number");
+    // The extension draws the same cards, so it gets the link too.
+    assert_eq!(body["services"][1]["link"], ORIGIN);
     assert_no_secrets(&res.body, "me/start for an admin");
     assert_eq!(res.header("cache-control"), "no-store");
 }
@@ -829,4 +833,199 @@ async fn me_start_for_a_card_whose_service_is_hidden_names_nothing() {
     assert_eq!(res.json()["groups"][0]["cards"][0]["service"]["id"], id);
     let embedded = page(&mut vera, "en").await;
     assert!(!embedded.body.contains("Soon-Hidden-Name"));
+}
+
+// ---------------------------------------------------------------------------
+// The link of a card with a service
+
+fn bound_card_without_link(id: &str, service_id: i64) -> Value {
+    let mut card = bound_card(id, Some(bind(service_id, &["status"])));
+    card["url"] = json!("");
+    card
+}
+
+#[tokio::test]
+async fn a_card_with_a_service_may_have_no_link_but_a_plain_card_needs_one() {
+    let app = App::new().await;
+    let mut admin = Web::new(&app, "ada", "admin").await;
+    let id = service(&app, "Blog", Visibility::Admin, &[]).await;
+
+    // With a service: an empty link is fine, and comes back empty.
+    let res = save(&mut admin, &doc(0, vec![bound_card_without_link("c1", id)])).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let embedded = block(&page(&mut admin, "en").await.body, "mm-layout");
+    assert_eq!(embedded["groups"][0]["cards"][0]["url"], "");
+
+    // Without one: 422, `required`, at the card's link.
+    let mut plain = bound_card("c1", None);
+    plain["url"] = json!("");
+    let res = save(&mut admin, &doc(1, vec![plain])).await;
+    assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", res.body);
+    assert_eq!(
+        res.json(),
+        json!({ "error": "invalid",
+                "fields": [{ "path": "groups[0].cards[0].url", "code": "required" }] })
+    );
+
+    // A link that is given is still checked, with or without a service.
+    for (url, code) in [
+        ("ftp://example.com/", "bad_scheme"),
+        ("not a link", "bad_url"),
+        (" ", "required"),
+    ] {
+        let mut card = bound_card_without_link("c1", id);
+        card["url"] = json!(url);
+        let res = save(&mut admin, &doc(1, vec![card])).await;
+        assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY, "{url:?}");
+        assert_eq!(res.json()["fields"][0]["code"], code, "{url:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_service_without_a_link_gives_the_origin_of_its_address() {
+    let app = App::new().await;
+    let core = &app.magpie.core;
+    let admin = add_user(&app, "ada", "admin").await;
+    let id = service(&app, "Blog", Visibility::All, &[]).await;
+    let views = services_for(core, Viewer::new(admin, true)).await.unwrap();
+    assert_eq!(views[0].id, id);
+    // Scheme, host and port: no path, no query.
+    assert_eq!(views[0].link, ORIGIN);
+
+    // The default port is left out, the host is lower case, and the rest of the
+    // address (path, query, fragment) never appears.
+    let mut other = input("Wiki", Visibility::All, &[]);
+    other.url = Some("https://Wiki.Example.com:443/a/b?token=zzz#frag".into());
+    store::create(core, &other).await.unwrap();
+    let mut no_url = input("Odd", Visibility::All, &[]);
+    no_url.url = Some("https://odd.example.com:8443".into());
+    store::create(core, &no_url).await.unwrap();
+    let views = services_for(core, Viewer::new(admin, true)).await.unwrap();
+    let link = |name: &str| {
+        views
+            .iter()
+            .find(|v| v.name == name)
+            .map(|v| v.link.clone())
+            .unwrap()
+    };
+    assert_eq!(link("Wiki"), "https://wiki.example.com");
+    assert_eq!(link("Odd"), "https://odd.example.com:8443");
+    let all = serde_json::to_string(&views).unwrap();
+    for leak in ["/a/b", "token=zzz", "frag", "health-check-path"] {
+        assert!(!all.contains(leak), "the link leaks {leak:?}: {all}");
+    }
+}
+
+#[tokio::test]
+async fn a_stored_link_is_used_and_checked() {
+    let app = App::new().await;
+    let core = &app.magpie.core;
+    let admin = add_user(&app, "ada", "admin").await;
+
+    let mut with_link = input("Blog", Visibility::All, &[]);
+    with_link.settings =
+        json!({ "expected_status": SETTING, "link": "https://blog.example.com/home" });
+    store::create(core, &with_link).await.unwrap();
+    // An empty one is none: the address's origin is used.
+    let mut empty = input("Empty", Visibility::All, &[]);
+    empty.settings = json!({ "expected_status": SETTING, "link": "" });
+    store::create(core, &empty).await.unwrap();
+    let views = services_for(core, Viewer::new(admin, true)).await.unwrap();
+    let link = |name: &str| {
+        views
+            .iter()
+            .find(|v| v.name == name)
+            .map(|v| v.link.clone())
+            .unwrap()
+    };
+    assert_eq!(link("Blog"), "https://blog.example.com/home");
+    assert_eq!(link("Empty"), ORIGIN);
+
+    // The same rules as a card's link; an address that points at a private or
+    // link-local host is fine, because Magpie never fetches it.
+    for fine in ["http://169.254.169.254/", "http://localhost:3000/x"] {
+        let mut ok = input("Fine", Visibility::All, &[]);
+        ok.settings = json!({ "expected_status": SETTING, "link": fine });
+        assert!(ok.check().is_empty(), "{fine}: {:?}", ok.check());
+    }
+    for bad in [
+        json!("ftp://example.com/"),
+        json!("example.com"),
+        json!("https:///x"),
+        json!(" https://example.com/"),
+        json!("https://example.com/\n"),
+        json!(5),
+        json!(null),
+        json!("https://example.com/".repeat(200)),
+    ] {
+        let mut wrong = input("Wrong", Visibility::All, &[]);
+        wrong.settings = json!({ "expected_status": SETTING, "link": bad });
+        let errors = wrong.check();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field == "link" && e.key == "err.link"),
+            "{bad}: {errors:?}"
+        );
+        assert!(store::create(core, &wrong).await.is_err(), "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn a_hidden_services_link_never_reaches_the_page() {
+    let app = App::new().await;
+    let mut admin = Web::new(&app, "ada", "admin").await;
+    let mut vera = Web::new(&app, "vera", "viewer").await;
+    let visible = service(&app, "Visible for all", Visibility::All, &[]).await;
+    let mut hidden = input("Zq Secret One", Visibility::Admin, &[]);
+    hidden.url = Some("http://10.1.2.3:9071/hidden-path".into());
+    hidden.settings =
+        json!({ "expected_status": SETTING, "link": "https://hidden.example.org/secret-link" });
+    store::create(&app.magpie.core, &hidden).await.unwrap();
+    let mut hidden_no_link = input("Zq Secret Two", Visibility::Admin, &[]);
+    hidden_no_link.url = Some("http://10.4.5.6:7083/".into());
+    store::create(&app.magpie.core, &hidden_no_link)
+        .await
+        .unwrap();
+
+    let as_vera = page(&mut vera, "en").await;
+    for leak in [
+        "hidden.example.org",
+        "secret-link",
+        "10.1.2.3",
+        "9071",
+        "10.4.5.6",
+        "7083",
+        "Zq Secret",
+    ] {
+        assert!(!as_vera.body.contains(leak), "vera's page leaks {leak:?}");
+    }
+    let services = block(&as_vera.body, "mm-services");
+    assert_eq!(services.as_array().unwrap().len(), 1);
+    assert_eq!(services[0]["id"], visible);
+    assert_eq!(services[0]["link"], ORIGIN);
+
+    // The admin sees them all, each with its link.
+    let as_admin = page(&mut admin, "en").await;
+    let services = block(&as_admin.body, "mm-services");
+    let links: Vec<_> = services
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["link"].as_str().unwrap().to_string())
+        .collect();
+    assert!(links.contains(&"https://hidden.example.org/secret-link".to_string()));
+    assert!(links.contains(&"http://10.4.5.6:7083".to_string()));
+    assert!(
+        !as_admin.body.contains("hidden-path"),
+        "the path stays hidden"
+    );
+
+    // The extension's API for a viewer's token leaves the hidden ones out too.
+    let token = extension_token(&app, &mut vera).await;
+    let res = bearer_get(&app, "/api/v1/me/start", &token).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    for leak in ["hidden.example.org", "10.1.2.3", "10.4.5.6", "secret-link"] {
+        assert!(!res.body.contains(leak), "me/start leaks {leak:?}");
+    }
 }

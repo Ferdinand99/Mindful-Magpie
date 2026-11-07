@@ -146,7 +146,8 @@ impl Service {
     }
 }
 
-/// What anyone who may see a service learns about it: no address, no settings.
+/// What anyone who may see a service learns about it: no address, no
+/// settings, only the link a card may point at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceSummary {
     pub id: i64,
@@ -154,6 +155,32 @@ pub struct ServiceSummary {
     pub name: String,
     /// Seconds between fetches; a page needs it to tell a stale value.
     pub interval_s: i64,
+    /// Where a card of the service links when it has no link of its own: the
+    /// service's own «Lenke på kort», else the origin of its address (see
+    /// [`card_link`]). Empty when the service has neither.
+    pub link: String,
+}
+
+/// The setting that holds a service's «Lenke på kort». It is not a field of
+/// any kind: it is kept in the settings object next to them, reserved for
+/// this, and nothing fetches it.
+pub const LINK_KEY: &str = "link";
+
+/// The link a card of a service points at when it has none of its own: the
+/// service's `link` setting if it has one, else the origin of its address
+/// (scheme, host and port: no user name, path or query), else empty.
+pub fn card_link(settings: &Json, url: Option<&str>) -> String {
+    if let Some(link) = settings
+        .get(LINK_KEY)
+        .and_then(Json::as_str)
+        .filter(|l| !l.is_empty())
+    {
+        return link.to_string();
+    }
+    url.and_then(|u| Url::parse(u.trim()).ok())
+        .filter(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some())
+        .map(|u| u.origin().ascii_serialization())
+        .unwrap_or_default()
 }
 
 /// A change to the set of services, announced after it is stored (the
@@ -284,6 +311,16 @@ impl ServiceInput {
         }
         let empty = Map::new();
         let settings = self.settings.as_object().unwrap_or(&empty);
+        // «Lenke på kort»: a link for the browser, checked like a card's. It is
+        // never fetched, so what it points at is not checked. Empty is none.
+        if let Some(link) = settings.get(LINK_KEY) {
+            let fine = link
+                .as_str()
+                .is_some_and(|l| l.is_empty() || crate::layout::model::link_problem(l).is_none());
+            if !fine {
+                errors.push(FieldError::new("link", "err.link"));
+            }
+        }
         for field in kind.fields().iter().filter(|f| !f.secret && f.required) {
             if !settings.contains_key(field.key) {
                 errors.push(FieldError::new(format!("f_{}", field.key), "err.required"));

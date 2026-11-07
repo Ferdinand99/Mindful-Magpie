@@ -157,9 +157,10 @@ fn sorted<const N: usize>(ids: [i64; N]) -> Vec<String> {
 }
 
 fn assert_clean(text: &str, what: &str) {
+    // The service's host and port are its card link and may be shown; its
+    // path, settings, key and any user name are not.
     for needle in [
         SECRET,
-        URL_HOST,
         "values-check-path",
         SETTING,
         "expected_status",

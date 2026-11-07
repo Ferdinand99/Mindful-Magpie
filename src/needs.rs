@@ -427,6 +427,7 @@ mod tests {
             kind: "http".into(),
             name: name.into(),
             interval_s: 60,
+            link: String::new(),
         }
     }
 
