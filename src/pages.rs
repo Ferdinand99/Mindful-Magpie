@@ -248,7 +248,14 @@ async fn start(
         labels_json: json_for_html(&labels()),
         corrupt,
     };
-    Ok((jar, [("vary", VARY)], HtmlTemplate(page)).into_response())
+    // The page holds one person's layout: no cache (the browser's back/forward
+    // cache and HTTP cache included) may show it to the next person in the tab.
+    Ok((
+        jar,
+        [("vary", VARY), ("cache-control", "no-store")],
+        HtmlTemplate(page),
+    )
+        .into_response())
 }
 
 /// `POST /start/layout`: replaces the signed-in user's layout. The body is

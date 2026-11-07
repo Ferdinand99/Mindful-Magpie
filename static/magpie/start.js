@@ -14,27 +14,12 @@ function readJson(doc, id) {
   }
 }
 
-// htmx does not keep script elements when it puts a saved body back (Back and
-// Forward), so the data blocks are gone from such a page. What the page showed
-// last is remembered here, for edit mode, which needs it again.
-const remembered = new Map();
-
-/** The block `id` as data; the remembered copy when the page has no such block. */
-function dataOf(doc, id) {
-  if (!doc.getElementById(id)) return remembered.get(id) ?? null;
-  const value = readJson(doc, id);
-  if (value !== null) remembered.set(id, value);
-  return value;
-}
-
 /**
  * Draws the layout embedded in `doc` into #groups. On a page without #groups
  * (the body of another page was swapped in) it takes the background off <html>
  * instead, because htmx swaps only the body and <html> would keep it.
- * `fromMemory` (a body htmx put back, whose data blocks are gone) draws what the
- * page showed last instead of an empty page.
  */
-export function draw(doc, fromMemory = false) {
+export function draw(doc) {
   const root = doc.getElementById("groups");
   // Edit mode owns the element while it is open.
   if (root?.hasAttribute("data-editing")) return;
@@ -46,12 +31,8 @@ export function draw(doc, fromMemory = false) {
     return;
   }
   // An unreadable layout draws as the empty page; the notice above says why.
-  let layout = readJson(doc, "mm-layout");
-  let labels = readJson(doc, "mm-labels") ?? {};
-  if (fromMemory && !doc.getElementById("mm-layout")) layout = remembered.get("mm-layout") ?? null;
-  if (fromMemory && !doc.getElementById("mm-labels")) labels = remembered.get("mm-labels") ?? {};
-  dataOf(doc, "mm-layout");
-  dataOf(doc, "mm-labels");
+  const layout = readJson(doc, "mm-layout");
+  const labels = readJson(doc, "mm-labels") ?? {};
   render(root, layout, { lang: doc.documentElement.lang, labels });
 }
 
@@ -67,7 +48,7 @@ export function drawIfNeeded(doc) {
   const root = doc.getElementById("groups");
   if (root?.hasAttribute("data-editing")) return;
   if (root && root.firstElementChild && doc.documentElement.hasAttribute("data-bg")) return;
-  draw(doc, true);
+  draw(doc);
 }
 
 /**
@@ -94,7 +75,6 @@ export function makeSave(doc, fetchFn = (...args) => fetch(...args)) {
     }
     if (response.status === 200 && Number.isFinite(body?.version)) {
       const block = doc.getElementById("mm-layout");
-      remembered.set("mm-layout", { ...layout, version: body.version });
       if (block) {
         // `<` as an escape: the block lives in HTML, and htmx saves it as HTML
         // for the history, so no text in it may be able to end it early.
@@ -179,6 +159,44 @@ export function clearStash(storage) {
   }
 }
 
+const RELOAD_KEY = "mm-reload-at";
+const RELOAD_GAP_MS = 10 * 1000;
+
+/**
+ * htmx does not keep script elements in the content it swaps in, and the start
+ * page's data blocks are scripts: a start page that htmx put back (Back, or a
+ * boosted visit from the start page to itself) has its groups element but no
+ * layout, and could only be drawn empty. The page is not kept in htmx's history
+ * cache (hx-history), so it came from the server for the right user: a full
+ * reload gives it with its data. A page that is still without data soon after a
+ * reload is left alone, so that this cannot loop: the mark of a reload is taken
+ * off as soon as a start page with its data is seen (call this on every load as
+ * well). Returns whether it reloaded.
+ */
+export function reloadIfDataLost(doc, deps = {}) {
+  if (!doc.getElementById("groups")) return false;
+  const storage = storageOf(doc, deps);
+  if (doc.getElementById("mm-layout")) {
+    try {
+      storage?.removeItem(RELOAD_KEY);
+    } catch {
+      // See below.
+    }
+    return false;
+  }
+  const now = (deps.now ?? (() => Date.now()))();
+  try {
+    const raw = storage?.getItem(RELOAD_KEY);
+    const at = raw === null || raw === undefined ? Number.NaN : Number(raw);
+    if (now - at >= 0 && now - at < RELOAD_GAP_MS) return false;
+    storage?.setItem(RELOAD_KEY, String(now));
+  } catch {
+    // No storage, no guard: a reload still gives the page its data.
+  }
+  (deps.reload ?? (() => doc.defaultView?.location.reload()))();
+  return true;
+}
+
 /**
  * Wires the Edit button (`#mm-edit`, found at click time, because htmx swaps
  * the body) to edit mode. The module is loaded on the first press. Pressing the
@@ -207,14 +225,21 @@ export function initEditing(doc, deps = {}) {
 
   async function begin(button, restored) {
     const root = doc.getElementById("groups");
-    const layout = dataOf(doc, "mm-layout");
+    const layout = readJson(doc, "mm-layout");
     if (!root || !layout || loading) return;
     loading = true;
+    let module;
     try {
-      const module = await load();
-      doc.getElementById("mm-restore")?.remove();
-      editor = module.startEditing(root, () => dataOf(doc, "mm-layout") ?? layout, save, {
-        labels: dataOf(doc, "mm-labels") ?? {},
+      // A failure here (the network, say) says nothing about a kept draft: it
+      // stays, and the person can try again.
+      module = await load();
+    } finally {
+      loading = false;
+    }
+    doc.getElementById("mm-restore")?.remove();
+    try {
+      editor = module.startEditing(root, () => readJson(doc, "mm-layout") ?? layout, save, {
+        labels: readJson(doc, "mm-labels") ?? {},
         lang: doc.documentElement.lang,
         editButton: button,
         reload: deps.reload,
@@ -223,19 +248,21 @@ export function initEditing(doc, deps = {}) {
         onDiscard: () => clearStash(storage),
       });
     } catch (error) {
-      // A kept draft that edit mode cannot use is not offered again.
+      // Only a draft that edit mode cannot use is dropped.
       if (restored) clearStash(storage);
       else throw error;
-    } finally {
-      loading = false;
     }
   }
+
+  /** `begin` for a click: a failure is reported, not left unhandled. */
+  const begun = (button, restored) =>
+    begin(button, restored).catch((error) => globalThis.console?.error?.(error));
 
   doc.addEventListener("click", (event) => {
     const button = event.target.closest?.("#mm-edit");
     if (!button) return;
     if (editor?.isActive()) editor.done();
-    else begin(button, null);
+    else begun(button, null);
   });
 
   function offerRestore() {
@@ -243,7 +270,7 @@ export function initEditing(doc, deps = {}) {
     if (!root || editor?.isActive() || doc.getElementById("mm-restore")) return;
     const kept = readStash(storage, userOf(doc), now());
     if (!kept) return;
-    const labels = dataOf(doc, "mm-labels") ?? {};
+    const labels = readJson(doc, "mm-labels") ?? {};
     // Without the strings the notice would say nothing: leave the draft alone.
     if (typeof labels.restore_notice !== "string") return;
     const make = (tag, props, text) => {
@@ -258,7 +285,7 @@ export function initEditing(doc, deps = {}) {
     const actions = make("div", { class: "mm-notice-actions" });
     const restore = make("button", { type: "button", class: "btn btn-primary" }, labels.restore_yes ?? "");
     const forget = make("button", { type: "button", class: "btn btn-secondary" }, labels.restore_discard ?? "");
-    restore.addEventListener("click", () => begin(doc.getElementById("mm-edit"), kept));
+    restore.addEventListener("click", () => begun(doc.getElementById("mm-edit"), kept));
     forget.addEventListener("click", () => {
       clearStash(storage);
       notice.remove();
@@ -270,15 +297,31 @@ export function initEditing(doc, deps = {}) {
     root.parentNode.insertBefore(notice, root);
   }
 
-  return {
-    leave() {
-      // Its buttons would be dead when htmx puts the saved body back.
-      doc.getElementById("mm-restore")?.remove();
-      if (!editor?.isActive()) return;
-      // Without a user number on the page the draft could not be tied to anyone.
-      if (editor.isDirty() && userOf(doc) !== null) stashDraft(storage, editor.draft(), userOf(doc), now());
-      editor.stop({ focus: false });
+  function leave() {
+    doc.getElementById("mm-restore")?.remove();
+    if (!editor?.isActive()) return;
+    // Without a user number on the page the draft could not be tied to anyone.
+    if (editor.isDirty() && userOf(doc) !== null) stashDraft(storage, editor.draft(), userOf(doc), now());
+    editor.stop({ focus: false });
+  }
+
+  // Back and Forward cannot be stopped. htmx takes over an entry it made
+  // (its state says so) and swaps the body, so the draft is kept now, while the
+  // editor is still there. An entry of another kind is a real page load, which
+  // the browser's own prompt covers (edit.js); a change of the address hash
+  // keeps the page, and so keeps edit mode. This page asks htmx not to keep a
+  // snapshot of it (hx-history), so htmx's beforeHistorySave never comes for it.
+  // Capture phase: before htmx's own listener swaps the body.
+  doc.defaultView?.addEventListener(
+    "popstate",
+    (event) => {
+      if (event.state?.htmx) leave();
     },
+    true,
+  );
+
+  return {
+    leave,
     check() {
       if (editor && editor.isActive() && !editor.root.isConnected) editor.dispose();
     },
@@ -289,6 +332,8 @@ export function initEditing(doc, deps = {}) {
 if (typeof document !== "undefined") {
   const editing = initEditing(document);
   const start = () => {
+    // A start page with its data takes off the mark of an earlier reload.
+    reloadIfDataLost(document);
     draw(document);
     editing.offerRestore();
   };
@@ -297,22 +342,20 @@ if (typeof document !== "undefined") {
   } else {
     start();
   }
-  // htmx saves the body for the history before it leaves the page, for a click
-  // on a link and also for Back and Forward (popstate, which cannot be stopped).
-  // Links and forms inside the app were asked about already while edit mode held
-  // unsaved changes (edit.js); what is left is Back and Forward, so the draft is
-  // kept, and edit mode closes so that the history holds the plain page.
-  document.addEventListener("htmx:beforeHistorySave", () => editing.leave());
-  // A boosted visit to the start page swaps in a fresh body, and htmx does not
-  // run scripts it swaps in. A boosted visit to another page takes the body away.
+  // The start page asks htmx not to keep a snapshot of it (hx-history="false"
+  // on #groups): it holds one person's layout and htmx's cache outlives a
+  // sign-out in the same tab. Back to the page fetches it from the server (for
+  // whoever is signed in now); the draft kept by a dirty Back is in initEditing.
+  //
+  // A body htmx swaps in has no data blocks (see reloadIfDataLost): reload.
   document.addEventListener("htmx:afterSettle", () => {
+    if (reloadIfDataLost(document)) return;
     editing.check();
     drawIfNeeded(document);
     editing.offerRestore();
   });
-  // Back to the start page: htmx puts the saved body back, drawn but without
-  // the background that the visit to the other page cleared.
   document.addEventListener("htmx:historyRestore", () => {
+    if (reloadIfDataLost(document)) return;
     drawIfNeeded(document);
     editing.offerRestore();
   });

@@ -7,7 +7,16 @@ import { test } from "node:test";
 import { parseHTML } from "linkedom";
 
 import { startEditing } from "../static/magpie/edit.js";
-import { clearStash, draw, drawIfNeeded, initEditing, makeSave, readStash, stashDraft } from "../static/magpie/start.js";
+import {
+  clearStash,
+  draw,
+  drawIfNeeded,
+  initEditing,
+  makeSave,
+  readStash,
+  reloadIfDataLost,
+  stashDraft,
+} from "../static/magpie/start.js";
 
 // The real English strings, so that the tests and the locale file cannot drift.
 function readStartStrings(path) {
@@ -1025,43 +1034,152 @@ test("storage_that_throws_does_not_break_the_page", async () => {
   assert.equal(blocked.root.hasAttribute("data-editing"), false);
 });
 
-test("edit_mode_works_on_a_page_htmx_put_back_without_its_data_blocks", async () => {
-  // htmx does not keep script elements when it restores a saved body (Back and
-  // Forward): the page is drawn but #mm-layout and #mm-labels are gone.
+// ---- a start page that htmx swaps in has no data blocks ---------------------
+
+test("a_start_page_swapped_in_without_its_data_blocks_is_reloaded", () => {
+  // htmx does not keep script elements: after Back (fetched from the server, as
+  // the page is not kept in htmx's history cache) the groups element is there
+  // but #mm-layout and #mm-labels are not.
   const t = setup();
   draw(t.document);
   t.document.getElementById("mm-layout").remove();
   t.document.getElementById("mm-labels").remove();
   const storage = fakeStorage();
-  stashDraft(storage, keptDraft(), 7);
-  const editing = wired(t, storage);
-  editing.offerRestore();
-  assert.ok(t.document.getElementById("mm-restore"), "the notice still has its strings");
-
-  click(t.document.getElementById("mm-edit"));
-  await tick();
-  // The notice goes when edit mode opens on the stored layout.
-  assert.ok(t.root.hasAttribute("data-editing"));
-  assert.ok(item(t.root, "card", "c1"), "the stored layout, remembered from the first draw");
-  assert.equal(t.document.getElementById("mm-restore"), null);
-  click(act(bar(t.document), "cancel"));
-  await tick();
-  assert.equal(t.root.hasAttribute("data-editing"), false);
+  const reloads = [];
+  const deps = { storage, reload: () => reloads.push(1), now: () => 1_000_000 };
+  assert.equal(reloadIfDataLost(t.document, deps), true);
+  assert.equal(reloads.length, 1);
+  // Still without data right after the reload: left alone, no loop.
+  assert.equal(reloadIfDataLost(t.document, { ...deps, now: () => 1_000_000 + 5_000 }), false);
+  assert.equal(reloads.length, 1);
+  assert.equal(reloadIfDataLost(t.document, { ...deps, now: () => 1_000_000 + 11_000 }), true);
+  assert.equal(reloads.length, 2);
+  // Once a start page with its data has been seen, the next loss reloads at once.
+  assert.equal(reloadIfDataLost(t.document, { ...deps, now: () => 1_000_000 + 12_000 }), false, "guarded again");
+  const whole = setup();
+  assert.equal(reloadIfDataLost(whole.document, { ...deps, now: () => 1_000_000 + 12_500 }), false, "has its data");
+  assert.equal(reloadIfDataLost(t.document, { ...deps, now: () => 1_000_000 + 13_000 }), true, "the mark is gone");
+  // Without storage there is no guard, and still no error.
+  assert.equal(reloadIfDataLost(t.document, { storage: denied, reload: () => reloads.push(1) }), true);
 });
 
-test("a_restored_body_without_blocks_is_redrawn_from_memory_not_emptied", () => {
-  // Back to the start page: htmx puts the body back without its script blocks,
-  // and <html> has lost data-bg. Redrawing from the missing blocks would wipe the page.
+test("a_page_with_its_data_or_without_a_groups_element_is_not_reloaded", () => {
   const t = setup();
-  draw(t.document);
-  const drawn = t.root.innerHTML;
-  assert.ok(drawn.includes("Sonarr"));
+  const reloads = [];
+  const deps = { storage: fakeStorage(), reload: () => reloads.push(1) };
+  assert.equal(reloadIfDataLost(t.document, deps), false, "the data blocks are there");
+  t.root.remove();
   t.document.getElementById("mm-layout").remove();
-  t.document.getElementById("mm-labels").remove();
-  t.document.documentElement.removeAttribute("data-bg");
-  drawIfNeeded(t.document);
-  assert.equal(t.root.innerHTML, drawn);
-  assert.equal(t.document.documentElement.getAttribute("data-bg"), "hedgerow");
+  assert.equal(reloadIfDataLost(t.document, deps), false, "another page");
+  assert.equal(reloads.length, 0);
+});
+
+test("a_body_for_another_user_never_shows_the_layout_of_the_one_before", async () => {
+  // Nothing of the page is remembered in the script: a body without data
+  // blocks draws as the empty page, it never takes another user's layout.
+  const a = setup();
+  draw(a.document);
+  assert.ok(a.root.textContent.includes("Sonarr"));
+
+  const b = setup({ layout: { version: 1, background: { kind: "preset", name: "hedgerow" }, groups: [], bookmarks: [] } });
+  b.root.setAttribute("data-user", "8");
+  b.document.getElementById("mm-layout").remove();
+  b.document.getElementById("mm-labels").remove();
+  drawIfNeeded(b.document);
+  assert.ok(!b.root.textContent.includes("Sonarr"));
+  assert.ok(!b.root.textContent.includes("Media"));
+
+  // And the Edit button has nothing to edit without data.
+  const editing = wired(b, fakeStorage());
+  void editing;
+  click(b.document.getElementById("mm-edit"));
+  await tick();
+  assert.equal(b.root.hasAttribute("data-editing"), false);
+});
+
+// ---- Back and Forward --------------------------------------------------------
+
+function popstate(t, state) {
+  const event = new t.window.Event("popstate");
+  event.state = state;
+  t.window.dispatchEvent(event);
+}
+
+test("popstate_into_an_htmx_entry_keeps_a_dirty_draft_and_closes_edit_mode", async () => {
+  const t = setup();
+  const storage = fakeStorage();
+  wired(t, storage);
+  click(t.document.getElementById("mm-edit"));
+  await tick();
+  click(act(item(t.root, "card", "c1"), "delete"));
+  popstate(t, { htmx: true });
+  assert.equal(t.root.hasAttribute("data-editing"), false);
+  assert.deepEqual(readStash(storage, 7).groups[0].cards.map((c) => c.id), ["c2"]);
+});
+
+test("a_hash_change_keeps_edit_mode_and_keeps_nothing", async () => {
+  const t = setup();
+  const storage = fakeStorage();
+  wired(t, storage);
+  click(t.document.getElementById("mm-edit"));
+  await tick();
+  click(act(item(t.root, "card", "c1"), "delete"));
+  popstate(t, null);
+  assert.ok(t.root.hasAttribute("data-editing"));
+  assert.equal(storage.map.size, 0);
+});
+
+test("a_failed_load_of_edit_mode_keeps_the_kept_draft", async () => {
+  const t = setup();
+  const storage = fakeStorage();
+  stashDraft(storage, keptDraft(), 7);
+  const errors = [];
+  const original = globalThis.console.error;
+  globalThis.console.error = (...args) => errors.push(args);
+  try {
+    const editing = initEditing(t.document, {
+      load: async () => {
+        throw new TypeError("Failed to fetch dynamically imported module");
+      },
+      save: async () => ({ status: 200, body: { version: 4 } }),
+      storage,
+    });
+    editing.offerRestore();
+    click(t.document.querySelector("#mm-restore button"));
+    await tick();
+    assert.equal(errors.length, 1, "reported, not thrown");
+    assert.ok(readStash(storage, 7), "the draft survives");
+    assert.ok(t.document.getElementById("mm-restore"), "and is still offered");
+    assert.equal(t.root.hasAttribute("data-editing"), false);
+    // A second try works once the module loads.
+    const again = initEditing(t.document, {
+      load: async () => ({ startEditing }),
+      save: async () => ({ status: 200, body: { version: 4 } }),
+      storage,
+    });
+    void again;
+  } finally {
+    globalThis.console.error = original;
+  }
+});
+
+test("a_kept_draft_that_edit_mode_cannot_use_is_dropped", async () => {
+  const t = setup();
+  const storage = fakeStorage();
+  stashDraft(storage, keptDraft(), 7);
+  const editing = initEditing(t.document, {
+    load: async () => ({
+      startEditing() {
+        throw new Error("cannot use this draft");
+      },
+    }),
+    save: async () => ({ status: 200, body: { version: 4 } }),
+    storage,
+  });
+  editing.offerRestore();
+  click(t.document.querySelector("#mm-restore button"));
+  await tick();
+  assert.equal(storage.map.size, 0);
 });
 
 const HOUR = 60 * 60 * 1000;

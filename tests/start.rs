@@ -544,3 +544,32 @@ async fn start_page_carries_the_signed_in_users_number() {
         assert!(!tag.contains(name), "the name is not on the page: {tag}");
     }
 }
+
+#[tokio::test]
+async fn start_page_is_not_kept_in_the_htmx_history_cache() {
+    // htmx keeps a snapshot of every page it leaves in sessionStorage, and the
+    // snapshot outlives a sign-out in the same tab: Back could show the start
+    // page, with its layout, to the next person. `hx-history="false"` anywhere
+    // in the page makes htmx keep no snapshot of it; Back then fetches the page
+    // from the server, for whoever is signed in.
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    let res = start_page(&mut web, "en").await;
+    assert!(
+        res.body.contains(r#"hx-history="false""#),
+        "the start page does not opt out of htmx's history cache"
+    );
+    // Nor in the browser's own caches: Back after a sign-out asks the server.
+    assert_eq!(res.header("cache-control"), "no-store");
+    // The page's own data is in the page, not in a snapshot.
+    assert!(res.body.contains(r#"id="mm-layout""#), "{}", res.body);
+
+    // The check lives in the htmx the kit ships: it looks for this selector.
+    // (If a newer htmx changes it, this fails and the opt-out needs a new look.)
+    let htmx = app.get("/static/htmx.min.js").await;
+    assert_eq!(htmx.status, StatusCode::OK);
+    assert!(
+        htmx.body.contains(r#"[hx-history="false" i]"#),
+        "this htmx does not know hx-history=false"
+    );
+}
