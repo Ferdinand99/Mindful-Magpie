@@ -403,6 +403,7 @@ unraid_array_no_data_disks = "No data disks"
 [detail]
 tofa_playing = "Playing now"
 tofa_libraries = "Libraries"
+tofa_progress = "Progress"
 tofa_server = "Server"
 tofa_tasks = "Background tasks"
 tofa_version = "Server version"

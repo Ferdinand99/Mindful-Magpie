@@ -722,9 +722,17 @@ async fn names_and_titles_from_tofa_never_reach_a_need_or_the_error() {
     for hidden in ["Hemmelig", "Film 0", "user0", "Tofa Web"] {
         assert!(!outside.contains(hidden), "{hidden} reached the reading");
     }
-    // A field the card does not show (the user name) is not kept at all.
-    let all = format!("{s:?}{}", serde_json::to_string(&s).unwrap());
-    assert!(!all.contains("user0"), "the user name reached the reading");
+    // The user, the title and the client are in the playing list, as text.
+    let blocks = details(&s);
+    let items = list_of(&blocks, "tofa_playing").unwrap();
+    assert_eq!(items[0].text, "Film 0");
+    assert_eq!(
+        items[0].sub.as_deref(),
+        Some("user0 \u{b7} Tofa Web \u{b7} transcode")
+    );
+    // The library name too, and nowhere else but the details.
+    let libraries = list_of(&blocks, "tofa_libraries").unwrap();
+    assert!(libraries[0].text.starts_with("Hemmelig"));
 }
 
 #[tokio::test]
@@ -845,6 +853,18 @@ fn list_of<'a>(blocks: &'a [Block], title: &str) -> Option<&'a Vec<ListItem>> {
     })
 }
 
+/// The bars of the progress block: label, percentage, text.
+fn bars_of(blocks: &[Block]) -> Option<Vec<(String, f64, String)>> {
+    blocks.iter().find_map(|b| match b {
+        Block::Bars { title_key, bars } if title_key == "tofa_progress" => Some(
+            bars.iter()
+                .map(|bar| (bar.label.clone(), bar.pct, bar.text.clone()))
+                .collect(),
+        ),
+        _ => None,
+    })
+}
+
 fn facts_of(blocks: &[Block]) -> Vec<(String, String)> {
     blocks
         .iter()
@@ -859,10 +879,11 @@ fn facts_of(blocks: &[Block]) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-/// A session as a real server lists it, with the fields the card shows.
+/// A session as a real server lists it, with the fields the card shows (the
+/// profile is the default label «Main»).
 fn play(
     title: &str,
-    profile: &str,
+    user: &str,
     client: &str,
     mode: &str,
     paused: bool,
@@ -871,7 +892,8 @@ fn play(
     json!({
         "session_id": "00000000-0000-4000-8000-000000000001",
         "media_title": title,
-        "profile_name": profile,
+        "username": user,
+        "profile_name": "Main",
         "client_name": client,
         "is_paused": paused,
         "play_method": "DirectStream",
@@ -911,8 +933,8 @@ async fn every_session_is_a_line_of_the_now_playing_list() {
     let items = list_of(&blocks, "tofa_playing").expect("a now-playing list");
     assert_eq!(items.len(), 2);
     assert_eq!(items[0].text, "Dune");
-    assert_eq!(items[0].sub.as_deref(), Some("Kari \u{b7} Tofa Web"));
-    assert_eq!(items[0].right.as_deref(), Some("84 %"));
+    assert_eq!(items[0].sub.as_deref(), Some("Kari (Main) \u{b7} Tofa Web"));
+    assert_eq!(items[0].right, None, "the progress is in the bars");
     assert_eq!(items[0].status, Some(Status::Ok));
     assert_eq!(items[0].href, None);
     // Paused: a warning. A transcode says so in the second line. No duration:
@@ -920,10 +942,16 @@ async fn every_session_is_a_line_of_the_now_playing_list() {
     assert_eq!(items[1].text, "Alien");
     assert_eq!(
         items[1].sub.as_deref(),
-        Some("Ola \u{b7} Living room TV \u{b7} transcode")
+        Some("Ola (Main) \u{b7} Living room TV \u{b7} transcode")
     );
-    assert_eq!(items[1].right, None);
     assert_eq!(items[1].status, Some(Status::Warn));
+    // Progress: one bar for the session that has one, with its title.
+    let bars = bars_of(&blocks).expect("a progress block");
+    assert_eq!(
+        bars,
+        [("Dune".to_string(), 84.0, "84 %".to_string())],
+        "the one without a duration has no bar"
+    );
     // The numbers and the needs are as before.
     assert_eq!(num(&s, "streams"), Some(1.0));
     assert_eq!(num(&s, "transcodes"), Some(1.0));
@@ -945,12 +973,17 @@ async fn progress_is_a_whole_percentage_from_zero_to_a_hundred() {
         ]),
     );
     let blocks = details(&fetch(&base).await);
-    let rights: Vec<_> = list_of(&blocks, "tofa_playing")
-        .unwrap()
-        .iter()
-        .map(|i| i.right.as_deref())
-        .collect();
-    assert_eq!(rights, [Some("0 %"), Some("100 %"), Some("33 %"), None]);
+    // The list keeps all four lines; the bars only the three with progress,
+    // in the same order.
+    assert_eq!(list_of(&blocks, "tofa_playing").unwrap().len(), 4);
+    assert_eq!(
+        bars_of(&blocks).unwrap(),
+        [
+            ("A".to_string(), 0.0, "0 %".to_string()),
+            ("B".to_string(), 100.0, "100 %".to_string()),
+            ("C".to_string(), 33.0, "33 %".to_string()),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -971,6 +1004,9 @@ async fn the_now_playing_list_holds_at_most_eight_and_hostile_titles_stay_text()
     let items = list_of(&blocks, "tofa_playing").unwrap();
     assert_eq!(items.len(), MAX_ITEMS);
     assert!(items[0].text.starts_with("<img src=x"));
+    let bars = bars_of(&blocks).unwrap();
+    assert_eq!(bars.len(), MAX_ITEMS);
+    assert!(bars[0].0.starts_with("<img src=x") && bars[0].0.chars().count() <= 80);
     for text in [Some(&items[0].text), items[0].sub.as_ref()] {
         let text = text.unwrap();
         assert!(text.chars().count() <= 80, "{text}");
@@ -1085,6 +1121,7 @@ async fn every_key_the_tofa_details_use_has_a_text_in_both_languages() {
         [
             "tofa_libraries",
             "tofa_playing",
+            "tofa_progress",
             "tofa_server",
             "tofa_tasks",
             "tofa_version"

@@ -15,7 +15,9 @@
 //! branch status, open Dependabot alerts, the newest releases) and, with the
 //! user's login (asked once, then remembered), the pull requests waiting for
 //! their review (the count and the newest few) and the number of their own
-//! open ones. A repository whose
+//! open ones. The rollup also asks for its first ten checks (`contexts`) to
+//! name the failing one; that adds one more connection per repository and
+//! raises the query's point cost by about one point for a hundred repositories. A repository whose
 //! default branch has no status in the answer gets one REST call (the newest
 //! completed workflow runs on that branch), for at most [`CI_FALLBACK_MAX`]
 //! repositories a fetch. Repositories past the first 100 of an owner are not
@@ -280,10 +282,19 @@ enum Part {
     Alerts,
     Releases,
     Search,
+    /// The names of the failing checks inside the rollup: a token that may
+    /// read the rollup's state may not read these.
+    Contexts,
 }
 
 impl Part {
-    const ALL: [Part; 4] = [Part::Rollup, Part::Alerts, Part::Releases, Part::Search];
+    const ALL: [Part; 5] = [
+        Part::Rollup,
+        Part::Alerts,
+        Part::Releases,
+        Part::Search,
+        Part::Contexts,
+    ];
 
     /// The field of the query that names this part in an error's path.
     fn fields(self) -> &'static [&'static str] {
@@ -292,13 +303,14 @@ impl Part {
             Part::Alerts => &["vulnerabilityAlerts"],
             Part::Releases => &["releases"],
             Part::Search => &["reviews", "authored"],
+            Part::Contexts => &["contexts"],
         }
     }
 }
 
 /// Which parts are left out, until when.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Denied([Option<Timestamp>; 4]);
+struct Denied([Option<Timestamp>; 5]);
 
 impl Denied {
     fn is(&self, part: Part, now: Timestamp) -> bool {
@@ -884,6 +896,10 @@ const REPOSITORY: &str = "fragment R on Repository {
 /// and what stands in its place when the token may not read it.
 const ROLLUP_PART: &str = "defaultBranchRef { name target { ... on Commit { statusCheckRollup { state contexts(first: 10) { nodes { __typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } } } } } }";
 
+/// The check names inside the rollup (a part of [`ROLLUP_PART`]), with the
+/// space before it.
+const CONTEXTS_PART: &str = " contexts(first: 10) { nodes { __typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } }";
+
 const REVIEWS: &str = "reviews: search(query: $reviewQ, type: ISSUE, first: 8) { issueCount nodes { ... on PullRequest { title url createdAt repository { nameWithOwner } author { login } } } }";
 
 /// The query and its variables. Owners and the login only ever travel as
@@ -917,7 +933,7 @@ fn build_query(owners: &[String], login: Option<&str>, denied: &Denied, now: Tim
         variables.insert(
             "reviewQ".into(),
             Json::String(format!(
-                "is:pr is:open review-requested:{login} archived:false{scope}"
+                "is:pr is:open review-requested:{login} archived:false{scope} sort:updated-desc"
             )),
         );
         variables.insert(
@@ -932,8 +948,13 @@ fn build_query(owners: &[String], login: Option<&str>, denied: &Denied, now: Tim
         );
     }
     let mut fragment = REPOSITORY.to_string();
+    // The whole rollup first; what is left of it without the check names
+    // keeps the state, so the number of red repositories stays complete.
     if denied.is(Part::Rollup, now) {
         fragment = fragment.replace(ROLLUP_PART, "defaultBranchRef { name }");
+    }
+    if denied.is(Part::Contexts, now) {
+        fragment = fragment.replace(CONTEXTS_PART, "");
     }
     if denied.is(Part::Alerts, now) {
         fragment = fragment.replace(
@@ -968,7 +989,8 @@ fn is_secondary_limit(body: &[u8]) -> bool {
 /// The parts the errors of an answer name: the ones whose field is in an
 /// error's path. An error of type FORBIDDEN or INSUFFICIENT_SCOPES says the
 /// token may not read the part (`true`: lasting); any other error with a path
-/// is a failure of this answer only (`false`).
+/// is a failure of this answer only (`false`). An error inside the rollup's
+/// `contexts` names that part only: the rollup's state is still readable.
 fn denied_parts(root: &Json) -> Vec<(Part, bool)> {
     let Some(errors) = root.get("errors").and_then(Json::as_array) else {
         return Vec::new();
@@ -983,9 +1005,10 @@ fn denied_parts(root: &Json) -> Vec<(Part, bool)> {
                         .get("path")
                         .and_then(Json::as_array)
                         .is_some_and(|path| {
-                            path.iter()
-                                .filter_map(Json::as_str)
-                                .any(|step| part.fields().contains(&step))
+                            let steps = path.iter().filter_map(Json::as_str);
+                            let in_contexts = steps.clone().any(|step| step == "contexts");
+                            let names = steps.clone().any(|step| part.fields().contains(&step));
+                            names && (part == Part::Contexts || !in_contexts)
                         })
                 })
                 .collect();
@@ -1302,6 +1325,51 @@ mod tests {
     }
 
     #[test]
+    fn an_age_is_one_short_unit_and_changes_at_the_boundaries() {
+        let now = at(10_000_000);
+        let ago = |secs: i64| age(at(10_000_000 - secs), now);
+        assert_eq!(ago(0), "1m");
+        assert_eq!(ago(59), "1m");
+        assert_eq!(ago(60), "1m");
+        assert_eq!(ago(59 * 60), "59m");
+        assert_eq!(ago(59 * 60 + 59), "59m");
+        assert_eq!(ago(60 * 60), "1h");
+        assert_eq!(ago(23 * 3600 + 59 * 60), "23h");
+        assert_eq!(ago(24 * 3600), "1d");
+        assert_eq!(ago(59 * 86_400), "59d");
+        assert_eq!(ago(60 * 86_400), "2mo");
+        assert_eq!(ago(729 * 86_400), "24mo");
+        assert_eq!(ago(730 * 86_400), "2y");
+        // A time in the future (a clock that is off) counts as just now.
+        assert_eq!(ago(-3600), "1m");
+    }
+
+    #[test]
+    fn an_error_inside_the_contexts_names_only_that_part() {
+        let root = json!({ "errors": [{
+            "type": "FORBIDDEN",
+            "path": ["viewer", "repositories", "nodes", 0, "defaultBranchRef", "target",
+                     "statusCheckRollup", "contexts", "nodes"],
+        }] });
+        assert_eq!(denied_parts(&root), vec![(Part::Contexts, true)]);
+        // An error at the rollup itself names the rollup, not the contexts.
+        let root = json!({ "errors": [{
+            "type": "FORBIDDEN",
+            "path": ["viewer", "repositories", "nodes", 0, "defaultBranchRef", "target",
+                     "statusCheckRollup"],
+        }] });
+        assert_eq!(denied_parts(&root), vec![(Part::Rollup, true)]);
+        // The query without the contexts keeps the rollup's state.
+        let now = at(1_000_000);
+        let mut denied = Denied::default();
+        denied.deny(Part::Contexts, now);
+        let query = build_query(&[], None, &denied, now);
+        let text = query["query"].as_str().unwrap();
+        assert!(text.contains("statusCheckRollup { state }"), "{text}");
+        assert!(!text.contains("contexts("), "{text}");
+    }
+
+    #[test]
     fn owners_are_logins_split_by_commas_or_spaces() {
         assert_eq!(parse_owners(""), Some(vec![]));
         assert_eq!(parse_owners(" , "), Some(vec![]));
@@ -1438,7 +1506,7 @@ mod tests {
         let review = query["variables"]["reviewQ"].as_str().unwrap();
         assert_eq!(
             review,
-            "is:pr is:open review-requested:me archived:false user:acme user:me"
+            "is:pr is:open review-requested:me archived:false user:acme user:me sort:updated-desc"
         );
         // No login yet: no search.
         let query = build_query(&owners, None, &Denied::default(), now);

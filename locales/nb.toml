@@ -403,6 +403,7 @@ unraid_array_no_data_disks = "Ingen datadisker"
 [detail]
 tofa_playing = "Spilles nå"
 tofa_libraries = "Biblioteker"
+tofa_progress = "Fremdrift"
 tofa_server = "Server"
 tofa_tasks = "Bakgrunnsjobber"
 tofa_version = "Serverversjon"
