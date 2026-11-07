@@ -986,3 +986,177 @@ async fn a_role_change_is_seen_by_a_stream_that_is_open() {
     assert_eq!(update["removed"], json!([secret]));
     assert!(!update.to_string().contains("Router"));
 }
+
+// ---------------------------------------------------------------------------
+// Whose services a token shows
+
+/// The token the extension's connect flow gives `web`'s user: consent, then
+/// the code swapped for a token (read access plus the `start:owner` scope).
+async fn extension_token(app: &App, web: &mut Web<'_>) -> String {
+    const REDIRECT: &str =
+        "https://9bd6a096502a3a8555d679b3f64704219dffb501.extensions.allizom.org/";
+    const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    let res = web
+        .post(
+            "/connect/extension",
+            &[
+                ("current_password", common::PASSWORD),
+                ("redirect_uri", REDIRECT),
+                ("state", "c3RhdGUtZnJvbS10aGUtZXh0ZW5zaW9u"),
+                ("code_challenge", CHALLENGE),
+                ("code_challenge_method", "S256"),
+                ("device", "Test"),
+                ("decision", "approve"),
+            ],
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    let location = url::Url::parse(res.header("location")).unwrap();
+    let code = location
+        .query_pairs()
+        .find(|(k, _)| k == "code")
+        .unwrap()
+        .1
+        .into_owned();
+    let res = common::post_json(
+        app,
+        "/api/v1/extension/token",
+        &json!({ "code": code, "code_verifier": VERIFIER }).to_string(),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    res.json()["token"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn an_admins_plain_read_token_gets_no_admin_only_values_but_the_extensions_token_does() {
+    let w = world().await;
+    let mut ada = Web::new(&w.app, "ada", "admin").await;
+    let ada_id = user_id(&w.app, "ada").await;
+    let secret = service(&w.app, "Admins-Only-Svc", Visibility::Admin, &[]).await;
+    save(
+        &mut ada,
+        &doc(
+            0,
+            vec![
+                card("c1", Some(bind(w.a, &["status"]))),
+                card("c2", Some(bind(secret, &["status"]))),
+            ],
+        ),
+    )
+    .await;
+    for id in [w.a, secret] {
+        w.app
+            .magpie
+            .poller
+            .set_snapshot_for_tests(id, snap(Status::Ok, 1.0));
+    }
+    let path = "/api/v1/me/values";
+
+    // The session's own page has both.
+    assert_eq!(ids(&embed(&mut ada).await), sorted([w.a, secret]));
+
+    // A script's read token (no product scope) is a viewer's: no admin-only name.
+    let plain = make_token(&w.app, ada_id, TokenScope::Read, "script").await;
+    let res = bearer_get(&w.app, path, &plain).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(ids(&res.json()), sorted([w.a]));
+    assert!(!res.body.contains("Admins-Only-Svc"), "{}", res.body);
+
+    // The token the connect flow gives: the admin's own view.
+    let ext = extension_token(&w.app, &mut ada).await;
+    let res = bearer_get(&w.app, path, &ext).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(ids(&res.json()), sorted([w.a, secret]));
+    assert_eq!(
+        res.json()["services"][secret.to_string()]["name"],
+        "Admins-Only-Svc"
+    );
+    assert_clean(&res.body, "the extension's values");
+
+    // A read-and-write token is the account's own role, as everywhere in the kit.
+    let write = make_token(&w.app, ada_id, TokenScope::Write, "writer").await;
+    let res = bearer_get(&w.app, path, &write).await;
+    assert_eq!(ids(&res.json()), sorted([w.a, secret]));
+}
+
+#[tokio::test]
+async fn a_viewers_extension_token_never_gets_admin_only_values() {
+    let w = world().await;
+    let _ada = Web::new(&w.app, "ada", "admin").await;
+    let mut vera = Web::new(&w.app, "vera", "viewer").await;
+    let vera_id = user_id(&w.app, "vera").await;
+    let was_open = service(&w.app, "Was-Open-Svc", Visibility::All, &[]).await;
+    save(
+        &mut vera,
+        &doc(
+            0,
+            vec![
+                card("c1", Some(bind(w.a, &["status"]))),
+                card("c2", Some(bind(was_open, &["status"]))),
+            ],
+        ),
+    )
+    .await;
+    for id in [w.a, was_open] {
+        w.app
+            .magpie
+            .poller
+            .set_snapshot_for_tests(id, snap(Status::Ok, 1.0));
+    }
+    // The binding stays in her layout (a save keeps an old binding), the service is hidden.
+    set_visibility(&w.app, was_open, "Was-Open-Svc", Visibility::Admin, &[]).await;
+
+    let ext = extension_token(&w.app, &mut vera).await;
+    let res = bearer_get(&w.app, "/api/v1/me/values", &ext).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(ids(&res.json()), sorted([w.a]));
+    assert!(!res.body.contains("Was-Open-Svc"), "{}", res.body);
+
+    // Giving a plain token the scope by hand gains nothing: the owner's role decides.
+    let plain = make_token(&w.app, vera_id, TokenScope::Read, "mine").await;
+    let id: i64 = w
+        .app
+        .magpie
+        .core
+        .with_conn(|c| {
+            c.query_row("SELECT id FROM api_tokens WHERE name = 'mine'", [], |r| {
+                r.get(0)
+            })
+        })
+        .await
+        .unwrap();
+    w.app
+        .magpie
+        .core
+        .with_conn(move |c| vole_kit::db::api_tokens::add_scope(c, id, "start:owner"))
+        .await
+        .unwrap();
+    let res = bearer_get(&w.app, "/api/v1/me/values", &plain).await;
+    assert_eq!(ids(&res.json()), sorted([w.a]));
+    assert!(!res.body.contains("Was-Open-Svc"));
+}
+
+#[tokio::test]
+async fn no_kind_of_token_opens_the_stream() {
+    let w = world().await;
+    let mut ada = Web::new(&w.app, "ada", "admin").await;
+    let ada_id = user_id(&w.app, "ada").await;
+    let ext = extension_token(&w.app, &mut ada).await;
+    let read = make_token(&w.app, ada_id, TokenScope::Read, "r").await;
+    let write = make_token(&w.app, ada_id, TokenScope::Write, "w").await;
+    for token in [ext, read, write] {
+        let res = w
+            .app
+            .send(
+                Request::get("/start/live")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_ne!(res.status, StatusCode::OK, "{}", res.body);
+        assert_ne!(res.header("content-type"), "text/event-stream");
+    }
+}

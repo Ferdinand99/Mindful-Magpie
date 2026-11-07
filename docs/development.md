@@ -49,10 +49,10 @@ Builds and tests run in Docker on a build host (a shared Docker daemon), not on 
 cargo commands that run inside a Rust 1.99 container with clippy and rustfmt installed.
 
 ```bash
-cargo test --locked                                  # 261 Rust tests: boot, auth and users, start page, layout, backgrounds and migrations, extension API and connect flow, services, the poller
+cargo test --locked                                  # 268 Rust tests: boot, auth and users, start page, layout, backgrounds and migrations, extension API and connect flow, services, the poller
 cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --all --check
-cd web && npm ci && node --test                     # 326 JavaScript tests: renderer, operations, rules, edit mode and page wiring, the extension (node:22 container; linkedom stands in for the DOM)
+cd web && npm ci && node --test                     # 328 JavaScript tests: renderer, operations, rules, edit mode and page wiring, the extension (node:22 container; linkedom stands in for the DOM)
 cd web && npm run build:extension                    # copies the renderer into extension/vendor/; git must show no change
 docker build -t magpie:dev .
 docker run --rm magpie:dev --help     # every flag and its MM_ variable
