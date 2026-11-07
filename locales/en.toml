@@ -238,3 +238,6 @@ redirect_scheme = "Redirect not allowed"
 too_large = "Response too large"
 invalid = "Unexpected answer"
 other = "The request failed"
+
+[need]
+http_down = "{name} is not answering"

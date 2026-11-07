@@ -53,6 +53,9 @@ pub struct Magpie {
     /// change is stored. The poller subscribes; with no subscriber a send is
     /// dropped.
     pub service_events: tokio::sync::broadcast::Sender<services::ServiceEvent>,
+    /// The latest snapshot of every service (see [`integrations::poller`]).
+    /// Idle until the server starts the poller; pages only read from it.
+    pub poller: integrations::poller::PollerHandle,
 }
 
 /// Installs the configuration, opens and migrates the database in
@@ -108,6 +111,7 @@ pub async fn start_with(
         extension_hosts: Arc::new(connect::allowed_hosts(extension_ids)),
         backgrounds,
         service_events: tokio::sync::broadcast::channel(64).0,
+        poller: integrations::poller::PollerHandle::idle(),
     })
 }
 

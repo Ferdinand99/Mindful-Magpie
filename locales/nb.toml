@@ -238,3 +238,6 @@ redirect_scheme = "Omdirigeringen er ikke tillatt"
 too_large = "Svaret er for stort"
 invalid = "Uventet svar"
 other = "Forespørselen feilet"
+
+[need]
+http_down = "{name} svarer ikke"

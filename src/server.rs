@@ -15,6 +15,13 @@ pub async fn run(config: Config) -> Result<(), crate::StartError> {
     .await?;
     // Notifications and other work outside a request use the site language.
     vole_kit::i18n::site_language(&magpie.core).await;
+    // Fetches every service in the background and follows the services pages.
+    let poller = crate::integrations::poller::Poller::start(
+        magpie.core.clone(),
+        crate::integrations::client().clone(),
+        &magpie.service_events,
+    );
+    let magpie = crate::Magpie { poller, ..magpie };
 
     let addr = config.bind_addr();
     let listener = tokio::net::TcpListener::bind(addr)
