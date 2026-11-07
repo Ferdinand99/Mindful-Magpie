@@ -59,6 +59,7 @@ export async function fetchData(fetchImpl, serverUrl, token, timeoutMs = 5000) {
     const res = await fetchImpl(startUrl(serverUrl), {
       headers: { Authorization: `Bearer ${token}` },
       credentials: "omit",
+      redirect: "error",
       cache: "no-store",
       signal: AbortSignal.timeout(timeoutMs),
     });

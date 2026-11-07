@@ -183,3 +183,13 @@ test("status texts are the four Norwegian lines and carry no secrets", () => {
   assert.equal(typeof statusText.cached, "string");
   for (const text of Object.values(statusText)) assert.equal(text.includes("Bearer"), false);
 });
+
+test("fetchData does not follow redirects and sends no cookies", async () => {
+  let seen;
+  await fetchData(async (url, opts) => {
+    seen = opts;
+    return { status: 200, json: async () => C };
+  }, "http://h", "t");
+  assert.equal(seen.redirect, "error");
+  assert.equal(seen.credentials, "omit");
+});
