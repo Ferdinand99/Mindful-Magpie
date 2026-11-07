@@ -236,17 +236,25 @@ http_expected = "Bruk en status som 200, et område som 200-399 eller en liste s
 
 [kind]
 http = "Nettside"
+ww = "Wise Wren"
 
 [field]
 http_expected = "Forventet status"
 http_expected_help = "Hvilke svar som regnes som at det fungerer. Tomt betyr 200-399."
 http_secret = "Token (valgfritt)"
 http_secret_help = "Sendes som Authorization: Bearer. Lagres kryptert."
+ww_secret = "Lesetoken"
+ww_secret_help = "Lag en token i Wise Wren under Innstillinger → API-tokens med tilgangen «Lese», og lim den inn her. Sendes som Authorization: Bearer. Lagres kryptert."
 
 [metric]
 http_status = "HTTP-status"
 http_latency = "Svartid (ms)"
 http_checked = "Sist sjekket"
+ww_updates_ready = "Oppdateringer klare"
+ww_agents_online = "Agenter tilkoblet"
+ww_agents_total = "Agenter i alt"
+ww_last_run = "Siste kjøring"
+ww_failed_targets = "Mislykkede oppdateringer"
 
 [fetch_err]
 config = "Innstillingene kan ikke brukes"
@@ -259,7 +267,10 @@ too_large = "Svaret er for stort"
 invalid = "Uventet svar"
 other = "Forespørselen feilet"
 secret = "Nøkkelen kan ikke leses – skriv den inn på nytt"
+auth = "Nøkkelen ble avvist"
 
 [need]
 http_down = "{name} svarer ikke"
+ww_failed = "{count} oppdateringer feilet"
+ww_offline = "{count} agenter frakoblet"
 service_config = "{name} må settes opp på nytt"

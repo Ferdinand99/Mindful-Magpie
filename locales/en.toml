@@ -236,17 +236,25 @@ http_expected = "Use a status like 200, a range like 200-399, or a list like 200
 
 [kind]
 http = "Website"
+ww = "Wise Wren"
 
 [field]
 http_expected = "Expected status"
 http_expected_help = "Which answers count as working. Empty means 200-399."
 http_secret = "Token (optional)"
 http_secret_help = "Sent as Authorization: Bearer. Stored encrypted."
+ww_secret = "Read token"
+ww_secret_help = "In Wise Wren, create a token under Settings → API tokens with the scope \"Read\" and paste it here. Sent as Authorization: Bearer. Stored encrypted."
 
 [metric]
 http_status = "HTTP status"
 http_latency = "Response time (ms)"
 http_checked = "Last checked"
+ww_updates_ready = "Updates ready"
+ww_agents_online = "Agents online"
+ww_agents_total = "Agents total"
+ww_last_run = "Last run"
+ww_failed_targets = "Failed updates"
 
 [fetch_err]
 config = "The settings can't be used"
@@ -259,7 +267,10 @@ too_large = "Response too large"
 invalid = "Unexpected answer"
 other = "The request failed"
 secret = "The secret can no longer be read - type it again"
+auth = "The key was refused"
 
 [need]
 http_down = "{name} is not answering"
+ww_failed = "{count} updates failed"
+ww_offline = "{count} agents offline"
 service_config = "{name} needs to be set up again"

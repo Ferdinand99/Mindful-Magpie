@@ -20,6 +20,7 @@
 
 pub mod http_kind;
 pub mod poller;
+pub mod ww_kind;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -78,7 +79,7 @@ pub trait Integration: Send + Sync + 'static {
 
 /// The kinds compiled into this build.
 pub fn registry() -> &'static [&'static dyn Integration] {
-    static KINDS: [&dyn Integration; 1] = [&http_kind::HTTP];
+    static KINDS: [&dyn Integration; 2] = [&http_kind::HTTP, &ww_kind::WW];
     &KINDS
 }
 
@@ -289,6 +290,9 @@ pub enum FetchError {
     /// The stored secret can't be opened (the instance key changed).
     #[error("stored secret unreadable")]
     SecretUnreadable,
+    /// The service refused the key (HTTP 401 or 403).
+    #[error("The key was refused")]
+    Auth,
     #[error("HTTP {0}")]
     Status(u16),
     #[error("request failed")]
@@ -309,6 +313,7 @@ impl FetchError {
             FetchError::TooLarge => "fetch_err.too_large",
             FetchError::Invalid => "fetch_err.invalid",
             FetchError::SecretUnreadable => "fetch_err.secret",
+            FetchError::Auth => "fetch_err.auth",
             FetchError::Other => "fetch_err.other",
             FetchError::Status(_) => return None,
         })
@@ -328,6 +333,7 @@ pub fn error_text_key(text: &str) -> Option<&'static str> {
         FetchError::TooLarge,
         FetchError::Invalid,
         FetchError::SecretUnreadable,
+        FetchError::Auth,
         FetchError::Other,
     ]
     .into_iter()
