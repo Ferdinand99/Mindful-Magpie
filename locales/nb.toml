@@ -237,6 +237,7 @@ http_expected = "Bruk en status som 200, et område som 200-399 eller en liste s
 [kind]
 http = "Nettside"
 vv = "Vigilant Vole"
+kk = "Keen Kestrel"
 
 [field]
 http_expected = "Forventet status"
@@ -245,6 +246,8 @@ http_secret = "Token (valgfritt)"
 http_secret_help = "Sendes som Authorization: Bearer. Lagres kryptert."
 vv_token = "API-token"
 vv_token_help = "Lag en lesenøkkel i Vigilant Vole under Innstillinger → API-tokens, med omfanget «Lese». Lagres kryptert."
+kk_secret = "Lesetoken"
+kk_secret_help = "Lag et lesetoken i Keen Kestrel under Innstillinger → API-tokens, «Lese». Sendes som Authorization: Bearer. Lagres kryptert."
 
 [metric]
 http_status = "HTTP-status"
@@ -256,6 +259,13 @@ vv_uptime_30d = "Oppetid, 30 dager"
 vv_uptime_24h = "Oppetid, 24 timer"
 vv_paused = "Satt på pause"
 vv_first_down = "Lengst nede"
+kk_new_issues = "Nye feil"
+kk_regressed_issues = "Feil som er tilbake"
+kk_unresolved_issues = "Uløste feil"
+kk_crash_free = "Krasjfrie økter"
+kk_visitors_today = "Besøkende i dag"
+kk_app_users_today = "Appbrukere i dag"
+kk_newest_issue = "Nyeste feil"
 
 [fetch_err]
 config = "Innstillingene kan ikke brukes"
@@ -269,8 +279,11 @@ invalid = "Uventet svar"
 other = "Forespørselen feilet"
 secret = "Nøkkelen kan ikke leses – skriv den inn på nytt"
 auth = "Nøkkelen ble avvist"
+kk_too_old = "Krever Keen Kestrel 0.10 eller nyere"
 
 [need]
 http_down = "{name} svarer ikke"
 service_config = "{name} må settes opp på nytt"
 vv_down = "{count} nede"
+kk_regressed = "{count} regresjoner"
+kk_new = "{count} nye saker"

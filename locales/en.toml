@@ -237,6 +237,7 @@ http_expected = "Use a status like 200, a range like 200-399, or a list like 200
 [kind]
 http = "Website"
 vv = "Vigilant Vole"
+kk = "Keen Kestrel"
 
 [field]
 http_expected = "Expected status"
@@ -245,6 +246,8 @@ http_secret = "Token (optional)"
 http_secret_help = "Sent as Authorization: Bearer. Stored encrypted."
 vv_token = "API token"
 vv_token_help = "Create a read token in Vigilant Vole under Settings → API tokens, with the scope \"Read\". Stored encrypted."
+kk_secret = "Read token"
+kk_secret_help = "Create a read token in Keen Kestrel under Settings → API tokens, scope «Read». Sent as Authorization: Bearer. Stored encrypted."
 
 [metric]
 http_status = "HTTP status"
@@ -256,6 +259,13 @@ vv_uptime_30d = "Uptime, 30 days"
 vv_uptime_24h = "Uptime, 24 hours"
 vv_paused = "Paused"
 vv_first_down = "Longest down"
+kk_new_issues = "New issues"
+kk_regressed_issues = "Regressed issues"
+kk_unresolved_issues = "Unresolved issues"
+kk_crash_free = "Crash-free sessions"
+kk_visitors_today = "Visitors today"
+kk_app_users_today = "App users today"
+kk_newest_issue = "Newest issue"
 
 [fetch_err]
 config = "The settings can't be used"
@@ -269,8 +279,11 @@ invalid = "Unexpected answer"
 other = "The request failed"
 secret = "The secret can no longer be read - type it again"
 auth = "The key was refused"
+kk_too_old = "Requires Keen Kestrel 0.10 or newer"
 
 [need]
 http_down = "{name} is not answering"
 service_config = "{name} needs to be set up again"
 vv_down = "{count} down"
+kk_regressed = "{count} regressions"
+kk_new = "{count} new issues"
