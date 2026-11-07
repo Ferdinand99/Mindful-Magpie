@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use common::stub::{self, Answer, Stub};
 use common::{locale, log};
-use mindful_magpie::integrations::tofa::{DOWN_NEED, LIBRARY_NEED, LIBRARY_WARN_NEED, SLOW_EVERY};
+use mindful_magpie::integrations::tofa::{LIBRARY_NEED, LIBRARY_WARN_NEED, SLOW_EVERY};
 use mindful_magpie::integrations::{
     self, FetchCtx, FetchError, Format, Level, Snapshot, Status, error_text_key,
 };
@@ -190,7 +190,6 @@ fn every_text_of_the_kind_exists_in_both_languages() {
     keys.extend(kind.metrics().iter().map(|m| m.label_key.to_string()));
     keys.extend(
         [
-            "need.tofa_down",
             "need.tofa_library",
             "need.tofa_library_warn",
             "fetch_err.not_admin",
@@ -236,7 +235,8 @@ fn the_texts_say_what_was_agreed() {
                 "{label}"
             );
         }
-        assert!(!t(file, "need", "tofa_down").contains('{'));
+        // The generic «not answering» replaced Tofa's own.
+        assert!(locale::text(file, "need", "tofa_down").is_none());
         // What was dropped is gone.
         assert!(locale::text(file, "metric", "tofa_new_items").is_none());
         assert!(locale::text(file, "metric", "tofa_scans_running").is_none());
@@ -537,20 +537,13 @@ async fn an_unsupported_fast_endpoint_costs_only_its_numbers() {
 // Down
 
 #[tokio::test]
-async fn a_server_that_does_not_answer_is_bad_with_the_down_need() {
+async fn a_server_that_does_not_answer_gives_no_reading_and_asks_nothing_else() {
+    // An error, not a bad reading with a need of its own: the poller makes
+    // «not answering» of it when it repeats, so once is not an alarm.
     let (base, stub) = stub::serve().await;
     quiet(&stub);
     stub.route(HEALTH, Answer::Status(503));
-    let s = fetch(&base).await;
-    assert_eq!(s.status, Status::Bad);
-    assert_eq!(s.error.as_deref(), Some("HTTP 503"));
-    assert!(s.values.is_empty());
-    assert_eq!(need_keys(&s), [DOWN_NEED]);
-    let n = &s.needs[0];
-    assert_eq!(n.level, Level::Bad);
-    assert_eq!(n.label_key, "need.tofa_down");
-    assert!(n.params.is_empty(), "no count");
-    // Nothing else was asked.
+    assert_eq!(fetch_err(&base).await, FetchError::Status(503));
     assert_eq!(stub.seen().len(), 1);
 }
 
@@ -560,16 +553,14 @@ async fn an_address_that_cannot_be_reached_or_is_not_tofa_is_down_too() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap()
     };
-    let s = fetch(&format!("http://{free}")).await;
-    assert_eq!(s.status, Status::Bad);
-    assert_eq!(s.error.as_deref(), Some("connection failed"));
-    assert_eq!(need_keys(&s), [DOWN_NEED]);
+    assert_eq!(
+        fetch_err(&format!("http://{free}")).await,
+        FetchError::Connect
+    );
 
     let (base, _stub) = stub::serve().await;
-    let s = fetch(&base).await;
-    assert_eq!(s.status, Status::Bad, "a stub with no health endpoint");
-    assert_eq!(s.error.as_deref(), Some("HTTP 404"));
-    assert_eq!(need_keys(&s), [DOWN_NEED]);
+    // A stub with no health endpoint.
+    assert_eq!(fetch_err(&base).await, FetchError::Status(404));
 }
 
 #[tokio::test]
@@ -577,7 +568,7 @@ async fn a_server_that_comes_back_is_fine_again() {
     let (base, stub) = stub::serve().await;
     quiet(&stub);
     stub.route(HEALTH, Answer::Status(503));
-    assert_eq!(fetch(&base).await.status, Status::Bad);
+    assert_eq!(fetch_err(&base).await, FetchError::Status(503));
     stub.ok(HEALTH, &health());
     let s = fetch(&base).await;
     assert_eq!(s.status, Status::Ok);
@@ -589,9 +580,7 @@ async fn health_that_is_not_json_still_means_down_not_a_panic() {
     let (base, stub) = stub::serve().await;
     quiet(&stub);
     stub.route(HEALTH, Answer::Raw("<html>"));
-    let s = fetch(&base).await;
-    assert_eq!(s.status, Status::Bad);
-    assert_eq!(s.error.as_deref(), Some("unexpected answer"));
+    assert_eq!(fetch_err(&base).await, FetchError::Invalid);
     // A health answer without a version is fine; the version is just missing.
     stub.ok(HEALTH, &json!({ "status": "ok" }));
     let s = fetch(&base).await;
@@ -760,8 +749,8 @@ async fn the_key_is_in_no_reading_error_or_log() {
     // A server that is down, and an address nothing listens on.
     let (base, stub) = stub::serve().await;
     stub.route(HEALTH, Answer::Status(503));
-    snapshots.push(fetch(&base).await);
-    snapshots.push(fetch("http://127.0.0.1:1").await);
+    errors.push(fetch_err(&base).await);
+    errors.push(fetch_err("http://127.0.0.1:1").await);
 
     let mut all = String::new();
     for s in &snapshots {
@@ -806,4 +795,27 @@ async fn a_redirect_to_another_origin_never_carries_the_key() {
             assert_eq!(hit.path, HEALTH, "only the public call went across");
         }
     }
+}
+
+#[tokio::test]
+async fn saving_or_testing_the_service_makes_the_slow_calls_run_again() {
+    use mindful_magpie::integrations::api;
+    let (base, stub) = stub::serve().await;
+    quiet(&stub);
+    let slow = "/api/v1/libraries/health";
+    // The first fetch refreshes the slow calls; the second carries them on.
+    fetch(&base).await;
+    fetch(&base).await;
+    assert_eq!(stub.count(slow), 1);
+    // Another address being saved changes nothing here.
+    api::forget_all_for("http://127.0.0.1:1/");
+    fetch(&base).await;
+    assert_eq!(stub.count(slow), 1);
+    // Saving or testing this one forgets what was remembered of it: the next
+    // fetch counts as the first again.
+    api::forget_all_for(&base);
+    fetch(&base).await;
+    assert_eq!(stub.count(slow), 2);
+    fetch(&base).await;
+    assert_eq!(stub.count(slow), 2);
 }

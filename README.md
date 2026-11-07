@@ -21,7 +21,7 @@
 > on its cards (empty means the service's address up to the port). The kinds of service are: «Nettside» (a website
 > check), Vigilant Vole, Keen Kestrel, Wise Wren, Proxmox VE, Unraid and Tofa, which an admin sets up with a
 > read-only key (a self-signed certificate is trusted by pinning its fingerprint), and GitHub, which each person
-> sets up for themselves under Settings → Mine integrasjoner with their own token. More kinds follow. It is part of the Hedgerow family and is built on
+> sets up for themselves under Settings → My integrations with their own token. More kinds follow. It is part of the Hedgerow family and is built on
 > [vole-kit](https://github.com/Ferdinand99/Vigilant-Vole), the shared kit that brings sign-in, users, setup,
 > translations and the design system. Nothing is released yet. The spike that settled the new-tab approach is in
 > [`docs/spike-findings.md`](docs/spike-findings.md).

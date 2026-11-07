@@ -28,11 +28,14 @@
 //!
 //! **«Trenger deg».** A kind sees one fetch at a time, so "bad twice in a row"
 //! is the poller's: from the second bad reading in a row a service gets a
-//! need. It is [`DOWN_KEY`] («the site does not answer») for a kind that has
-//! the rule (see [`down_label`]), or [`CONFIG_KEY`] («set it up again») when
-//! the reading failed because the settings, the address or the stored secret
-//! can't be used (an address that is not allowed, a redirect to another
-//! scheme): that needs an admin, not the site. The count survives a restart, an update
+//! need. It is [`DOWN_KEY`] («not answering») when the fetch failed in a way
+//! that may pass by itself (no connection, a timeout, a server error, an odd
+//! answer: [`FetchError::is_unreachable`]), for every kind (see
+//! [`down_label`]); or [`CONFIG_KEY`] («set it up again») when it failed
+//! because the settings, the address, the stored secret or the key can't be
+//! used ([`FetchError::is_config`]): that needs an admin, not the site. A
+//! kind's own bad reading, one that is not a failed fetch (a monitor is down),
+//! gets neither: the kind has its own needs. The count survives a restart, an update
 //! and a resync: it is taken up again from the stored snapshot, so a need
 //! that is showing does not go and come back (an acknowledgement would
 //! reopen).
@@ -94,13 +97,16 @@ impl Default for Options {
     }
 }
 
-/// The translation key of the need «bad twice in a row» for `kind`, when the
-/// kind has the rule. Kinds that know better report their own needs from
-/// `fetch`; `http` has nothing but this.
-pub fn down_label(kind: &str) -> Option<&'static str> {
+/// The translation key of the need «failed twice in a row» of every kind
+/// that has no label of its own: «Not answering».
+pub const SERVICE_DOWN_LABEL: &str = "need.service_down";
+
+/// The translation key of the need «failed twice in a row» for `kind`: the
+/// short «down» of `http`, «Not answering» for every other kind.
+pub fn down_label(kind: &str) -> &'static str {
     match kind {
-        "http" => Some("need.http_down"),
-        _ => None,
+        "http" => "need.http_down",
+        _ => SERVICE_DOWN_LABEL,
     }
 }
 
@@ -741,38 +747,27 @@ fn need_marks(snapshot: &Snapshot) -> Vec<(&str, Level, u64)> {
         .collect()
 }
 
-/// The failures that an admin has to fix, not the site: settings that can't
-/// be used, an address that is not allowed, a redirect that is not allowed,
-/// a secret that can't be opened, a key the service refused, a key with the
-/// wrong role or no rights, a certificate that was not accepted, and a Keen
-/// Kestrel that has to be upgraded.
-const CONFIG_ERRORS: [FetchError; 9] = [
-    FetchError::Config,
-    FetchError::Forbidden,
-    FetchError::RedirectScheme,
-    FetchError::SecretUnreadable,
-    FetchError::Auth,
-    FetchError::KkTooOld,
-    FetchError::NotAdmin,
-    FetchError::NothingVisible,
-    FetchError::Cert,
-];
-
-/// Whether the reading failed because of one of [`CONFIG_ERRORS`].
-fn is_config_error(snapshot: &Snapshot) -> bool {
-    snapshot
-        .error
-        .as_deref()
-        .is_some_and(|text| CONFIG_ERRORS.iter().any(|e| e.to_string() == text))
+/// Why the reading failed, when it did (its error text is one of
+/// [`FetchError`]'s).
+fn failure(snapshot: &Snapshot) -> Option<FetchError> {
+    snapshot.error.as_deref().and_then(FetchError::from_text)
 }
 
-/// The need of a service that has had bad readings in a row, if its kind has
-/// one for this reading.
+/// The need of a service that has had bad readings in a row, for this
+/// reading: «set it up again» for a failure only an admin can fix, «down» for
+/// a fetch that did not get an answer, and none for anything else (a kind's
+/// own bad reading, a 4xx answer, a rate limit). `http` is the one kind whose
+/// every bad reading says the site is down, a wrong status included.
 fn bad_need(service: &Service, snapshot: &Snapshot) -> Option<Need> {
-    let (key, label_key) = if is_config_error(snapshot) {
+    let reason = failure(snapshot);
+    let (key, label_key) = if reason.as_ref().is_some_and(FetchError::is_config) {
         (CONFIG_KEY, CONFIG_LABEL)
+    } else if (service.kind == "http" && snapshot.error.is_some())
+        || reason.as_ref().is_some_and(FetchError::is_unreachable)
+    {
+        (DOWN_KEY, down_label(&service.kind))
     } else {
-        (DOWN_KEY, down_label(&service.kind)?)
+        return None;
     };
     Some(Need {
         key: key.to_string(),

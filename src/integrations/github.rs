@@ -150,6 +150,11 @@ impl Integration for GithubKind {
         "kind.github"
     }
 
+    /// The address a card opens: GitHub's site, not the API's.
+    fn default_link(&self) -> Option<&'static str> {
+        Some("https://github.com/")
+    }
+
     fn fields(&self) -> &'static [Field] {
         &FIELDS
     }

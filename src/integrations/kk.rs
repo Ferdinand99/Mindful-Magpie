@@ -244,11 +244,11 @@ mod tests {
             "unresolved_issues": "many",
             "crash_free_sessions": 250.0,
             "visitors_today": null,
-            "app_users_today": 1.5e300,
+            "app_users_today": 1.5e300, // past the bound of a count
         } });
         let snapshot = read_summary(&doc).unwrap();
         let ids: Vec<_> = snapshot.values.keys().map(String::as_str).collect();
-        assert_eq!(ids, ["app_users_today", "crash_free", "new_issues"]);
+        assert_eq!(ids, ["crash_free", "new_issues"]);
         assert_eq!(snapshot.values["crash_free"].num, Some(100.0));
         assert_eq!(snapshot.status, Status::Warn);
     }

@@ -283,6 +283,36 @@ impl OldAddresses {
     }
 }
 
+/// What the address of a service begins with in every key a kind keeps
+/// (`origin`, then its path, then a slash): the string [`forget_all_for`] hands
+/// to the hooks, and what a kind builds its own keys from.
+pub fn service_prefix(base: &Url) -> String {
+    format!(
+        "{}{}/",
+        base.origin().ascii_serialization(),
+        base.path().trim_end_matches('/')
+    )
+}
+
+/// What a kind that keeps something per address besides a remembered 404
+/// registers, to be told when the service at an address is saved or tested.
+/// It gets [`service_prefix`] of the address.
+pub type Forget = fn(&str);
+
+fn hooks() -> std::sync::MutexGuard<'static, Vec<Forget>> {
+    static ALL: Mutex<Vec<Forget>> = Mutex::new(Vec::new());
+    ALL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Registers `hook` (once, however often this is called) to be called by
+/// [`forget_all_for`] with the prefix of the address.
+pub fn on_forget(hook: Forget) {
+    let mut all = hooks();
+    if !all.iter().any(|known| std::ptr::fn_addr_eq(*known, hook)) {
+        all.push(hook);
+    }
+}
+
 /// Makes every kind ask the service at `base` again, whatever it answered
 /// before: forgets each remembered 404 of an address on `base` (its origin and
 /// path, without the query and fragment). Call it when the service is saved or
@@ -296,11 +326,11 @@ pub fn forget_all_for(base: &str) {
     }
     // The keys are endpoint addresses (see [`endpoint`]): the service's own
     // address and then the path of the call.
-    let prefix = format!(
-        "{}{}/",
-        url.origin().ascii_serialization(),
-        url.path().trim_end_matches('/')
-    );
+    let prefix = service_prefix(&url);
+    let hooks: Vec<Forget> = hooks().clone();
+    for hook in hooks {
+        hook(&prefix);
+    }
     let all: Vec<Arc<Seen>> = {
         let mut all = registry();
         all.retain(|weak| weak.strong_count() > 0);
@@ -358,12 +388,17 @@ pub fn clean_text(text: &str, max: usize) -> String {
     line.trim().to_string()
 }
 
-/// A count: a JSON number that is finite and not below 0, rounded down. Odd
-/// values (null, text, negative, huge) are `None`, so only that metric goes.
+/// The largest count taken as one (a thousand billion): a number past it is
+/// not a count of anything real and would only break the page's layout.
+pub const MAX_COUNT: f64 = 1e15;
+
+/// A count: a JSON number that is finite, not below 0 and at most
+/// [`MAX_COUNT`], rounded down. Odd values (null, text, negative, past the
+/// bound) are `None`, so only that metric goes.
 pub fn count(value: Option<&Json>) -> Option<f64> {
     value
         .and_then(Json::as_f64)
-        .filter(|n| n.is_finite() && *n >= 0.0)
+        .filter(|n| n.is_finite() && (0.0..=MAX_COUNT).contains(n))
         .map(f64::floor)
 }
 
@@ -563,11 +598,36 @@ mod tests {
     }
 
     #[test]
+    fn a_hook_is_told_the_prefix_of_the_address_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn hook(prefix: &str) {
+            if prefix == "https://hook-test.example:8443/vole/" {
+                CALLS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        on_forget(hook);
+        on_forget(hook);
+        forget_all_for("https://hook-test.example:8443/vole?x=1#f");
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+        // Another address does not match; one that is not an address is ignored.
+        forget_all_for("https://other.example/");
+        forget_all_for("not an address");
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+        let url = Url::parse("http://h/vole").unwrap();
+        assert_eq!(service_prefix(&url), "http://h/vole/");
+    }
+
+    #[test]
     fn odd_numbers_only_drop_their_own_metric() {
         let n = |v: Json| count(Some(&v));
         assert_eq!(n(json!(3)), Some(3.0));
         assert_eq!(n(json!(3.7)), Some(3.0));
         assert_eq!(n(json!(0)), Some(0.0));
+        // Up to a thousand billion; past it is no count of anything.
+        assert_eq!(n(json!(1e15)), Some(1e15));
+        assert_eq!(n(json!(1.000_000_1e15)), None);
+        assert_eq!(n(json!(1.5e300)), None);
         for odd in [json!(-1), json!(null), json!("3"), json!([]), json!({})] {
             assert_eq!(n(odd), None);
         }

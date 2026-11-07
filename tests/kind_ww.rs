@@ -741,7 +741,7 @@ async fn one_call_failing_gives_a_bad_reading_with_fewer_numbers() {
         quiet(&stub);
         stub.reply(failing, 500, "boom");
         let s = fetch(&base).await;
-        assert_eq!(s.status, Status::Bad, "{failing}");
+        assert_eq!(s.status, Status::Warn, "{failing}");
         assert_eq!(s.error.as_deref(), Some("HTTP 500"), "{failing}");
         let mut have: Vec<_> = s.values.keys().map(String::as_str).collect();
         let mut want: Vec<_> = kept.to_vec();
@@ -758,7 +758,7 @@ async fn a_failing_call_still_lets_the_others_raise_needs() {
     stub.ok(UPDATES, &updates(0));
     stub.reply(RUNS, 500, "");
     let s = fetch(&base).await;
-    assert_eq!(s.status, Status::Bad);
+    assert_eq!(s.status, Status::Warn);
     assert_eq!(s.needs.len(), 1);
     assert_eq!(s.needs[0].key, "ww:offline");
 }
@@ -805,7 +805,7 @@ async fn a_refusal_in_one_call_beats_another_failure() {
     stub.reply(SERVERS, 500, "");
     stub.reply(UPDATES, 401, "");
     let s = fetch(&base).await;
-    assert_eq!(s.status, Status::Bad);
+    assert_eq!(s.status, Status::Warn);
     assert_eq!(s.error.as_deref(), Some("key refused"));
     assert!(s.values.contains_key("failed_targets"));
 }
@@ -828,7 +828,7 @@ async fn malformed_json_is_a_bad_reading_not_a_panic() {
             quiet(&stub);
             stub.reply(failing, 200, body);
             let s = fetch(&base).await;
-            assert_eq!(s.status, Status::Bad, "{failing}: {body:?}");
+            assert_eq!(s.status, Status::Warn, "{failing}: {body:?}");
             assert_eq!(
                 s.error.as_deref(),
                 Some("unexpected answer"),
@@ -854,7 +854,7 @@ async fn an_oversized_answer_is_refused() {
     quiet(&stub);
     stub.reply(RUNS, 200, " ".repeat(integrations::MAX_BODY + 10));
     let s = fetch(&base).await;
-    assert_eq!(s.status, Status::Bad);
+    assert_eq!(s.status, Status::Warn);
     assert_eq!(s.error.as_deref(), Some("response too large"));
 }
 

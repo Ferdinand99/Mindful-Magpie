@@ -74,6 +74,12 @@ pub trait Integration: Send + Sync + 'static {
     fn default_interval(&self) -> Duration;
     /// The shortest interval an admin may choose.
     fn min_interval(&self) -> Duration;
+    /// Where a card of a service of this kind opens when the service has no
+    /// link of its own set: for a kind whose address is an API's, the app's
+    /// own site (GitHub). `None`: the origin of the service's address.
+    fn default_link(&self) -> Option<&'static str> {
+        None
+    }
     /// Whether a service of this kind needs an address (`services.url`).
     fn url_required(&self) -> bool {
         true
@@ -376,6 +382,76 @@ pub enum FetchError {
 }
 
 impl FetchError {
+    /// Every error except [`FetchError::Status`] (which has a number): what a
+    /// stored error text can be besides `HTTP n`. The test of the texts walks
+    /// it, so a new error needs a text in both languages.
+    pub const ALL: [FetchError; 16] = [
+        FetchError::Config,
+        FetchError::Forbidden,
+        FetchError::Timeout,
+        FetchError::Connect,
+        FetchError::Cert,
+        FetchError::Redirects,
+        FetchError::RedirectScheme,
+        FetchError::TooLarge,
+        FetchError::Invalid,
+        FetchError::SecretUnreadable,
+        FetchError::Auth,
+        FetchError::KkTooOld,
+        FetchError::NotAdmin,
+        FetchError::NothingVisible,
+        FetchError::RateLimited,
+        FetchError::Other,
+    ];
+
+    /// The error a stored text stands for: one of [`FetchError::ALL`], or
+    /// `HTTP n`.
+    pub fn from_text(text: &str) -> Option<FetchError> {
+        if let Some(code) = text.strip_prefix("HTTP ") {
+            return code.parse().ok().map(FetchError::Status);
+        }
+        FetchError::ALL.into_iter().find(|e| e.to_string() == text)
+    }
+
+    /// Whether only an admin can put it right, not the service coming back:
+    /// settings or an address that can't be used, a redirect that is not
+    /// allowed, a secret that can't be opened, a key that was refused or has
+    /// the wrong role or sees nothing, a certificate that was not accepted, a
+    /// Keen Kestrel that has to be upgraded. The poller makes the «set it up
+    /// again» need of these, never «not answering».
+    pub fn is_config(&self) -> bool {
+        matches!(
+            self,
+            FetchError::Config
+                | FetchError::Forbidden
+                | FetchError::RedirectScheme
+                | FetchError::SecretUnreadable
+                | FetchError::Auth
+                | FetchError::KkTooOld
+                | FetchError::NotAdmin
+                | FetchError::NothingVisible
+                | FetchError::Cert
+        )
+    }
+
+    /// Whether it says the service did not answer properly (it may come back
+    /// by itself): no connection, a timeout, a server error, an answer that
+    /// is not what was expected. The poller makes the «not answering» need of
+    /// these once they repeat. A 4xx status, a rate limit and every
+    /// [`FetchError::is_config`] error are not.
+    pub fn is_unreachable(&self) -> bool {
+        match self {
+            FetchError::Connect
+            | FetchError::Timeout
+            | FetchError::Invalid
+            | FetchError::Other
+            | FetchError::Redirects
+            | FetchError::TooLarge => true,
+            FetchError::Status(code) => (500..600).contains(code),
+            _ => false,
+        }
+    }
+
     /// The translation key of the text, when it has one (`HTTP n` is the
     /// same in every language).
     pub fn text_key(&self) -> Option<&'static str> {
@@ -450,27 +526,7 @@ pub fn localize_texts(kind: &str, values: &mut BTreeMap<String, Value>) {
 /// The translation key for a stored error text (a [`Snapshot::error`]), when
 /// it is one of [`FetchError`]'s fixed texts.
 pub fn error_text_key(text: &str) -> Option<&'static str> {
-    [
-        FetchError::Config,
-        FetchError::Forbidden,
-        FetchError::Timeout,
-        FetchError::Connect,
-        FetchError::Cert,
-        FetchError::Redirects,
-        FetchError::RedirectScheme,
-        FetchError::TooLarge,
-        FetchError::Invalid,
-        FetchError::SecretUnreadable,
-        FetchError::Auth,
-        FetchError::KkTooOld,
-        FetchError::NotAdmin,
-        FetchError::NothingVisible,
-        FetchError::RateLimited,
-        FetchError::Other,
-    ]
-    .into_iter()
-    .find(|e| e.to_string() == text)
-    .and_then(|e| e.text_key())
+    FetchError::from_text(text).and_then(|e| e.text_key())
 }
 
 /// The redirect rules that are not about the address.
@@ -644,4 +700,84 @@ pub async fn read_capped(mut response: reqwest::Response) -> Result<Vec<u8>, Fet
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A number for each error. The match has no catch-all: a new error does
+    /// not compile until it is placed here, and the test below then insists
+    /// that it is in [`FetchError::ALL`] (or is `Status`).
+    fn slot(e: &FetchError) -> usize {
+        match e {
+            FetchError::Config => 0,
+            FetchError::Forbidden => 1,
+            FetchError::Timeout => 2,
+            FetchError::Connect => 3,
+            FetchError::Cert => 4,
+            FetchError::Redirects => 5,
+            FetchError::RedirectScheme => 6,
+            FetchError::TooLarge => 7,
+            FetchError::Invalid => 8,
+            FetchError::SecretUnreadable => 9,
+            FetchError::Auth => 10,
+            FetchError::KkTooOld => 11,
+            FetchError::NotAdmin => 12,
+            FetchError::NothingVisible => 13,
+            FetchError::RateLimited => 14,
+            FetchError::Other => 15,
+            FetchError::Status(_) => 16,
+        }
+    }
+
+    #[test]
+    fn all_lists_every_error_but_status_once() {
+        let mut slots: Vec<usize> = FetchError::ALL.iter().map(slot).collect();
+        slots.push(slot(&FetchError::Status(500)));
+        slots.sort_unstable();
+        assert_eq!(slots, (0..=16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_stored_text_gives_its_error_back() {
+        for e in FetchError::ALL {
+            assert_eq!(FetchError::from_text(&e.to_string()), Some(e), "{e}");
+            assert!(e.text_key().is_some(), "{e}");
+        }
+        assert_eq!(
+            FetchError::from_text("HTTP 503"),
+            Some(FetchError::Status(503))
+        );
+        for odd in ["", "HTTP", "HTTP x", "something else", "Config"] {
+            assert_eq!(FetchError::from_text(odd), None, "{odd:?}");
+        }
+        assert_eq!(FetchError::Status(503).text_key(), None);
+    }
+
+    #[test]
+    fn config_and_unreachable_never_overlap() {
+        let all = FetchError::ALL.into_iter().chain([
+            FetchError::Status(404),
+            FetchError::Status(500),
+            FetchError::Status(503),
+        ]);
+        for e in all {
+            assert!(!(e.is_config() && e.is_unreachable()), "{e}");
+        }
+        for e in [FetchError::Connect, FetchError::Timeout, FetchError::Other] {
+            assert!(e.is_unreachable() && !e.is_config(), "{e}");
+        }
+        assert!(FetchError::Status(502).is_unreachable());
+        assert!(!FetchError::Status(404).is_unreachable());
+        assert!(!FetchError::RateLimited.is_unreachable());
+        assert!(!FetchError::RateLimited.is_config());
+        for e in [
+            FetchError::Cert,
+            FetchError::Forbidden,
+            FetchError::RedirectScheme,
+        ] {
+            assert!(e.is_config() && !e.is_unreachable(), "{e}");
+        }
+    }
 }

@@ -168,3 +168,66 @@ fn eight_kinds_and_only_github_is_personal() {
         assert_eq!(kind(name).personal(), name == "github", "{name}");
     }
 }
+
+#[test]
+fn every_error_has_a_text_in_both_languages() {
+    use mindful_magpie::integrations::FetchError;
+    for (lang, file) in locales() {
+        let texts = section(file, "fetch_err");
+        for error in FetchError::ALL {
+            let key = error
+                .text_key()
+                .and_then(|k| k.strip_prefix("fetch_err."))
+                .unwrap_or_else(|| panic!("{error} has no text key"));
+            assert!(
+                texts.get(key).is_some_and(|t| !t.is_empty()),
+                "{lang}: no fetch_err.{key} for {error}"
+            );
+        }
+        // The text of a refused rate limit does not name one service.
+        assert!(!texts["rate_limited"].contains("GitHub"), "{lang}");
+    }
+}
+
+#[test]
+fn a_github_card_without_a_link_opens_github() {
+    use mindful_magpie::services::card_link_for;
+    use serde_json::json;
+    // The kind's own default, not the API's address.
+    assert_eq!(
+        card_link_for(Some("github"), &json!({}), None),
+        "https://github.com/"
+    );
+    assert_eq!(
+        card_link_for(Some("github"), &json!({}), Some("https://api.github.com/")),
+        "https://github.com/"
+    );
+    // The service's own link wins; an empty one is none.
+    assert_eq!(
+        card_link_for(
+            Some("github"),
+            &json!({ "link": "https://github.com/acme" }),
+            None
+        ),
+        "https://github.com/acme"
+    );
+    assert_eq!(
+        card_link_for(Some("github"), &json!({ "link": "" }), None),
+        "https://github.com/"
+    );
+    // Other kinds: the origin of the address.
+    assert_eq!(
+        card_link_for(
+            Some("vv"),
+            &json!({}),
+            Some("https://vole.example:8443/x?y=1")
+        ),
+        "https://vole.example:8443"
+    );
+    assert_eq!(card_link_for(Some("vv"), &json!({}), None), "");
+    assert_eq!(card_link_for(Some("nope"), &json!({}), None), "");
+    assert_eq!(kind("github").default_link(), Some("https://github.com/"));
+    for name in ["http", "vv", "kk", "ww", "proxmox", "unraid", "tofa"] {
+        assert_eq!(kind(name).default_link(), None, "{name}");
+    }
+}

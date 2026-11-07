@@ -760,6 +760,18 @@ async fn a_user_adds_edits_tests_and_deletes_their_own_service() {
     assert!(res.body.contains("name=\"f_owners\""));
     assert!(!res.body.contains("name=\"url\""), "no address to enter");
     assert!(!res.body.contains("name=\"visibility\""));
+    // No certificate pin either (the address is fixed), and the link says what
+    // an empty one means for this kind.
+    assert!(
+        !res.body.contains("cert_sha256"),
+        "no pin for a personal service"
+    );
+    assert!(res.body.contains("name=\"link\""));
+    assert!(
+        res.body.contains("github.com"),
+        "the link help names the default"
+    );
+    assert!(!res.body.contains("up to the port"), "not the admin's help");
     for permission in [
         "Metadata",
         "Pull requests",

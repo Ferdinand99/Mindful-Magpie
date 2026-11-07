@@ -327,16 +327,20 @@ fn reading(
             .needs
             .push(need("ww:offline", Level::Warn, "need.ww_offline", offline));
     }
+    // A call that failed leaves the reading partial, which is a warning (as for
+    // Unraid and Tofa); only a failed update is bad. Updates ready are shown,
+    // not a warning: whether they matter is up to the user (Wise Wren's list
+    // does not say which ones were skipped).
     if let Some(err) = error {
-        snapshot.status = Status::Bad;
         snapshot.error = Some(err.to_string());
-    } else if failed > 0 {
-        snapshot.status = Status::Bad;
-    } else if offline > 0 {
-        // Updates ready are shown, not a warning: whether they matter is up
-        // to the user (Wise Wren's list does not say which ones were skipped).
-        snapshot.status = Status::Warn;
     }
+    snapshot.status = if failed > 0 {
+        Status::Bad
+    } else if offline > 0 || snapshot.error.is_some() {
+        Status::Warn
+    } else {
+        Status::Ok
+    };
     Ok(snapshot)
 }
 

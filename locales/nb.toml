@@ -244,6 +244,7 @@ none_text = "Legg inn din egen GitHub-nøkkel så startsiden kan vise tallene di
 created = "Integrasjonen er lagt til."
 saved = "Integrasjonen er lagret."
 deleted = "Integrasjonen er slettet."
+link_help = "Dit et kort for denne integrasjonen fører når du ikke gir kortet en egen lenke. Valgfritt: tomt betyr tjenestens eget nettsted, for GitHub github.com."
 
 [err]
 name = "Gi tjenesten et navn på høyst 80 tegn."
@@ -288,7 +289,7 @@ kk_secret_help = "Lag et token i Keen Kestrel under Innstillinger → API-tokene
 ww_secret = "Lesetoken"
 ww_secret_help = "Lag et token i Wise Wren under Innstillinger → API-tokener med tilgangen «Bare lesing», og lim det inn her. Sendes som Authorization: Bearer. Lagres kryptert."
 pve_token_id = "API-token-id"
-pve_token_id_help = "Lag et API-token i Proxmox under Datacenter → Permissions → API Tokens og skriv inn id-en som bruker@realm!tokenid. Gi tokenet rollen PVEAuditor på /. Fjern haken for «Privilege Separation», eller gi selve tokenet PVEAuditor."
+pve_token_id_help = "Lag en egen bruker i Proxmox (for eksempel magpie@pve) under Datacenter → Permissions → Users og gi den rollen PVEAuditor på / (Permissions). Lag så et API-token for den brukeren under Datacenter → Permissions → API Tokens og skriv inn id-en som bruker@realm!tokenid. Enten fjerner du haken for «Privilege Separation» (tokenet har da brukerens rettigheter), eller du gir selve tokenet PVEAuditor på /. Bruk aldri et root-token."
 pve_secret = "API-token-hemmelighet"
 pve_secret_help = "Hemmeligheten Proxmox viser én gang når tokenet lages. Sendes som Authorization: PVEAPIToken. Lagres kryptert."
 unraid_secret = "API-nøkkel"
@@ -362,7 +363,7 @@ auth = "Nøkkelen ble avvist"
 kk_too_old = "Krever Keen Kestrel 0.10 eller nyere"
 not_admin = "Nøkkelen er ikke en admin-nøkkel"
 nothing_visible = "Nøkkelen ser ingenting – sjekk rollen"
-rate_limited = "GitHubs forespørselsgrense er nådd, prøver igjen senere"
+rate_limited = "Tjenestens forespørselsgrense er nådd, prøver igjen senere"
 
 [need]
 other = "trenger oppmerksomhet"
@@ -378,7 +379,7 @@ pve_storage = "Mest full lagring (%): {count}"
 unraid_array = "Arrayet er ikke i drift"
 unraid_parity_errors = "Paritetsfeil: {count}"
 unraid_disk = "Diskbruk (%): {count}"
-tofa_down = "Svarer ikke"
+service_down = "Svarer ikke"
 tofa_library = "Bibliotek med feil: {count}"
 tofa_library_warn = "Bibliotek med avvik: {count}"
 

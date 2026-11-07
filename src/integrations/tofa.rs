@@ -14,7 +14,8 @@
 //! The kind does not look at the server's capability list: the names the spec
 //! leaves unnamed are not the names a real server (0.13.1) advertises. It
 //! calls the endpoints, and a 404 or 501 means «this server does not have it»:
-//! the address is then left alone for an hour ([`OldAddresses`]) and only that
+//! the address is then left alone for a few minutes ([`api::OLD_FOR`], by
+//! [`OldAddresses`]) and only that
 //! call's numbers are missing.
 //!
 //! **Streams** are the sessions that are not paused; **transcodes** are the
@@ -56,8 +57,6 @@ pub static TOFA: TofaKind = TofaKind;
 /// See the module.
 pub struct TofaKind;
 
-/// The key of the need «the server does not answer».
-pub const DOWN_NEED: &str = "tofa:down";
 /// The key of the need «libraries with errors».
 pub const LIBRARY_NEED: &str = "tofa:library";
 /// The key of the need «libraries with issues».
@@ -152,7 +151,7 @@ impl Integration for TofaKind {
 async fn read(ctx: &FetchCtx) -> Result<Snapshot, FetchError> {
     let base = api::base_url(&ctx.settings)?;
     let key = Credential::bearer(ctx.secret.as_deref())?;
-    let address = base.to_string();
+    let address = api::service_prefix(&base);
     let before = remember(&address, |m| {
         let before = m.clone();
         m.fetches = m.fetches.wrapping_add(1);
@@ -160,14 +159,13 @@ async fn read(ctx: &FetchCtx) -> Result<Snapshot, FetchError> {
     });
     let slow_due = before.fetches % SLOW_EVERY == 0;
 
-    // Is the server there? Any failure says no. The health call is public, so
-    // it is sent without the key.
+    // Is the server there? Any failure says no: an error, and the poller makes
+    // «not answering» of it when it repeats (once is not worth a need). The
+    // health call is public, so it is sent without the key.
     let url = api::endpoint(&base, HEALTH, None)?;
-    let health = match api::get_json_public::<Json>(&ctx.http, url).await {
-        Ok(Reply::Found(doc)) => doc,
-        Ok(Reply::NotFound) => return Ok(down(FetchError::Status(404))),
-        Err(err) => return Ok(down(err)),
-    };
+    let health = api::get_json_public::<Json>(&ctx.http, url)
+        .await?
+        .found()?;
     let version = text_of(&health, "version");
 
     let mut error = None;
@@ -210,7 +208,8 @@ async fn read(ctx: &FetchCtx) -> Result<Snapshot, FetchError> {
 // ---------------------------------------------------------------------------
 // Memory
 
-/// What is remembered of an address between fetches.
+/// What is remembered of an address between fetches (the key is
+/// [`api::service_prefix`]).
 #[derive(Debug, Clone, Default)]
 struct Memory {
     /// How many fetches began (it decides which one refreshes the slow calls).
@@ -238,9 +237,21 @@ struct Libraries {
 /// counts as the most recently used. The list holds at most [`MEMORY_MAX`]
 /// addresses.
 fn remember<R>(key: &str, f: impl FnOnce(&mut Memory) -> R) -> R {
+    // Saving or testing the service forgets what is remembered of it.
+    api::on_forget(forget);
     // A panic elsewhere cannot leave the list in a state that matters.
     let mut list = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     remember_in(&mut list, key, f)
+}
+
+/// Forgets the memory of the service at `prefix` (see [`api::service_prefix`]):
+/// the next fetch counts as the first, refreshes the slow calls and drops what
+/// was carried from the last ones.
+fn forget(prefix: &str) {
+    MEMORY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(key, _)| key != prefix);
 }
 
 fn remember_in<R>(
@@ -266,7 +277,7 @@ fn remember_in<R>(
 // Calls
 
 /// One GET of a data endpoint (they are for admins). `None`: the address
-/// answered 404 or 501 less than an hour ago, or does now (this server does not
+/// answered 404 or 501 less than [`api::OLD_FOR`] ago, or does now (this server does not
 /// have the endpoint).
 async fn call(
     ctx: &FetchCtx,
@@ -393,20 +404,6 @@ fn counted_need(key: &str, level: Level, label_key: &str, count: f64) -> Need {
         score: count,
         since: None,
     }
-}
-
-/// The reading of a server that does not answer.
-fn down(err: FetchError) -> Snapshot {
-    let mut snapshot = Snapshot::failed(&err);
-    snapshot.needs.push(Need {
-        key: DOWN_NEED.to_string(),
-        level: Level::Bad,
-        label_key: "need.tofa_down".to_string(),
-        params: Default::default(),
-        score: 1.0,
-        since: None,
-    });
-    snapshot
 }
 
 /// The reading of a server that answers: bad when a library has errors, warn

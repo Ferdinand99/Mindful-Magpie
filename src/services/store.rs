@@ -16,7 +16,7 @@ use vole_kit::state::Core;
 
 use super::{
     FieldError, MAX_PERSONAL, SECRET_PURPOSE, Scope, SecretChange, Service, ServiceInput,
-    ServiceSummary, Viewer, Visibility, card_link, same_origin,
+    ServiceSummary, Viewer, Visibility, card_link_for, same_origin,
 };
 use crate::integrations::{FetchCtx, FetchError, SERVICE_ID_KEY};
 
@@ -180,15 +180,16 @@ pub async fn visible_to(
              ORDER BY name COLLATE NOCASE, id",
         )?;
         stmt.query_map(params![viewer.admin, viewer.id], |r| {
+            let kind: String = r.get(1)?;
             let url: Option<String> = r.get(4)?;
             let settings: String = r.get(5)?;
             let settings = serde_json::from_str::<Json>(&settings).unwrap_or(Json::Null);
             Ok(ServiceSummary {
                 id: r.get(0)?,
-                kind: r.get(1)?,
+                kind: kind.clone(),
                 name: r.get(2)?,
                 interval_s: r.get(3)?,
-                link: card_link(&settings, url.as_deref()),
+                link: card_link_for(Some(&kind), &settings, url.as_deref()),
                 personal: r.get(6)?,
             })
         })?

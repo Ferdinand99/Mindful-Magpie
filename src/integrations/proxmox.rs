@@ -15,8 +15,9 @@
 //! metric it feeds. Names (nodes) come from outside and are never put into a
 //! need or a value; [`node_rows`] hands them to a page that shows them as text.
 //!
-//! A self-signed certificate is refused by the shared client; pinning one is
-//! not part of this kind yet.
+//! A server with a self-signed certificate is reached by pinning its
+//! fingerprint in the service's settings, like for every kind (see
+//! [`super::pin`]); the shared client refuses it otherwise.
 
 use std::collections::BTreeMap;
 use std::time::Duration;

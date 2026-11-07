@@ -16,7 +16,7 @@
 //! **An older schema.** A server that does not know `metrics` or `info`
 //! rejects the whole query (HTTP 400, or `GRAPHQL_VALIDATION_FAILED` with no
 //! data). The kind then asks again with the core query (array and
-//! containers only) and remembers the address for an hour, so these extras can
+//! containers only) and remembers the address for [`api::OLD_FOR`] (a few minutes), so these extras can
 //! never break the card; the server row then has no name, CPU or memory.
 //!
 //! **The disk figure.** `disk_used` is the use of the *fullest* disk (data

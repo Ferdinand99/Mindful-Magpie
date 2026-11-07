@@ -89,6 +89,8 @@ enum Mode {
     Bad,
     /// `Ok` with a bad reading that says `HTTP 500`.
     Http500,
+    /// `Ok` with a bad reading that says `HTTP 404`.
+    Http404,
     /// `Ok` with a bad reading: the address is not allowed.
     BadForbidden,
     /// `Ok` with a bad reading: a redirect to another scheme.
@@ -243,6 +245,7 @@ impl Integration for Stub {
                 Mode::BadForbidden => Ok(Snapshot::failed(&FetchError::Forbidden)),
                 Mode::BadRedirectScheme => Ok(Snapshot::failed(&FetchError::RedirectScheme)),
                 Mode::Http500 => Ok(Snapshot::failed(&FetchError::Status(500))),
+                Mode::Http404 => Ok(Snapshot::failed(&FetchError::Status(404))),
                 Mode::Ok => Ok(ok_snapshot(n, marker)),
             }
         })
@@ -1047,15 +1050,70 @@ async fn a_supervisor_that_panics_is_logged_at_error() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn a_kind_without_the_rule_gets_no_down_need() {
+async fn a_kind_other_than_http_gets_the_generic_down_need() {
     let app = App::new().await;
     tokio::time::pause();
-    set_mode("t_no_rule", Mode::Bad);
-    let id = add_stub(&app, "NoRule", "t_no_rule", "", 10).await;
+    // A fetch that fails the way a service that does not answer does: twice in
+    // a row is the need, for every kind, with the generic text.
+    for (tag, mode) in [
+        ("t_gd_bad", Mode::Bad),
+        ("t_gd_conn", Mode::ErrConnect),
+        ("t_gd_500", Mode::Http500),
+    ] {
+        set_mode(tag, mode);
+        let id = add_stub(&app, tag, tag, "", 10).await;
+        let poller = start_with(&app, stub_kinds, 0).await;
+        wait_calls(tag, 1).await;
+        let first = wait_snapshot(&poller, id, |_| true).await;
+        assert!(first.needs.is_empty(), "{tag}: one failure is not a need");
+        wait_calls(tag, 2).await;
+        let second = wait_snapshot(&poller, id, |s| !s.needs.is_empty()).await;
+        assert_eq!(second.needs.len(), 1, "{tag}");
+        let need = &second.needs[0];
+        assert_eq!(need.key, DOWN_KEY, "{tag}");
+        assert_eq!(need.label_key, "need.service_down", "{tag}");
+        assert_eq!(need.level, Level::Bad, "{tag}");
+        assert!(need.params.is_empty(), "{tag}");
+        drop(poller);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_failure_only_an_admin_can_fix_never_gives_the_down_need() {
+    let app = App::new().await;
+    tokio::time::pause();
+    for (tag, mode) in [
+        ("t_nd_cfg", Mode::Err),
+        ("t_nd_secret", Mode::ErrSecret),
+        ("t_nd_auth", Mode::ErrAuth),
+        ("t_nd_old", Mode::ErrKkTooOld),
+        ("t_nd_forbidden", Mode::BadForbidden),
+        ("t_nd_scheme", Mode::BadRedirectScheme),
+    ] {
+        set_mode(tag, mode);
+        let id = add_stub(&app, tag, tag, "", 10).await;
+        let poller = start_with(&app, stub_kinds, 0).await;
+        wait_calls(tag, 3).await;
+        let s = wait_snapshot(&poller, id, |s| !s.needs.is_empty()).await;
+        let keys: Vec<_> = s.needs.iter().map(|n| n.key.as_str()).collect();
+        assert_eq!(keys, [CONFIG_KEY], "{tag}");
+        assert_eq!(s.needs[0].label_key, "need.service_config", "{tag}");
+        drop(poller);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_client_error_or_a_good_reading_gives_no_down_need() {
+    let app = App::new().await;
+    tokio::time::pause();
+    // A 4xx answer is neither «not answering» nor something the poller can
+    // name: no need.
+    set_mode("t_nd_404", Mode::Http404);
+    let id = add_stub(&app, "NoNeed", "t_nd_404", "", 10).await;
     let poller = start_with(&app, stub_kinds, 0).await;
-    wait_calls("t_no_rule", 3).await;
+    wait_calls("t_nd_404", 3).await;
     let s = wait_snapshot(&poller, id, |_| true).await;
-    assert!(s.needs.is_empty());
+    assert!(s.needs.is_empty(), "{:?}", s.needs);
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -28,7 +28,11 @@
     {%- if !form.personal %}
     {{ m::field_text("url", tr("service.url"), value=&form.url, kind="url", placeholder="https://example.com/…", required=form.url_required, help=tr("service.url_help"), error=&form.url_error) }}
     {%- endif %}
+    {%- if form.personal %}
+    {{ m::field_text("link", tr("service.link"), value=&form.link, kind="url", placeholder="https://example.com/…", help=tr("integration.link_help"), error=&form.link_error) }}
+    {%- else %}
     {{ m::field_text("link", tr("service.link"), value=&form.link, kind="url", placeholder="https://example.com/…", help=tr("service.link_help"), error=&form.link_error) }}
+    {%- endif %}
     {%- for f in form.settings %}
     {%- if f.help.is_empty() %}
     {{ m::field_text(&f.name, tr(f.label_key), value=&f.value, kind="text", placeholder=f.placeholder, required=f.required, error=&f.error) }}
@@ -36,8 +40,10 @@
     {{ m::field_text(&f.name, tr(f.label_key), value=&f.value, kind="text", placeholder=f.placeholder, required=f.required, help=tr(f.help), error=&f.error) }}
     {%- endif %}
     {%- endfor %}
-    {#- Every service may pin the certificate of a server that signs its own. Only for https; shown to admins only, like the whole form. -#}
+    {#- A service of the admins may pin the certificate of a server that signs its own (only for https). A personal one has a fixed address and no pin. -#}
+    {%- if !form.personal %}
     {{ m::field_text("cert_sha256", tr("service.pin"), value=&form.cert_value, placeholder="AA:BB:CC:…", help=tr("service.pin_help"), error=&form.cert_error) }}
+    {%- endif %}
     {%- if let Some(s) = form.secret %}
     {#- Never filled in: the secret does not come back from the server. -#}
     {%- if form.has_secret && form.secret_unreadable %}

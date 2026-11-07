@@ -213,10 +213,22 @@ pub const LINK_KEY: &str = "link";
 /// service's `link` setting if it has one, else the origin of its address
 /// (scheme, host and port: no user name, path or query), else empty.
 pub fn card_link(settings: &Json, url: Option<&str>) -> String {
+    card_link_for(None, settings, url)
+}
+
+/// [`card_link`] for the kind `kind`: the service's own link, else the kind's
+/// [`Integration::default_link`], else the origin of the address.
+pub fn card_link_for(kind: Option<&str>, settings: &Json, url: Option<&str>) -> String {
     if let Some(link) = settings
         .get(LINK_KEY)
         .and_then(Json::as_str)
         .filter(|l| !l.is_empty())
+    {
+        return link.to_string();
+    }
+    if let Some(link) = kind
+        .and_then(integrations::find)
+        .and_then(|k| k.default_link())
     {
         return link.to_string();
     }
