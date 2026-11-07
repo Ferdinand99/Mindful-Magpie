@@ -192,6 +192,21 @@ pub fn check_url(url: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Whether two addresses have the same origin (scheme, host and port, the
+/// default port counted as given). Both missing counts as the same; an address
+/// that does not parse never matches. A stored secret may only be used for an
+/// address of the origin it was saved for.
+pub fn same_origin(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => match (Url::parse(a.trim()), Url::parse(b.trim())) {
+            (Ok(a), Ok(b)) => a.origin().is_tuple() && a.origin() == b.origin(),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// `url` without a user name and password, for showing a refused form again.
 pub fn without_userinfo(url: &str) -> String {
     match Url::parse(url) {
@@ -269,7 +284,12 @@ impl ServiceInput {
         }
         if let SecretChange::Replace(secret) = &self.secret {
             let has_field = kind.fields().iter().any(|f| f.secret);
-            if !has_field || secret.chars().count() > 2048 || secret.chars().any(char::is_control) {
+            // Visible ASCII only (no spaces, line breaks or other control characters):
+            // the secret goes into a header.
+            if !has_field
+                || secret.chars().count() > 2048
+                || !secret.chars().all(|c| ('!'..='~').contains(&c))
+            {
                 errors.push(FieldError::new("secret", "err.secret"));
             }
         }

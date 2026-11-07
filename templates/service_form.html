@@ -33,14 +33,24 @@
     {%- endfor %}
     {%- if let Some(s) = form.secret %}
     {#- Never filled in: the secret does not come back from the server. -#}
-    {%- if form.has_secret %}
+    {%- if form.has_secret && form.secret_unreadable %}
+    {{ m::field_text("secret", tr(s.label_key), kind="password", autocomplete="new-password", help=tr(s.help), error=tr("service.secret_unreadable")) }}
+    {{ m::checkbox("clear_secret", tr("service.clear_secret"), false) }}
+    {%- else if form.has_secret %}
     {{ m::field_text("secret", tr(s.label_key), kind="password", placeholder=tr("service.secret_saved"), autocomplete="new-password", help=tr(s.help), error=&form.secret_error) }}
     {{ m::checkbox("clear_secret", tr("service.clear_secret"), false) }}
     {%- else %}
     {{ m::field_text("secret", tr(s.label_key), kind="password", autocomplete="new-password", help=tr(s.help), error=&form.secret_error) }}
     {%- endif %}
     {%- endif %}
-    {{ m::field_text("interval", tr("service.interval"), value=&form.interval, kind="number", placeholder=form.interval_default.to_string(), help=tr2("service.interval_help", "default", form.interval_default, "min", form.interval_min), error=&form.interval_error) }}
+    <div class="field{% if !form.interval_error.is_empty() %} is-invalid{% endif %}">
+      <label class="label" for="f-interval">{{ tr("service.interval") }}</label>
+      <input id="f-interval" name="interval" type="number" inputmode="numeric" min="{{ form.interval_min }}" max="86400" step="1" value="{{ form.interval }}" placeholder="{{ form.interval_default }}" autocomplete="off" aria-describedby="f-interval-help{% if !form.interval_error.is_empty() %} f-interval-error{% endif %}"{% if !form.interval_error.is_empty() %} aria-invalid="true"{% endif %}>
+      <p class="help" id="f-interval-help">{{ tr2("service.interval_help", "default", form.interval_default, "min", form.interval_min) }}</p>
+      {%- if !form.interval_error.is_empty() %}
+      <p class="field-error" id="f-interval-error">{{ form.interval_error }}</p>
+      {%- endif %}
+    </div>
   </section>
 
   <section class="card stack">

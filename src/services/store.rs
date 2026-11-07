@@ -11,9 +11,9 @@ use vole_kit::state::Core;
 
 use super::{
     FieldError, SECRET_PURPOSE, SecretChange, Service, ServiceInput, ServiceSummary, Viewer,
-    Visibility,
+    Visibility, same_origin,
 };
-use crate::integrations::FetchCtx;
+use crate::integrations::{FetchCtx, FetchError};
 
 /// Why a service was not stored.
 #[derive(Debug, thiserror::Error)]
@@ -245,22 +245,31 @@ pub async fn update(core: &Core, id: i64, input: &ServiceInput) -> Result<(), St
     let input = input.clone();
     db::interact(&core.db, move |c| {
         let tx = c.transaction()?;
-        let kind: Option<String> = tx
+        let stored: Option<(String, Option<String>, bool)> = tx
             .query_row(
-                "SELECT kind FROM services WHERE id = ?1",
+                "SELECT kind, url, secret IS NOT NULL FROM services WHERE id = ?1",
                 params![id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        match kind {
-            None => return Ok(Err(StoreError::NotFound)),
-            Some(kind) if kind != input.kind => {
-                return Ok(Err(StoreError::Invalid(vec![FieldError {
-                    field: "kind".into(),
-                    key: "err.kind",
-                }])));
-            }
-            Some(_) => {}
+        let Some((kind, old_url, had_secret)) = stored else {
+            return Ok(Err(StoreError::NotFound));
+        };
+        if kind != input.kind {
+            return Ok(Err(StoreError::Invalid(vec![FieldError::new(
+                "kind", "err.kind",
+            )])));
+        }
+        // A stored secret never follows a changed address: keeping it needs the
+        // same origin, otherwise the key has to be typed again (or removed).
+        if input.secret == SecretChange::Keep
+            && had_secret
+            && !same_origin(old_url.as_deref(), url.as_deref())
+        {
+            return Ok(Err(StoreError::Invalid(vec![FieldError::new(
+                "secret",
+                "err.secret_origin",
+            )])));
         }
         tx.execute(
             "UPDATE services SET name = ?2, url = ?3, settings = ?4, interval_s = ?5,
@@ -324,6 +333,16 @@ pub async fn open_secret(core: &Core, id: i64) -> Result<Option<String>, CtxErro
                 .map_err(CtxError::SecretUnreadable)
         })
         .transpose()
+}
+
+impl CtxError {
+    /// The fetch error to record when no context could be made.
+    pub fn fetch_error(&self) -> FetchError {
+        match self {
+            CtxError::SecretUnreadable(_) => FetchError::SecretUnreadable,
+            CtxError::Db(_) => FetchError::Other,
+        }
+    }
 }
 
 /// What a fetch of `service` needs: the shared client, its settings with the

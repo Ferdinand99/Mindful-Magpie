@@ -33,7 +33,8 @@ use vole_kit::state::Core;
 
 use super::store::{self, StoreError};
 use super::{
-    FieldError, SecretChange, Service, ServiceEvent, ServiceInput, Visibility, without_userinfo,
+    FieldError, SecretChange, Service, ServiceEvent, ServiceInput, Visibility, same_origin,
+    without_userinfo,
 };
 use crate::Magpie;
 use crate::integrations::{
@@ -278,6 +279,8 @@ struct FormView {
     settings: Vec<SettingView>,
     secret: Option<SecretView>,
     has_secret: bool,
+    /// The stored secret can't be opened any more.
+    secret_unreadable: bool,
     users: Vec<UserChoice>,
     name_error: String,
     url_error: String,
@@ -435,6 +438,7 @@ async fn form_view(
         settings,
         secret,
         has_secret,
+        secret_unreadable: false,
     })
 }
 
@@ -462,6 +466,7 @@ fn chooser() -> FormView {
         settings: Vec::new(),
         secret: None,
         has_secret: false,
+        secret_unreadable: false,
         users: Vec::new(),
         name_error: String::new(),
         url_error: String::new(),
@@ -516,6 +521,16 @@ async fn new_form(
     .await
 }
 
+/// Whether the service has a secret that can't be opened any more (the instance
+/// key changed): the form says so instead of "saved".
+async fn unreadable(core: &Core, service: &Service) -> bool {
+    service.has_secret
+        && matches!(
+            store::open_secret(core, service.id).await,
+            Err(store::CtxError::SecretUnreadable(_))
+        )
+}
+
 async fn edit_form(
     State(core): State<Core>,
     user: CurrentUser,
@@ -526,7 +541,8 @@ async fn edit_form(
     let service = store::get(&core, id).await?.ok_or(ApiError::NotFound)?;
     let kind = service.integration().ok_or(ApiError::NotFound)?;
     let has_secret = service.has_secret;
-    let form = form_view(&core, kind, Some(id), has_secret, Shown::of(&service)).await?;
+    let mut form = form_view(&core, kind, Some(id), has_secret, Shown::of(&service)).await?;
+    form.secret_unreadable = unreadable(&core, &service).await;
     render_form(
         &core,
         &user,
@@ -630,7 +646,7 @@ async fn update(
             Ok(done(jar, "service.saved"))
         }
         Err(StoreError::Invalid(errors)) => {
-            let form = form_view(
+            let mut form = form_view(
                 &core,
                 kind,
                 Some(id),
@@ -638,6 +654,7 @@ async fn update(
                 Shown::typed(parsed, &raw, errors),
             )
             .await?;
+            form.secret_unreadable = unreadable(&core, &service).await;
             render_form(
                 &core,
                 &user,
@@ -822,12 +839,19 @@ async fn test(State(core): State<Core>, user: CurrentUser, body: Bytes) -> ApiRe
         SecretChange::Keep => match raw.get("id").parse::<i64>() {
             Ok(id) => match store::get(&core, id).await? {
                 Some(service) if service.kind == input.kind && service.has_secret => {
+                    // The stored secret only goes to the address it was saved for.
+                    if !same_origin(service.url.as_deref(), input.url.as_deref()) {
+                        return Ok(
+                            HtmlTemplate(unknown(i18n::t("err.secret_origin").to_string()))
+                                .into_response(),
+                        );
+                    }
                     match store::open_secret(&core, id).await {
                         Ok(secret) => secret,
                         Err(store::CtxError::SecretUnreadable(_)) => {
-                            return Ok(HtmlTemplate(unknown(
-                                i18n::t("service.secret_unreadable").to_string(),
-                            ))
+                            return Ok(HtmlTemplate(unknown(reason_text(
+                                &FetchError::SecretUnreadable.to_string(),
+                            )))
                             .into_response());
                         }
                         Err(store::CtxError::Db(err)) => return Err(ApiError::internal(err)),
@@ -848,5 +872,8 @@ async fn test(State(core): State<Core>, user: CurrentUser, body: Bytes) -> ApiRe
         secret,
     };
     let outcome = kind.fetch(&ctx).await;
-    Ok(HtmlTemplate(describe(kind, outcome)).into_response())
+    let result = describe(kind, outcome);
+    // Only what happened, never the address, the settings or the secret.
+    tracing::info!(admin = %user.username, kind = kind.kind(), status = result.status, "service tested");
+    Ok(HtmlTemplate(result).into_response())
 }

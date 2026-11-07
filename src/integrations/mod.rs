@@ -274,6 +274,9 @@ pub enum FetchError {
     TooLarge,
     #[error("unexpected answer")]
     Invalid,
+    /// The stored secret can't be opened (the instance key changed).
+    #[error("stored secret unreadable")]
+    SecretUnreadable,
     #[error("HTTP {0}")]
     Status(u16),
     #[error("request failed")]
@@ -293,6 +296,7 @@ impl FetchError {
             FetchError::RedirectScheme => "fetch_err.redirect_scheme",
             FetchError::TooLarge => "fetch_err.too_large",
             FetchError::Invalid => "fetch_err.invalid",
+            FetchError::SecretUnreadable => "fetch_err.secret",
             FetchError::Other => "fetch_err.other",
             FetchError::Status(_) => return None,
         })
@@ -311,6 +315,7 @@ pub fn error_text_key(text: &str) -> Option<&'static str> {
         FetchError::RedirectScheme,
         FetchError::TooLarge,
         FetchError::Invalid,
+        FetchError::SecretUnreadable,
         FetchError::Other,
     ]
     .into_iter()

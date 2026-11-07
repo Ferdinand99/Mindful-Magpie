@@ -7,7 +7,7 @@ mod common;
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::Path;
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect};
 use axum::routing::get;
@@ -16,7 +16,7 @@ use mindful_magpie::integrations::{self, FetchCtx, Integration, Status};
 use mindful_magpie::services::{
     SecretChange, ServiceEvent, ServiceInput, Viewer, Visibility, store,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 
 const SECRET: &str = "s3cr3t-Tok3n-9f8e7d6c";
 const PURPOSE: &str = "magpie.service.secret";
@@ -40,6 +40,16 @@ async fn hop(Path(n): Path<u32>) -> axum::response::Response {
         "arrived".into_response()
     } else {
         Redirect::temporary(&format!("/hop/{}", n - 1)).into_response()
+    }
+}
+
+/// Redirects to the address in `?u=`.
+async fn to(
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    match q.get("u") {
+        Some(u) => Redirect::temporary(u).into_response(),
+        None => StatusCode::BAD_REQUEST.into_response(),
     }
 }
 
@@ -68,6 +78,7 @@ async fn stub() -> String {
             "/meta",
             get(|| async { Redirect::temporary("http://169.254.169.254/latest/meta-data/") }),
         )
+        .route("/to", get(to))
         .route("/loop", get(|| async { Redirect::temporary("/loop") }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -188,7 +199,7 @@ async fn an_admin_creates_an_http_service_and_it_is_listed() {
 async fn only_admins_reach_the_service_routes() {
     let app = App::new().await;
     let mut admin = Web::new(&app, "root", "admin").await;
-    let id = create_via_page(&mut admin, "Blog", "http://10.0.0.5/", SECRET).await;
+    let id = create_via_page(&mut admin, "Hidden-Blog-Name", "http://10.0.0.5/", SECRET).await;
     for role in ["viewer", "editor"] {
         let name: &'static str = if role == "viewer" { "vera" } else { "eddie" };
         let mut web = Web::new(&app, name, role).await;
@@ -199,6 +210,10 @@ async fn only_admins_reach_the_service_routes() {
         ] {
             let res = web.get(&path).await;
             assert_eq!(res.status, StatusCode::FORBIDDEN, "{role} GET {path}");
+            assert!(
+                !res.body.contains("Hidden-Blog-Name"),
+                "{role} GET {path} names the service"
+            );
         }
         let edit = format!("/settings/services/{id}");
         let delete = format!("/settings/services/{id}/delete");
@@ -211,12 +226,16 @@ async fn only_admins_reach_the_service_routes() {
         ] {
             let res = web.post(path, &f).await;
             assert_eq!(res.status, StatusCode::FORBIDDEN, "{role} POST {path}");
+            assert!(
+                !res.body.contains("Hidden-Blog-Name"),
+                "{role} POST {path} names the service"
+            );
         }
     }
     // Nothing changed.
     assert_eq!(app.count("SELECT COUNT(*) FROM services").await, 1);
     assert_eq!(
-        app.count("SELECT COUNT(*) FROM services WHERE name = 'Blog'")
+        app.count("SELECT COUNT(*) FROM services WHERE name = 'Hidden-Blog-Name'")
             .await,
         1
     );
@@ -345,6 +364,14 @@ async fn a_bad_form_is_refused_and_nothing_is_stored() {
         (
             "secret with a line break",
             form("A", "http://10.0.0.5/", "a\r\nX-Evil: 1"),
+        ),
+        (
+            "secret with a space",
+            form("A", "http://10.0.0.5/", "two words"),
+        ),
+        (
+            "secret with non-ASCII",
+            form("A", "http://10.0.0.5/", "n\u{f8}kkel"),
         ),
         ("interval", {
             let mut f = form("A", "http://10.0.0.5/", "");
@@ -657,10 +684,14 @@ async fn the_store_hands_out_the_secret_only_through_a_fetch_context() {
     assert!(!printed.contains("10.0.0.5"), "{printed}");
     // A sealed value that cannot be opened (the key changed) is an error, not
     // a fetch without a secret.
-    app.exec("UPDATE services SET secret = 'sealed:v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' WHERE id = 1".into())
+    app.exec(format!("UPDATE services SET secret = 'sealed:v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' WHERE id = {id}"))
         .await;
     let broken = store::get(core, id).await.unwrap().unwrap();
-    assert!(store::fetch_ctx(core, &broken).await.is_err());
+    let err = store::fetch_ctx(core, &broken).await.unwrap_err();
+    assert_eq!(
+        err.fetch_error(),
+        integrations::FetchError::SecretUnreadable
+    );
 }
 
 #[tokio::test]
@@ -887,7 +918,6 @@ async fn the_services_migration_is_in_place() {
         })
         .await;
     assert!(bad.is_err());
-    let _: Value = json!(null);
 }
 
 /// A resolver that refuses every name the way the kit's guarded one does.
@@ -937,4 +967,396 @@ async fn the_service_routes_are_behind_the_csrf_guard() {
         assert_eq!(res.status, StatusCode::FORBIDDEN, "{path}");
     }
     assert_eq!(app.count("SELECT COUNT(*) FROM services").await, 0);
+}
+
+// ---------------------------------------------------------------------------
+// A stored secret never follows a changed address (Ruling G)
+
+type AuthLog = std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>;
+
+async fn record(State(log): State<AuthLog>, headers: HeaderMap) -> &'static str {
+    let sent = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    log.lock().unwrap().push(sent);
+    "recorded"
+}
+
+/// A stub that records the `Authorization` header of every request to `/rec`
+/// and `/rec2`; `/jump/{port}` redirects to `/rec` on another stub.
+async fn recorder() -> (String, u16, AuthLog) {
+    let log = AuthLog::default();
+    let app = Router::new()
+        .route("/rec", get(record))
+        .route("/rec2", get(record))
+        .route(
+            "/jump/{port}",
+            get(|Path(port): Path<u16>| async move {
+                Redirect::temporary(&format!("http://127.0.0.1:{port}/rec"))
+            }),
+        )
+        .with_state(log.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), addr.port(), log)
+}
+
+#[tokio::test]
+async fn a_new_address_with_an_empty_secret_is_refused_and_the_secret_stays() {
+    let app = App::new().await;
+    let mut admin = Web::new(&app, "root", "admin").await;
+    let id = create_via_page(&mut admin, "Blog", "http://10.0.0.5/health", SECRET).await;
+    let before = stored_secret(&app, id).await.unwrap();
+    for new_url in [
+        "http://10.0.0.6/health",      // another host
+        "http://10.0.0.5:8080/health", // another port
+        "https://10.0.0.5/health",     // another scheme
+    ] {
+        let res = admin
+            .post(
+                &format!("/settings/services/{id}"),
+                &form("Blog", new_url, ""),
+            )
+            .await;
+        assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY, "{new_url}");
+        assert!(
+            res.body
+                .contains("Type the key again when the address changes"),
+            "{new_url}: {}",
+            res.body
+        );
+        assert_clean(&res, "the refusal");
+        assert_eq!(stored_secret(&app, id).await.unwrap(), before, "{new_url}");
+        assert_eq!(
+            app.count("SELECT COUNT(*) FROM services WHERE url = 'http://10.0.0.5/health'")
+                .await,
+            1,
+            "the address did not change"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_store_refuses_it_too() {
+    let app = App::new().await;
+    let core = &app.magpie.core;
+    let mut with_secret = input("S", Visibility::Admin, &[]);
+    with_secret.secret = SecretChange::Replace(SECRET.into());
+    let id = store::create(core, &with_secret).await.unwrap();
+    let mut moved = input("S", Visibility::Admin, &[]);
+    moved.url = Some("http://10.0.0.99/".into());
+    match store::update(core, id, &moved).await {
+        Err(store::StoreError::Invalid(errors)) => {
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors[0].field, "secret");
+            assert_eq!(errors[0].key, "err.secret_origin");
+        }
+        other => panic!("{other:?}"),
+    }
+    // A service that has no secret may move freely.
+    let none = store::create(core, &input("N", Visibility::Admin, &[]))
+        .await
+        .unwrap();
+    store::update(core, none, &moved).await.unwrap();
+}
+
+#[tokio::test]
+async fn the_same_origin_with_another_path_keeps_the_secret() {
+    let app = App::new().await;
+    let mut admin = Web::new(&app, "root", "admin").await;
+    let id = create_via_page(&mut admin, "Blog", "http://10.0.0.5/health", SECRET).await;
+    let before = stored_secret(&app, id).await.unwrap();
+    // Another path, and the default port written out: still the same origin.
+    for new_url in ["http://10.0.0.5/other?x=1", "http://10.0.0.5:80/health"] {
+        let res = admin
+            .post(
+                &format!("/settings/services/{id}"),
+                &form("Blog", new_url, ""),
+            )
+            .await;
+        assert_eq!(res.status, StatusCode::SEE_OTHER, "{new_url}: {}", res.body);
+        assert_eq!(stored_secret(&app, id).await.unwrap(), before);
+    }
+}
+
+#[tokio::test]
+async fn clearing_or_replacing_the_secret_allows_a_new_address() {
+    let app = App::new().await;
+    let mut admin = Web::new(&app, "root", "admin").await;
+    let id = create_via_page(&mut admin, "Blog", "http://10.0.0.5/", SECRET).await;
+    // Replace with a new origin.
+    let res = admin
+        .post(
+            &format!("/settings/services/{id}"),
+            &form("Blog", "http://10.0.0.6/", "brand-new-secret"),
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    let now = stored_secret(&app, id).await.unwrap();
+    assert_eq!(
+        vole_kit::crypto::open(&app.magpie.core.session_key, PURPOSE, &now).as_deref(),
+        Ok("brand-new-secret")
+    );
+    // Clear with another new origin.
+    let mut f = form("Blog", "http://10.0.0.7/", "");
+    f.push(("clear_secret", "true"));
+    let res = admin.post(&format!("/settings/services/{id}"), &f).await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    assert_eq!(stored_secret(&app, id).await, None);
+    assert_eq!(
+        app.count("SELECT COUNT(*) FROM services WHERE url = 'http://10.0.0.7/'")
+            .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_never_sends_a_stored_secret_to_another_address() {
+    let (a, _, log_a) = recorder().await;
+    let (b, _, log_b) = recorder().await;
+    let app = App::new().await;
+    let mut admin = Web::new(&app, "root", "admin").await;
+    let id = create_via_page(&mut admin, "Guarded", &format!("{a}/rec"), SECRET).await;
+    let id_text = id.to_string();
+    let (url_b, url_a2) = (format!("{b}/rec"), format!("{a}/rec2"));
+
+    // Another port: refused, and nothing is sent to either stub.
+    let mut f = form("Guarded", &url_b, "");
+    f.push(("id", &id_text));
+    let res = admin.post("/settings/services/test", &f).await;
+    assert!(
+        res.body.contains("data-test-status=\"unknown\""),
+        "{}",
+        res.body
+    );
+    assert!(
+        res.body
+            .contains("Type the key again when the address changes")
+    );
+    assert_clean(&res, "the refusal");
+    assert!(log_a.lock().unwrap().is_empty());
+    assert!(log_b.lock().unwrap().is_empty());
+
+    // A key typed in the form may go to the new address.
+    let mut f = form("Guarded", &url_b, "typed-key-123");
+    f.push(("id", &id_text));
+    let res = admin.post("/settings/services/test", &f).await;
+    assert!(res.body.contains("data-test-status=\"ok\""), "{}", res.body);
+    assert_eq!(
+        *log_b.lock().unwrap(),
+        [Some("Bearer typed-key-123".to_string())]
+    );
+
+    // Removing the key goes without one.
+    let mut f = form("Guarded", &url_b, "");
+    f.push(("id", &id_text));
+    f.push(("clear_secret", "true"));
+    admin.post("/settings/services/test", &f).await;
+    assert_eq!(log_b.lock().unwrap().last(), Some(&None));
+
+    // The same origin with another path uses the stored key.
+    let mut f = form("Guarded", &url_a2, "");
+    f.push(("id", &id_text));
+    let res = admin.post("/settings/services/test", &f).await;
+    assert!(res.body.contains("data-test-status=\"ok\""), "{}", res.body);
+    assert_eq!(*log_a.lock().unwrap(), [Some(format!("Bearer {SECRET}"))]);
+    assert_clean(&res, "the test result");
+}
+
+#[tokio::test]
+async fn a_redirect_to_another_origin_drops_the_authorization_header() {
+    let (a, _, log_a) = recorder().await;
+    let (_, port_b, log_b) = recorder().await;
+    let snap = fetch(&format!("{a}/jump/{port_b}"), Some(SECRET)).await;
+    assert_eq!(snap.status, Status::Ok, "{:?}", snap.error);
+    assert!(log_a.lock().unwrap().is_empty(), "A only redirected");
+    assert_eq!(
+        *log_b.lock().unwrap(),
+        [None],
+        "B got no Authorization header"
+    );
+}
+
+#[tokio::test]
+async fn disguised_metadata_addresses_are_refused_directly_and_as_redirects() {
+    let base = stub().await;
+    let app = App::new().await;
+    let mut admin = Web::new(&app, "root", "admin").await;
+    for url in [
+        "http://2852039166/",
+        "http://0251.0376.0251.0376/",
+        "http://[::ffff:169.254.169.254]/",
+        "http://[fe80::1]/",
+    ] {
+        // «Test»
+        let res = admin
+            .post("/settings/services/test", &form("Cloud", url, SECRET))
+            .await;
+        assert!(
+            res.body.contains("data-test-status=\"bad\""),
+            "{url}: {}",
+            res.body
+        );
+        assert!(res.body.contains("not allowed"), "{url}");
+        assert_no_header(&res, url);
+        // As the target of a redirect.
+        let hop = format!(
+            "{base}/to?u={}",
+            url.replace('[', "%5B").replace(']', "%5D")
+        );
+        let snap = fetch(&hop, Some(SECRET)).await;
+        assert_eq!(snap.status, Status::Bad, "{url}");
+        let error = snap.error.unwrap();
+        assert!(error.contains("not allowed"), "{url}: {error}");
+        assert!(!error.contains(SECRET));
+    }
+}
+
+#[tokio::test]
+async fn an_unreadable_stored_secret_is_said_not_shown_as_saved() {
+    let app = App::new().await;
+    let mut admin = Web::new(&app, "root", "admin").await;
+    let id = create_via_page(&mut admin, "Blog", "http://10.0.0.5/", SECRET).await;
+    app.exec(format!(
+        "UPDATE services SET secret = 'sealed:v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' WHERE id = {id}"
+    ))
+    .await;
+    let edit = admin.get(&format!("/settings/services/{id}")).await;
+    assert_eq!(edit.status, StatusCode::OK);
+    assert!(
+        edit.body.contains("can no longer be opened"),
+        "{}",
+        edit.body
+    );
+    assert!(!edit.body.contains("Saved – type to replace"));
+    // «Test» with the form's empty field says so too, and sends nothing.
+    let mut f = form("Blog", "http://10.0.0.5/", "");
+    let id_text = id.to_string();
+    f.push(("id", &id_text));
+    let res = admin.post("/settings/services/test", &f).await;
+    assert!(
+        res.body.contains("data-test-status=\"unknown\""),
+        "{}",
+        res.body
+    );
+    assert!(res.body.contains("can no longer be read"), "{}", res.body);
+}
+
+#[tokio::test]
+async fn the_interval_input_has_the_kinds_floor_as_its_minimum() {
+    let app = App::new().await;
+    let mut admin = Web::new(&app, "root", "admin").await;
+    let res = admin.get("/settings/services/new").await;
+    assert!(res.body.contains("name=\"interval\""));
+    assert!(res.body.contains("min=\"15\""), "{}", res.body);
+}
+
+#[tokio::test]
+async fn update_and_delete_are_behind_the_csrf_guard_too() {
+    let app = App::new().await;
+    let mut admin = Web::new(&app, "root", "admin").await;
+    let id = create_via_page(&mut admin, "Blog", "http://10.0.0.5/", SECRET).await;
+    let before = stored_secret(&app, id).await;
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(form("Taken over", "http://10.0.0.5/", "evil-secret"))
+        .finish();
+    for path in [
+        format!("/settings/services/{id}"),
+        format!("/settings/services/{id}/delete"),
+    ] {
+        let req = axum::http::Request::post(&path)
+            .header(header::ORIGIN, "http://evil.example")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(axum::body::Body::from(body.clone()))
+            .unwrap();
+        let res = admin.send(req).await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{path}");
+    }
+    assert_eq!(
+        app.count("SELECT COUNT(*) FROM services WHERE name = 'Blog'")
+            .await,
+        1
+    );
+    assert_eq!(stored_secret(&app, id).await, before);
+}
+
+// ---------------------------------------------------------------------------
+// Logs
+
+#[derive(Clone, Default)]
+struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+    type Writer = Capture;
+
+    fn make_writer(&'a self) -> Capture {
+        self.clone()
+    }
+}
+
+#[tokio::test]
+async fn nothing_that_is_logged_holds_a_secret() {
+    // Everything on every thread, at debug level (what RUST_LOG=debug shows).
+    // This is the only test that installs a subscriber.
+    let capture = Capture::default();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .finish(),
+    )
+    .expect("no other subscriber in this test binary");
+    const FIRST: &str = "probe-secret-first-4f7a91";
+    const SECOND: &str = "probe-secret-second-b3c8d2";
+    let base = stub().await;
+    let app = App::new().await;
+    let mut admin = Web::new(&app, "root", "admin").await;
+    // Create, update (same origin), a refused update, «Test» three ways, and a
+    // failed fetch.
+    let url = format!("{base}/auth/{SECOND}");
+    let id = create_via_page(&mut admin, "Probe", &url, FIRST).await;
+    let path = format!("/settings/services/{id}");
+    admin.post(&path, &form("Probe", &url, SECOND)).await;
+    admin
+        .post(&path, &form("Probe", "http://10.9.9.9/", ""))
+        .await;
+    for target in [
+        url.clone(),
+        format!("{base}/fail"),
+        "http://127.0.0.1:1/".into(),
+    ] {
+        admin
+            .post("/settings/services/test", &form("Probe", &target, SECOND))
+            .await;
+    }
+    let ctx = FetchCtx {
+        http: integrations::client().clone(),
+        settings: json!({ "url": "http://127.0.0.1:1/" }),
+        secret: Some(SECOND.into()),
+    };
+    let snap = http_kind().fetch(&ctx).await.unwrap();
+    assert_eq!(snap.status, Status::Bad);
+    tracing::debug!(ctx = ?ctx, "a debug print of the fetch context");
+    admin.post(&format!("{path}/delete"), &[]).await;
+
+    let log = String::from_utf8_lossy(&capture.0.lock().unwrap()).into_owned();
+    assert!(log.contains("service created"), "the capture works:\n{log}");
+    assert!(log.contains("service tested"), "{log}");
+    for needle in [FIRST, SECOND, "Bearer"] {
+        assert!(!log.contains(needle), "the log holds {needle:?}:\n{log}");
+    }
 }
