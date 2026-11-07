@@ -34,7 +34,12 @@
     {%- if let Some(s) = form.secret %}
     {#- Never filled in: the secret does not come back from the server. -#}
     {%- if form.has_secret && form.secret_unreadable %}
+    {#- A refused value is said first; the note only when there is no error. -#}
+    {%- if form.secret_error.is_empty() %}
     {{ m::field_text("secret", tr(s.label_key), kind="password", autocomplete="new-password", help=tr(s.help), error=tr("service.secret_unreadable")) }}
+    {%- else %}
+    {{ m::field_text("secret", tr(s.label_key), kind="password", autocomplete="new-password", help=tr(s.help), error=&form.secret_error) }}
+    {%- endif %}
     {{ m::checkbox("clear_secret", tr("service.clear_secret"), false) }}
     {%- else if form.has_secret %}
     {{ m::field_text("secret", tr(s.label_key), kind="password", placeholder=tr("service.secret_saved"), autocomplete="new-password", help=tr(s.help), error=&form.secret_error) }}

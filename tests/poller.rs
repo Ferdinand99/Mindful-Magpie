@@ -19,7 +19,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Redirect;
 use axum::routing::get;
 use common::App;
-use mindful_magpie::integrations::poller::{FETCH_DEADLINE, Options, Poller, PollerHandle};
+use mindful_magpie::integrations::poller::{Change, FETCH_DEADLINE, Options, Poller, PollerHandle};
 use mindful_magpie::integrations::{
     self, BoxFuture, FetchCtx, FetchError, Field, Integration, MetricDef, Snapshot, Status, Value,
 };
@@ -56,9 +56,10 @@ fn log_buffer() -> &'static LogBuffer {
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
             .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        tracing::subscriber::set_global_default(subscriber)
+            .with_writer(move || writer.clone());
+        // Also bridges the `log` records of reqwest.
+        subscriber
+            .try_init()
             .expect("no other subscriber in this test binary");
     });
     buffer
@@ -447,13 +448,11 @@ async fn a_broadcast_goes_out_for_every_new_snapshot() {
     snapshot_where(&poller, a, |s| s.values.get("n") == Some(&Value::num(3.0))).await;
     snapshot_where(&poller, b, |s| s.values.get("n") == Some(&Value::num(3.0))).await;
     let (mut for_a, mut for_b) = (0, 0);
-    while let Ok(id) = rx.try_recv() {
-        if id == a {
-            for_a += 1;
-        } else if id == b {
-            for_b += 1;
-        } else {
-            panic!("a broadcast for service {id}");
+    while let Ok(change) = rx.try_recv() {
+        match change {
+            Change::Snapshot(id) if id == a => for_a += 1,
+            Change::Snapshot(id) if id == b => for_b += 1,
+            other => panic!("a broadcast {other:?}"),
         }
     }
     assert_eq!((for_a, for_b), (3, 3), "one per snapshot");
@@ -521,6 +520,7 @@ async fn a_deleted_service_stops_and_its_row_is_gone() {
     snapshot_where(&poller, id, |_| true).await;
     assert!(stored_json(&app, id).await.is_some());
 
+    let mut rx = poller.subscribe();
     assert!(store::delete(&app.magpie.core, id).await.unwrap());
     app.magpie
         .service_events
@@ -529,6 +529,14 @@ async fn a_deleted_service_stops_and_its_row_is_gone() {
     settle().await;
     assert!(poller.snapshot(id).is_none());
     assert!(stored_json(&app, id).await.is_none());
+    // Subscribers (the live stream) are told that the service is gone.
+    let mut removed = 0;
+    while let Ok(change) = rx.try_recv() {
+        if change == Change::Removed(id) {
+            removed += 1;
+        }
+    }
+    assert_eq!(removed, 1, "one removal notice");
     let before = calls("t_delete").len();
     advance_until("the other one runs on", 1, 60, || {
         calls("t_stays").len() >= 5
@@ -549,9 +557,28 @@ async fn reload_and_remove_work_without_an_event() {
     let id = add_stub(&app, "Handle", "t_handle", "", 60).await;
     poller.reload(id);
     snapshot_where(&poller, id, |_| true).await;
+    let mut rx = poller.subscribe();
     poller.remove(id);
+    assert!(
+        poller.snapshot(id).is_none(),
+        "gone as soon as remove returns"
+    );
     settle().await;
-    assert!(poller.snapshot(id).is_none());
+    assert!(stored_json(&app, id).await.is_none());
+    assert_eq!(rx.try_recv(), Ok(Change::Removed(id)));
+    assert!(rx.try_recv().is_err(), "announced once");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_idle_handle_holds_set_snapshots_and_announces_removal() {
+    let poller = PollerHandle::idle();
+    let mut rx = poller.subscribe();
+    poller.set_snapshot(7, Snapshot::new(Status::Warn));
+    assert_eq!(poller.snapshot(7).unwrap().status, Status::Warn);
+    assert_eq!(rx.try_recv(), Ok(Change::Snapshot(7)));
+    poller.remove(7);
+    assert!(poller.snapshot(7).is_none());
+    assert_eq!(rx.try_recv(), Ok(Change::Removed(7)));
 }
 
 // ---------------------------------------------------------------------------
@@ -811,6 +838,51 @@ async fn no_secret_and_no_userinfo_reaches_a_log_a_snapshot_or_the_database() {
             assert!(!text.contains(needle), "{needle:?} leaked into: {text}");
         }
     }
-    // The capture works: the poller does say what it is doing.
+    // The capture works: the poller does say what it is doing, and the
+    // libraries' lines (hyper, reqwest) are in it.
     assert!(logged().contains("poller"), "{}", logged());
+    assert!(
+        logged().contains("hyper_util") || logged().contains("reqwest"),
+        "no library line was captured:
+{}",
+        logged()
+    );
+}
+
+#[tokio::test]
+async fn a_secret_that_cannot_be_opened_is_recorded_as_such_not_as_bad_settings() {
+    let app = App::new().await;
+    let base = stub_server().await;
+    let id = store::create(
+        &app.magpie.core,
+        &ServiceInput {
+            kind: "http".into(),
+            name: "Locked".into(),
+            url: Some(format!("{base}/ok")),
+            settings: json!({}),
+            secret: SecretChange::Replace(SECRET.into()),
+            interval_s: 60,
+            visibility: Visibility::Admin,
+            users: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    // The instance key changed: what is stored no longer opens.
+    app.exec(format!(
+        "UPDATE services SET secret = 'sealed:v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' WHERE id = {id}"
+    ))
+    .await;
+    let poller = start_with(&app, stub_kinds, 0);
+    let s = real_snapshot(&poller, id).await;
+    assert_eq!(s.status, Status::Bad);
+    assert_eq!(
+        s.error.as_deref(),
+        Some(FetchError::SecretUnreadable.to_string().as_str())
+    );
+    assert_ne!(s.error, Some(FetchError::Config.to_string()));
+    assert_eq!(
+        integrations::error_text_key(s.error.as_deref().unwrap()),
+        Some("fetch_err.secret")
+    );
 }

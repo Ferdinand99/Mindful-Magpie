@@ -103,7 +103,7 @@ struct State {
 
 struct Shared {
     state: RwLock<State>,
-    changes: broadcast::Sender<i64>,
+    changes: broadcast::Sender<Change>,
 }
 
 impl Shared {
@@ -138,8 +138,17 @@ impl Shared {
             }
             state.snapshots.insert(id, snapshot);
         }
-        let _ = self.changes.send(id);
+        let _ = self.changes.send(Change::Snapshot(id));
     }
+}
+
+/// What [`PollerHandle::subscribe`] announces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change {
+    /// The service has a new snapshot.
+    Snapshot(i64),
+    /// The service is gone: no snapshot of it any more.
+    Removed(i64),
 }
 
 enum Control {
@@ -175,11 +184,19 @@ impl PollerHandle {
         }
     }
 
-    /// Forgets the service: its task stops, its snapshot and its row go.
+    /// Forgets the service: its task stops, its snapshot and its row go, and
+    /// [`Change::Removed`] is announced. [`PollerHandle::snapshot`] answers
+    /// `None` from the moment this returns.
     pub fn remove(&self, service_id: i64) {
         self.shared.forget(service_id);
-        if let Some(control) = &self.control {
-            let _ = control.send(Control::Remove(service_id));
+        match &self.control {
+            // The poller announces it once the row is gone too.
+            Some(control) => {
+                let _ = control.send(Control::Remove(service_id));
+            }
+            None => {
+                let _ = self.shared.changes.send(Change::Removed(service_id));
+            }
         }
     }
 
@@ -188,9 +205,10 @@ impl PollerHandle {
         self.shared.read().snapshots.get(&service_id).cloned()
     }
 
-    /// The id of a service each time it gets a new snapshot. A receiver that
-    /// falls far behind gets `Lagged` and should read every snapshot again.
-    pub fn subscribe(&self) -> broadcast::Receiver<i64> {
+    /// A [`Change`] each time a service gets a new snapshot or is removed (also
+    /// when its deletion arrives as a service event). A receiver that falls far
+    /// behind gets `Lagged` and should read every snapshot again.
+    pub fn subscribe(&self) -> broadcast::Receiver<Change> {
         self.shared.changes.subscribe()
     }
 
@@ -202,7 +220,7 @@ impl PollerHandle {
             let mut state = self.shared.write();
             state.snapshots.insert(service_id, Arc::new(snapshot));
         }
-        let _ = self.shared.changes.send(service_id);
+        let _ = self.shared.changes.send(Change::Snapshot(service_id));
     }
 }
 
@@ -385,6 +403,7 @@ impl Supervisor {
         if let Err(err) = deleted {
             tracing::warn!(service_id = id, %err, "poller can't delete a stored snapshot");
         }
+        let _ = self.shared.changes.send(Change::Removed(id));
     }
 
     /// After missed events: every stored service gets a fresh task, and a
@@ -505,7 +524,7 @@ impl Job {
                     %err,
                     "poller can't prepare a fetch"
                 );
-                return (Snapshot::failed(&FetchError::Config), true);
+                return (Snapshot::failed(&err.fetch_error()), true);
             }
         };
         ctx.http = self.http.clone();

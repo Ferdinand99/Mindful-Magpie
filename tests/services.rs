@@ -1245,6 +1245,57 @@ async fn an_unreadable_stored_secret_is_said_not_shown_as_saved() {
 }
 
 #[tokio::test]
+async fn a_refused_secret_is_said_before_the_unreadable_note() {
+    let app = App::new().await;
+    let mut admin = Web::new(&app, "root", "admin").await;
+    let id = create_via_page(&mut admin, "Blog", "http://10.0.0.5/", SECRET).await;
+    app.exec(format!(
+        "UPDATE services SET secret = 'sealed:v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' WHERE id = {id}"
+    ))
+    .await;
+    // A new value with a space in it: refused, and the reason shows.
+    let res = admin
+        .post(
+            &format!("/settings/services/{id}"),
+            &form("Blog", "http://10.0.0.5/", "not valid"),
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", res.body);
+    assert!(
+        res.body.contains("visible ASCII characters"),
+        "{}",
+        res.body
+    );
+    assert!(
+        !res.body.contains("can no longer be opened"),
+        "{}",
+        res.body
+    );
+    // The same with a changed address: the origin rule says so.
+    let res = admin
+        .post(
+            &format!("/settings/services/{id}"),
+            &form("Blog", "http://10.0.0.99/", ""),
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", res.body);
+    assert!(
+        res.body
+            .contains("Type the key again when the address changes."),
+        "{}",
+        res.body
+    );
+    assert!(
+        !res.body.contains("can no longer be opened"),
+        "{}",
+        res.body
+    );
+    // With no error the note stays.
+    let edit = admin.get(&format!("/settings/services/{id}")).await;
+    assert!(edit.body.contains("can no longer be opened"));
+}
+
+#[tokio::test]
 async fn the_interval_input_has_the_kinds_floor_as_its_minimum() {
     let app = App::new().await;
     let mut admin = Web::new(&app, "root", "admin").await;
@@ -1312,14 +1363,13 @@ async fn nothing_that_is_logged_holds_a_secret() {
     // Everything on every thread, at debug level (what RUST_LOG=debug shows).
     // This is the only test that installs a subscriber.
     let capture = Capture::default();
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_ansi(false)
-            .with_writer(capture.clone())
-            .finish(),
-    )
-    .expect("no other subscriber in this test binary");
+    // `try_init` also bridges the `log` records of reqwest.
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer(capture.clone())
+        .try_init()
+        .expect("no other subscriber in this test binary");
     const FIRST: &str = "probe-secret-first-4f7a91";
     const SECOND: &str = "probe-secret-second-b3c8d2";
     let base = stub().await;
@@ -1356,6 +1406,13 @@ async fn nothing_that_is_logged_holds_a_secret() {
     let log = String::from_utf8_lossy(&capture.0.lock().unwrap()).into_owned();
     assert!(log.contains("service created"), "the capture works:\n{log}");
     assert!(log.contains("service tested"), "{log}");
+    // The libraries' own lines are in the capture, so it would catch a leak
+    // from them too.
+    assert!(
+        log.contains("reqwest") || log.contains("hyper_util"),
+        "no library line was captured:
+{log}"
+    );
     for needle in [FIRST, SECOND, "Bearer"] {
         assert!(!log.contains(needle), "the log holds {needle:?}:\n{log}");
     }
