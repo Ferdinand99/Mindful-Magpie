@@ -5,7 +5,6 @@
 //!
 //! The service's secret, when it has one, is sent as `Authorization: Bearer`.
 
-use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
 
@@ -84,6 +83,16 @@ pub fn parse_expected(text: &str) -> Option<Vec<RangeInclusive<u16>>> {
         ranges.push(low..=high);
     }
     Some(ranges)
+}
+
+/// `snapshot` with the `checked` metric: when the reading was taken, also when
+/// the site did not answer.
+fn checked(mut snapshot: Snapshot) -> Snapshot {
+    snapshot.values.insert(
+        "checked".to_string(),
+        Value::num(snapshot.fetched_at.as_second() as f64),
+    );
+    snapshot
 }
 
 /// The address to fetch: `http` or `https`, a host, no user name or password.
@@ -165,22 +174,21 @@ impl Integration for HttpKind {
             let started = Instant::now();
             let response = match request.send().await {
                 Ok(response) => response,
-                // The site not answering is the reading, not a failure of ours.
-                Err(err) => return Ok(Snapshot::failed(&classify(&err))),
+                // The site not answering is the reading, not a failure of ours,
+                // and it was checked: «Last checked» says when.
+                Err(err) => return Ok(checked(Snapshot::failed(&classify(&err)))),
             };
             let code = response.status().as_u16();
             let body = read_capped(response).await;
             let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
 
-            let mut snapshot = Snapshot::new(Status::Ok);
-            let mut values = BTreeMap::new();
-            values.insert("status".to_string(), Value::num(f64::from(code)));
-            values.insert("latency_ms".to_string(), Value::num(latency_ms.round()));
-            values.insert(
-                "checked".to_string(),
-                Value::num(snapshot.fetched_at.as_second() as f64),
-            );
-            snapshot.values = values;
+            let mut snapshot = checked(Snapshot::new(Status::Ok));
+            snapshot
+                .values
+                .insert("status".to_string(), Value::num(f64::from(code)));
+            snapshot
+                .values
+                .insert("latency_ms".to_string(), Value::num(latency_ms.round()));
             if let Err(err) = body {
                 snapshot.status = Status::Bad;
                 snapshot.error = Some(err.to_string());

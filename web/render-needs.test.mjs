@@ -36,7 +36,7 @@ function need(over = {}) {
     service_name: "Blog",
     key: "down",
     level: "bad",
-    label: "not answering",
+    label: "down",
     since: NOW - 120,
     acked: false,
     ...over,
@@ -107,11 +107,33 @@ test("the_row_sits_before_the_groups_and_chips_read_service_text_age", () => {
   assert.equal(section.querySelector(".mm-needs-title").textContent, EN.labels.needs);
   const items = chips(root);
   assert.equal(items.length, 2);
-  assert.equal(items[0].querySelector(".mm-need-chip").textContent, "Blog · not answering · 2 min. ago");
+  assert.equal(items[0].querySelector(".mm-need-chip").textContent, "Blog · down · 2 min. ago");
   assert.equal(items[1].querySelector(".mm-need-chip").textContent, "Wiki · disk almost full · 3 hr. ago");
   // The same in Norwegian.
-  const nb = draw([need({ label: "svarer ikke" })], { lang: NB });
-  assert.match(chips(nb.root)[0].querySelector(".mm-need-chip").textContent, /^Blog · svarer ikke · for 2 min siden$/);
+  const nb = draw([need({ label: "nede" })], { lang: NB });
+  assert.match(chips(nb.root)[0].querySelector(".mm-need-chip").textContent, /^Blog · nede · for 2 min siden$/);
+});
+
+test("a_chip_breaks_between_its_parts_never_inside_the_name", () => {
+  const { root } = draw([need({ service_name: "KK", label: "needs to be set up again" })]);
+  const chip = root.querySelector(".mm-need-chip");
+  // The dot, the name and its separator are one part; the text and its separator another; then the age.
+  assert.deepEqual([...chip.children].map((el) => el.className), ["mm-need-lead", "mm-need-main", "mm-need-age"]);
+  const lead = chip.querySelector(".mm-need-lead");
+  assert.deepEqual([...lead.children].map((el) => el.className), ["mm-status", "mm-need-name", "mm-need-sep"]);
+  assert.deepEqual([...chip.querySelector(".mm-need-main").children].map((el) => el.className), ["mm-need-text", "mm-need-sep"]);
+  assert.equal(chip.textContent, "KK · needs to be set up again · 2 min. ago");
+  // Without a time there is nothing to separate the text from.
+  const bare = draw([need({ since: undefined })]);
+  assert.deepEqual([...bare.root.querySelector(".mm-need-main").children].map((el) => el.className), ["mm-need-text"]);
+  // The style that keeps the name whole (a one-letter name must not wrap letter by letter).
+  const css = readFileSync(new URL("../static/magpie/render.css", import.meta.url), "utf8");
+  const rule = (selector) => {
+    const at = css.indexOf(`\n${selector} {`);
+    return at === -1 ? "" : css.slice(at, css.indexOf("}", at));
+  };
+  assert.match(rule(".mm-need-lead"), /white-space:\s*nowrap/);
+  assert.match(rule(".mm-need-lead"), /flex:\s*none/);
 });
 
 test("the_shape_tells_the_level_as_well_as_the_colour", () => {
@@ -142,7 +164,7 @@ test("a_chip_opens_the_bound_cards_address_in_the_same_tab", () => {
 
 test("a_chip_without_a_usable_card_address_is_text", () => {
   // No card is bound to the service, or its address is not http(s).
-  const unbound = draw([need({ service_id: 5, service_name: "Gone", label: "not answering" })]);
+  const unbound = draw([need({ service_id: 5, service_name: "Gone", label: "down" })]);
   const el = chips(unbound.root)[0].querySelector(".mm-need-chip");
   assert.equal(el.tagName, "SPAN");
   assert.equal(el.getAttribute("href"), null);
@@ -179,7 +201,7 @@ test("each_chip_has_a_kvitter_button_after_it_and_the_order_is_chips_then_their_
   const button = row(root).querySelector(".mm-need-ack");
   assert.equal(button.getAttribute("type"), "button");
   assert.equal(button.textContent, EN.labels.need_ack);
-  assert.equal(button.getAttribute("aria-label"), "Acknowledge Blog: not answering");
+  assert.equal(button.getAttribute("aria-label"), "Acknowledge Blog: down");
   assert.ok(button.getAttribute("aria-label").startsWith(button.textContent), "the name holds the visible text");
   const nb = draw([need()], { lang: NB });
   assert.equal(nb.root.querySelector(".mm-need-ack").textContent, "Kvitter");
@@ -264,12 +286,12 @@ test("the_live_region_starts_empty_and_a_new_need_is_announced_without_moving_fo
   assert.equal(updateValues(p.root, l, { ...opts, values: values([need()]) }), true);
   assert.ok(row(p.root));
   assert.equal(p.root.querySelector(".mm-needs-live"), live, "the same region");
-  assert.equal(live.textContent, "Blog: not answering");
+  assert.equal(live.textContent, "Blog: down");
   // Nothing new in the next update: the same row stays, and the text is not touched again.
   const section = row(p.root);
   updateValues(p.root, l, { ...opts, values: values([need()]) });
   assert.equal(row(p.root), section, "same element when nothing changed");
-  assert.equal(live.textContent, "Blog: not answering");
+  assert.equal(live.textContent, "Blog: down");
   // Another change (an acknowledgement) announces nothing new.
   updateValues(p.root, l, { ...opts, values: values([need({ acked: true })]) });
   assert.equal(live.textContent, "");
@@ -400,10 +422,10 @@ test("the_row_is_named_by_its_heading_and_the_toggle_controls_the_acknowledged_l
 
 test("the_buttons_name_the_service_as_well_as_the_text", () => {
   const { root } = draw([need({ service_name: "Wiki", service_id: 2 }), need({ key: "x", label: "slow", acked: true })]);
-  assert.equal(root.querySelector(".mm-need-ack").getAttribute("aria-label"), "Acknowledge Wiki: not answering");
+  assert.equal(root.querySelector(".mm-need-ack").getAttribute("aria-label"), "Acknowledge Wiki: down");
   assert.equal(root.querySelector(".mm-need-unack").getAttribute("aria-label"), "Undo the acknowledgement of Blog: slow");
   const nb = draw([need()], { lang: NB });
-  assert.equal(nb.root.querySelector(".mm-need-ack").getAttribute("aria-label"), "Kvitter Blog: not answering");
+  assert.equal(nb.root.querySelector(".mm-need-ack").getAttribute("aria-label"), "Kvitter Blog: down");
   assert.equal(nb.root.querySelector(".mm-need-ack").textContent, "Kvitter");
 });
 

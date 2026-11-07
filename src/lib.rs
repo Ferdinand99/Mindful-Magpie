@@ -24,7 +24,10 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 
-use axum::middleware::{from_fn, from_fn_with_state};
+use axum::extract::Request;
+use axum::http::{HeaderValue, header};
+use axum::middleware::{Next, from_fn, from_fn_with_state};
+use axum::response::Response;
 use axum::routing::get;
 use axum::{Extension, Router};
 use vole_kit::auth::{guard, pages as kit_pages};
@@ -147,6 +150,29 @@ pub async fn start_with(
     })
 }
 
+/// Whether `path` is one of Magpie's own scripts or styles (not the kit's, not
+/// an icon): the files that have to match the server's routes and data.
+fn is_own_code(path: &str) -> bool {
+    path.starts_with("/static/magpie/") || matches!(path, "/static/magpie.css" | "/static/clock.js")
+}
+
+/// Makes the browser ask again before it uses one of Magpie's own scripts or
+/// styles. Their URLs carry no version (the modules import each other by plain
+/// path, so a version in the page's URLs would load a second copy of each), and
+/// the kit's handler would let the browser keep them for an hour: after an
+/// update the old client would run against the new server. `no-cache` keeps
+/// the kit's `ETag`, so an unchanged file costs one `304`.
+async fn revalidate_own_code(request: Request, next: Next) -> Response {
+    let own = is_own_code(request.uri().path());
+    let mut response = next.run(request).await;
+    if own {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    }
+    response
+}
+
 /// The whole app: Magpie's pages, the kit's pages, static files and the
 /// health probe, behind the kit's middleware.
 pub fn router(magpie: Magpie) -> Router {
@@ -167,7 +193,10 @@ pub fn router(magpie: Magpie) -> Router {
     // Sign-in, first-run setup, logout, health and static files.
     let public = Router::new()
         .route("/healthz", get(vole_kit::http::healthz))
-        .route("/static/{*path}", get(vole_kit::http::assets::static_asset))
+        .route(
+            "/static/{*path}",
+            get(vole_kit::http::assets::static_asset).layer(from_fn(revalidate_own_code)),
+        )
         .merge(api::public_router())
         // Takes a cookie or an API token and answers 401 itself (see the module).
         .merge(pages::image_router())
@@ -181,4 +210,59 @@ pub fn router(magpie: Magpie) -> Router {
         .layer(from_fn(vole_kit::http::error::negotiate))
         .layer(from_fn(headers::security_headers))
         .with_state(core)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{Request, header};
+    use tower::ServiceExt as _;
+
+    use super::*;
+
+    /// The kit's handler in a release build: files kept for an hour.
+    async fn kept_for_an_hour() -> ([(header::HeaderName, &'static str); 1], &'static str) {
+        ([(header::CACHE_CONTROL, "public, max-age=3600")], "x")
+    }
+
+    #[tokio::test]
+    async fn only_magpies_own_code_is_made_to_revalidate() {
+        let app = Router::new()
+            .route("/static/{*path}", get(kept_for_an_hour))
+            .layer(from_fn(revalidate_own_code));
+        let cache_control = |path: &'static str| {
+            let app = app.clone();
+            async move {
+                let res = app
+                    .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                res.headers()[header::CACHE_CONTROL]
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+        for own in [
+            "/static/magpie/start.js",
+            "/static/magpie/render.css",
+            "/static/magpie.css",
+            "/static/clock.js",
+        ] {
+            assert_eq!(cache_control(own).await, "no-cache", "{own}");
+        }
+        // The kit's files and the icons keep the long lifetime.
+        for other in [
+            "/static/style.css",
+            "/static/app.js",
+            "/static/favicon.svg",
+            "/static/magpie.css.map",
+        ] {
+            assert_eq!(
+                cache_control(other).await,
+                "public, max-age=3600",
+                "{other}"
+            );
+        }
+    }
 }

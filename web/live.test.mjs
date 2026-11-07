@@ -614,6 +614,37 @@ test("the_age_timer_counts_on_the_servers_clock_not_the_browsers", () => {
   assert.ok(!cardEl(p).hasAttribute("data-stale"), "a fresh reading is not stale");
 });
 
+test("an_ack_answer_does_not_move_the_ages_back", async () => {
+  // The browser's clock is an hour behind the server's, and the reading is ten minutes old.
+  const p = page({ values: { ...valuesFixture(84, { fetchedAt: NOW - 600 }), needs: [NEED] } });
+  p.clock.ms = NOW * 1000 - 3_600_000;
+  draw(p.document);
+  const live = initLive(p.document, p.deps);
+  live.sync();
+  const age = () => cardEl(p).querySelector(".mm-age").textContent;
+  // 30 minutes pass: 40 minutes since the reading.
+  p.clock.ms += 30 * 60 * 1000;
+  p.timers.fireInterval();
+  assert.match(age(), /40/, age());
+  assert.ok(cardEl(p).hasAttribute("data-stale"));
+  // The answer to an acknowledgement carries the needs and no `now`.
+  const needs = initNeeds(p.document, {
+    apply: live.apply,
+    fetch: async () => ({ status: 200, json: async () => ({ needs: [{ ...NEED, acked: true }] }) }),
+  });
+  assert.ok(needs);
+  p.root.querySelector("button.mm-need-ack").dispatchEvent(new p.window.Event("click", { bubbles: true }));
+  await tick();
+  assert.equal(p.root.querySelector(".mm-needs-toggle").textContent, "1 acknowledged", "the answer was applied");
+  assert.match(age(), /40/, `the age stays on the server's clock: ${age()}`);
+  assert.ok(cardEl(p).hasAttribute("data-stale"), "and the card is still stale");
+  // The next tick agrees, and a full redraw (the data block) does too.
+  p.timers.fireInterval();
+  assert.match(age(), /40/, age());
+  draw(p.document);
+  assert.match(age(), /40/, age());
+});
+
 test("showing_the_page_again_brings_the_ages_up_to_date_at_once", () => {
   const p = page({ values: valuesFixture(84, { fetchedAt: NOW - 30 }) });
   draw(p.document);
@@ -729,7 +760,7 @@ const NEED = {
   service_name: "Blog",
   key: "down",
   level: "bad",
-  label: "not answering",
+  label: "down",
   since: NOW - 120,
   acked: false,
 };
@@ -754,7 +785,7 @@ test("an_event_brings_a_need_into_the_row_in_place_and_announces_it_without_movi
   const before = p.focus.count;
   p.ES.all[0].emit("values", { now: NOW + 3, full: false, services: {}, removed: [], needs: [NEED] });
   assert.deepEqual(chipKeys(p), ["down"]);
-  assert.equal(p.root.querySelector(".mm-needs-live").textContent, "Blog: not answering");
+  assert.equal(p.root.querySelector(".mm-needs-live").textContent, "Blog: down");
   assert.equal(p.focus.count, before, "no focus call");
   assert.deepEqual(block(p, "mm-values").needs, [NEED], "the page's data block follows");
   // An event without a needs list leaves the row alone.

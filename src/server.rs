@@ -20,7 +20,8 @@ pub async fn run(config: Config) -> Result<(), crate::StartError> {
         magpie.core.clone(),
         crate::integrations::client().clone(),
         &magpie.service_events,
-    );
+    )
+    .await;
     let magpie = crate::Magpie { poller, ..magpie };
 
     // Open event streams would keep the graceful shutdown waiting for an hour.

@@ -35,6 +35,10 @@ pub enum CtxError {
     /// be entered again.
     #[error("the stored secret can't be opened ({0})")]
     SecretUnreadable(OpenError),
+    /// The service was changed (or deleted) after the caller read it: what
+    /// it holds is no longer what the caller meant to fetch.
+    #[error("the service changed")]
+    Changed,
     #[error(transparent)]
     Db(#[from] DbError),
 }
@@ -328,25 +332,64 @@ pub async fn delete(core: &Core, id: i64) -> Result<bool, DbError> {
     .await
 }
 
-/// The stored secret of service `id`, opened. `None` when there is none.
-pub async fn open_secret(core: &Core, id: i64) -> Result<Option<String>, CtxError> {
-    let sealed: Option<String> = db::interact(&core.db, move |c| {
+/// What the row of a service holds about its secret, read in one query so the
+/// address, the secret and the time of the last change belong together: a
+/// change that lands between two reads can't pair a new key with an old
+/// address.
+#[derive(Debug)]
+pub struct StoredSecret {
+    pub kind: String,
+    pub url: Option<String>,
+    pub updated_at: String,
+    sealed: Option<String>,
+}
+
+impl StoredSecret {
+    /// Whether a secret is stored.
+    pub fn has_secret(&self) -> bool {
+        self.sealed.is_some()
+    }
+
+    /// The secret, opened. `None` when there is none.
+    pub fn open(&self, core: &Core) -> Result<Option<String>, CtxError> {
+        self.sealed
+            .as_deref()
+            .map(|sealed| {
+                sealer(core)
+                    .open(sealed)
+                    .map_err(CtxError::SecretUnreadable)
+            })
+            .transpose()
+    }
+}
+
+/// The kind, address, sealed secret and `updated_at` of service `id`, from one
+/// row. `None` when there is no such service.
+pub async fn stored_secret(core: &Core, id: i64) -> Result<Option<StoredSecret>, DbError> {
+    db::interact(&core.db, move |c| {
         c.query_row(
-            "SELECT secret FROM services WHERE id = ?1",
+            "SELECT kind, url, updated_at, secret FROM services WHERE id = ?1",
             params![id],
-            |r| r.get(0),
+            |r| {
+                Ok(StoredSecret {
+                    kind: r.get(0)?,
+                    url: r.get(1)?,
+                    updated_at: r.get(2)?,
+                    sealed: r.get(3)?,
+                })
+            },
         )
         .optional()
-        .map(Option::flatten)
     })
-    .await?;
-    sealed
-        .map(|sealed| {
-            sealer(core)
-                .open(&sealed)
-                .map_err(CtxError::SecretUnreadable)
-        })
-        .transpose()
+    .await
+}
+
+/// The stored secret of service `id`, opened. `None` when there is none.
+pub async fn open_secret(core: &Core, id: i64) -> Result<Option<String>, CtxError> {
+    match stored_secret(core, id).await? {
+        Some(stored) => stored.open(core),
+        None => Ok(None),
+    }
 }
 
 impl CtxError {
@@ -354,21 +397,28 @@ impl CtxError {
     pub fn fetch_error(&self) -> FetchError {
         match self {
             CtxError::SecretUnreadable(_) => FetchError::SecretUnreadable,
-            CtxError::Db(_) => FetchError::Other,
+            CtxError::Changed | CtxError::Db(_) => FetchError::Other,
         }
     }
 }
 
 /// What a fetch of `service` needs: the shared client, its settings with the
-/// address added as `"url"`, and its secret, opened.
+/// address added as `"url"`, and its secret, opened. The address and the secret
+/// come from one row, and [`CtxError::Changed`] answers when that row is not the
+/// `service` the caller holds (changed or deleted since it was read), so a new
+/// key is never sent to an old address or the other way round.
 pub async fn fetch_ctx(core: &Core, service: &Service) -> Result<FetchCtx, CtxError> {
+    let stored = stored_secret(core, service.id)
+        .await?
+        .filter(|stored| stored.updated_at == service.updated_at)
+        .ok_or(CtxError::Changed)?;
     let secret = if service.has_secret {
-        open_secret(core, service.id).await?
+        stored.open(core)?
     } else {
         None
     };
     let mut settings = service.settings.as_object().cloned().unwrap_or_default();
-    if let Some(url) = &service.url {
+    if let Some(url) = &stored.url {
         settings.insert("url".into(), Json::String(url.clone()));
     }
     Ok(FetchCtx {

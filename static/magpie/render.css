@@ -368,7 +368,8 @@ a.mm-card {
   max-width: 100%;
   padding: 0.1875rem 0.1875rem 0.1875rem 0.625rem;
   border: 1px solid var(--line-strong);
-  border-radius: 1.125rem;
+  /* A pill when it is one line, a rounded box when the chip breaks onto more. */
+  border-radius: 1rem;
 }
 .mm-need[data-level="bad"] {
   border-color: var(--bad-text);
@@ -384,11 +385,48 @@ a.mm-card {
   flex-wrap: wrap;
   align-items: center;
   gap: 0 0.375rem;
+  /* Takes the room the button leaves, so the parts below break onto a line of their own
+     before they get narrower than their words. */
+  flex: 1 1 auto;
   min-width: 0;
   color: var(--text);
   font-size: 0.8125rem;
   text-decoration: none;
   overflow-wrap: anywhere;
+}
+/* The parts of a chip: the name, the text and the age. Each part moves to the next line as a whole
+   when the chip is too narrow; a separator stays at the end of the part before it. */
+.mm-need-lead,
+.mm-need-main {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.375rem;
+  min-width: 0;
+  max-width: 100%;
+}
+/* The name never shrinks below its words (a one-letter name does not wrap letter by letter); a name
+   wider than the whole chip is cut with an ellipsis. */
+.mm-need-lead {
+  flex: none;
+  align-items: center;
+  white-space: nowrap;
+}
+.mm-need-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* The text breaks inside only when it alone is wider than the chip. */
+.mm-need-main {
+  flex: 0 1 auto;
+  overflow-wrap: normal;
+}
+.mm-need-text {
+  min-width: 0;
+  overflow-wrap: break-word;
+}
+.mm-need-sep {
+  flex: none;
 }
 @media (hover: hover) and (pointer: fine) {
   a.mm-need-chip:hover {
@@ -400,6 +438,7 @@ a.mm-card {
   color: var(--muted);
 }
 .mm-need-age {
+  flex: none;
   white-space: nowrap;
 }
 .mm-need-ack,

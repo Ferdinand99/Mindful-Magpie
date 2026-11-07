@@ -665,13 +665,19 @@ export function initLive(doc, deps = {}) {
 
   /** Takes an update (an event's data) into the page: the blocks first, then the cards. */
   function apply(update) {
-    const { values } = mergeValues(readJson(doc, "mm-values"), update);
+    let { values } = mergeValues(readJson(doc, "mm-values"), update);
+    // An update without a `now` (the answer to an acknowledgement) keeps the block's old
+    // one: ages would be counted from it, and look too young. Count them from the server's
+    // clock as it is now, as this page learned it; the clock itself is only learned from an
+    // update that says what time it is.
+    const stamped = toMs(update?.now) !== null;
+    if (!stamped && offset !== null) values = { ...values, now: (now() + offset) / 1000 };
     writeBlock(doc, "mm-values", values);
     const listed = readJson(doc, "mm-services");
     if (Array.isArray(listed)) {
       writeBlock(doc, "mm-services", mergeServices(listed, values, update.services_visible, update.services_add));
     }
-    learnClock(values);
+    if (stamped) learnClock(values);
     // Edit mode owns the page; the blocks are current for when it ends.
     if (editing()) return;
     const root = rootEl();

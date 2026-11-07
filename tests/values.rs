@@ -1,4 +1,4 @@
-//! Service values on the start page (Plan 4, task 4): the `#mm-values` embed,
+//! Service values on the start page: the `#mm-values` embed,
 //! the `GET /start/live` event stream and `GET /api/v1/me/values`.
 //!
 //! The stream tests run on a paused clock (the stream waits a quiet second
@@ -740,7 +740,7 @@ async fn an_unbound_or_hidden_service_never_makes_an_event() {
         live.nothing().await;
     }
     // Removal of one he has no card for says nothing either.
-    w.app.magpie.poller.remove(hidden);
+    w.app.magpie.poller.remove_for_tests(hidden);
     live.nothing().await;
 }
 
@@ -846,7 +846,7 @@ async fn a_deleted_service_is_removed() {
     tokio::time::pause();
 
     store::delete(&w.app.magpie.core, w.a).await.unwrap();
-    w.app.magpie.poller.remove(w.a);
+    w.app.magpie.poller.remove_for_tests(w.a);
     let update = live.event().await;
     assert_eq!(update["removed"], json!([w.a]));
     assert_eq!(update["services"], json!({}));

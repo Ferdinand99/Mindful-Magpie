@@ -1338,6 +1338,81 @@ async fn upgrading_from_the_schema_of_main_applies_only_the_new_migrations() {
 }
 
 #[tokio::test]
+async fn upgrading_from_the_schema_before_services_applies_only_0006_to_0008() {
+    // A database as 0005 left it: no services, snapshots or acknowledgements,
+    // but a layout and a token. This build adds 0006 to 0008 and nothing else.
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    let uid = user_id(&app, "ada").await;
+    save_layout(
+        &mut web,
+        &layout_with(0, json!({ "kind": "preset", "name": "hav" })),
+    )
+    .await;
+    let token = make_token(&app, uid, TokenScope::Read, "ext").await;
+    let applied = app.count("SELECT COUNT(*) FROM schema_migrations").await;
+    app.exec(
+        "DROP TABLE acks;
+         DROP TABLE service_snapshots;
+         DROP TABLE service_users;
+         DROP TABLE services;
+         DELETE FROM schema_migrations WHERE name LIKE '%0006_services%'
+                                          OR name LIKE '%0007_snapshots%'
+                                          OR name LIKE '%0008_acks%';"
+            .to_string(),
+    )
+    .await;
+    assert_eq!(
+        app.count("SELECT COUNT(*) FROM schema_migrations").await,
+        applied - 3
+    );
+    drop(web);
+
+    let app = app.restart().await;
+    // The three new migrations ran, once each, and no other was applied again.
+    assert_eq!(
+        app.count("SELECT COUNT(*) FROM schema_migrations").await,
+        applied
+    );
+    for (name, sql) in [
+        (
+            "0006",
+            "SELECT COUNT(*) FROM schema_migrations WHERE name LIKE '%0006_services%'",
+        ),
+        (
+            "0007",
+            "SELECT COUNT(*) FROM schema_migrations WHERE name LIKE '%0007_snapshots%'",
+        ),
+        (
+            "0008",
+            "SELECT COUNT(*) FROM schema_migrations WHERE name LIKE '%0008_acks%'",
+        ),
+    ] {
+        assert_eq!(app.count(sql).await, 1, "{name}");
+    }
+    // The new tables are there and empty; the old rows are untouched.
+    for (table, sql) in [
+        ("services", "SELECT COUNT(*) FROM services"),
+        ("service_users", "SELECT COUNT(*) FROM service_users"),
+        (
+            "service_snapshots",
+            "SELECT COUNT(*) FROM service_snapshots",
+        ),
+        ("acks", "SELECT COUNT(*) FROM acks"),
+    ] {
+        assert_eq!(app.count(sql).await, 0, "{table}");
+    }
+    assert_eq!(app.count("SELECT COUNT(*) FROM layouts").await, 1);
+    assert_eq!(app.count("SELECT COUNT(*) FROM api_tokens").await, 1);
+    let res = bearer_get(&app, "/api/v1/me/start", &token).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(
+        res.json()["background"],
+        json!({ "kind": "preset", "name": "hav" })
+    );
+}
+
+#[tokio::test]
 async fn a_read_token_cannot_save_upload_or_delete() {
     // An API token (here with read scope; a write scope is no different on
     // these routes) works under /api/ only. Sent alone, without the session

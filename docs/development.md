@@ -29,7 +29,7 @@ src/
 templates/            # Magpie's pages (extend kit/layout.html)
 static/               # favicon, icons, web manifest, magpie.css, clock.js
 static/magpie/        # the start page scripts (ES modules: render.js is the shared renderer, edit.js is edit mode with ops.js and rules.js) and render.css
-web/                  # JavaScript tests (node --test, linkedom): render*, ops, rules, edit (edit mode, the page wiring in start.js), extension-*; build-extension.mjs and kit-tokens.css; dev-only
+web/                  # JavaScript tests (node --test, linkedom): render, render-start, render-values and render-needs (the renderer: cards, live numbers, the «Trenger deg» row), live (the event stream, the ages, the acknowledge buttons), ops, rules, edit (edit mode, the page wiring in start.js) and the extension tests (extension-*: state, options, connect, newtab, render, values, vendor); build-extension.mjs and kit-tokens.css; dev-only
 extension/            # the Firefox extension; extension/vendor/ is generated from static/magpie/ and web/kit-tokens.css
 migrations/           # Magpie's migrations (0001 init, 0002 layouts, 0003 extension codes, 0004 backgrounds, 0005 kept background, 0006 services, 0007 snapshots, 0008 acks)
 locales/              # Magpie's strings (en, nb)
@@ -50,10 +50,10 @@ Builds and tests run in Docker on a build host (a shared Docker daemon), not on 
 cargo commands that run inside a Rust 1.99 container with clippy and rustfmt installed.
 
 ```bash
-cargo test --locked                                  # 296 Rust tests: boot, auth and users, start page, layout, backgrounds and migrations, extension API and connect flow, services, the poller
+cargo test --locked                                  # 304 Rust tests: boot, auth and users, start page, layout, backgrounds and migrations, extension API and connect flow, services, the poller
 cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --all --check
-cd web && npm ci && node --test                     # 418 JavaScript tests: renderer, operations, rules, edit mode and page wiring, the extension (node:22 container; linkedom stands in for the DOM)
+cd web && npm ci && node --test                     # 424 JavaScript tests: renderer, live numbers and needs, operations, rules, edit mode and page wiring, the extension (node:22 container; linkedom stands in for the DOM)
 cd web && npm run build:extension                    # copies the renderer into extension/vendor/; git must show no change
 docker build -t magpie:dev .
 docker run --rm magpie:dev --help     # every flag and its MM_ variable

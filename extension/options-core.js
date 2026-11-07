@@ -85,13 +85,15 @@ async function finishCheck(request, fetchImpl, parsed, token) {
 }
 
 // Saves server and token. The cache (layout, service values and the old-server back-off) belongs to
-// one server and one token, so it is dropped when either changes.
+// one server and one token, so it is dropped when either changes. The new settings are stored
+// first: an open tab that sees them stops writing at once (newtab-core.js checks them before every
+// write), so nothing from the old server can land in the cache after it is cleared.
 async function persist(storage, serverUrl, token) {
   const previous = await storage.local.get(["serverUrl", "token"]);
+  await storage.local.set({ serverUrl, token });
   if (previous.serverUrl !== serverUrl || previous.token !== token) {
     await storage.local.remove(["last", "lastValues", "valuesMissing"]);
   }
-  await storage.local.set({ serverUrl, token });
 }
 
 // Tests the connection and saves the settings only when the test succeeds.
