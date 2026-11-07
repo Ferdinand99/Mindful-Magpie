@@ -46,11 +46,15 @@ pub struct App {
     pub magpie: Magpie,
     pub router: Router,
     pub dir: PathBuf,
+    /// Leave the data directory in place on drop (a restart reuses it).
+    keep_dir: bool,
 }
 
 impl Drop for App {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if !self.keep_dir {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -62,12 +66,27 @@ impl App {
             N.fetch_add(1, Ordering::SeqCst)
         ));
         let _ = std::fs::remove_dir_all(&dir);
+        App::open(dir).await
+    }
+
+    /// Starts a Magpie on `dir` (new or existing data).
+    async fn open(dir: PathBuf) -> App {
         let magpie = mindful_magpie::start(&dir, None).await.unwrap();
         App {
             router: mindful_magpie::router(magpie.clone()),
             magpie,
             dir,
+            keep_dir: false,
         }
+    }
+
+    /// Stops this Magpie and starts a new one on the same data directory,
+    /// as a process restart does.
+    pub async fn restart(mut self) -> App {
+        self.keep_dir = true;
+        let dir = self.dir.clone();
+        drop(self);
+        App::open(dir).await
     }
 
     /// Sends `req` as a program would (no cookies).

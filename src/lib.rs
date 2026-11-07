@@ -3,12 +3,13 @@
 //! Sign-in, setup, users, API tokens, Security, General and the API reference
 //! come from vole-kit. This crate is the skeleton: the product configuration,
 //! the database with its own migration set, the process configuration and the
-//! router. The kit's routers are mounted in [`router`].
+//! router, which mounts the kit's routers (see [`router`]).
 
 #![forbid(unsafe_code)]
 
 pub mod config;
 pub mod db;
+pub mod pages;
 pub mod product;
 pub mod server;
 
@@ -17,7 +18,7 @@ use std::path::Path;
 use axum::middleware::{from_fn, from_fn_with_state};
 use axum::routing::get;
 use axum::{Extension, Router};
-use vole_kit::auth::guard;
+use vole_kit::auth::{guard, pages as kit_pages};
 use vole_kit::db::settings;
 use vole_kit::http::headers;
 use vole_kit::state::Core;
@@ -71,13 +72,17 @@ pub async fn start(data_dir: &Path, public_url: Option<&str>) -> Result<Magpie, 
 /// health probe, behind the kit's middleware.
 pub fn router(magpie: Magpie) -> Router {
     let core = magpie.core.clone();
-    // Pages that need a signed-in user. The kit's routers and the start page
-    // are merged here, then `.route_layer(from_fn_with_state(core.clone(),
-    // guard::require_auth))` guards them (axum refuses a layer on no routes).
-    let protected: Router<Core> = Router::new();
+    // Pages that need a signed-in user: Magpie's own, then the kit's
+    // (settings, users, tokens, API reference). Sign-in guards them all.
+    let protected = Router::new()
+        .merge(pages::router())
+        .merge(kit_pages::router())
+        .route_layer(from_fn_with_state(core.clone(), guard::require_auth));
+    // Sign-in, first-run setup, logout, health and static files.
     let public = Router::new()
         .route("/healthz", get(vole_kit::http::healthz))
-        .route("/static/{*path}", get(vole_kit::http::assets::static_asset));
+        .route("/static/{*path}", get(vole_kit::http::assets::static_asset))
+        .merge(kit_pages::public_router());
     protected
         .merge(public)
         .fallback(vole_kit::http::error::not_found)

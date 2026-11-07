@@ -1,0 +1,10 @@
+{% extends "kit/layout.html" %}
+{% import "kit/macros.html" as m %}
+
+{% block head %}
+  <link rel="stylesheet" href="/static/magpie.css">
+{% endblock %}
+
+{% block content %}
+{% call m::page_header(tr("start.title"), tr("start.sub")) %}{% endcall %}
+{% endblock %}

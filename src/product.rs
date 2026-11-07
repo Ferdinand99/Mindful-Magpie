@@ -1,6 +1,7 @@
 //! What makes this build Mindful Magpie as far as vole-kit is concerned:
 //! names, cookies, token prefixes, migrations, translations, API reference,
-//! the settings tabs, the webhook's words and what the shared layouts show.
+//! the settings tabs and what the shared layouts show. (`webhook` is a field
+//! the kit requires; Magpie sends no webhooks.)
 
 use rust_embed::Embed;
 use vole_kit::config::KitConfig;

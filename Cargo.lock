@@ -1552,6 +1552,7 @@ version = "0.0.0"
 dependencies = [
  "askama",
  "axum",
+ "axum-extra",
  "clap",
  "reqwest",
  "rusqlite",
