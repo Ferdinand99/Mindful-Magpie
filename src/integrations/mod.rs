@@ -24,6 +24,7 @@
 //! [`FetchError`]'s texts are a closed set plus an HTTP status.
 
 pub mod api;
+pub mod block;
 pub mod github;
 pub mod http_kind;
 pub mod kk;
@@ -46,6 +47,10 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use vole_kit::net::{Forbidden, GuardedResolver, check_host};
+
+use crate::layout::Size;
+
+pub use block::Block;
 
 /// A boxed future, so [`Integration`] can be used as a trait object.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -79,6 +84,11 @@ pub trait Integration: Send + Sync + 'static {
     /// own site (GitHub). `None`: the origin of the service's address.
     fn default_link(&self) -> Option<&'static str> {
         None
+    }
+    /// The size a card of a service of this kind has when the person has not
+    /// chosen one: wide for the kinds that have a lot to show.
+    fn default_size(&self) -> Size {
+        Size::Normal
     }
     /// Whether a service of this kind needs an address (`services.url`).
     fn url_required(&self) -> bool {
@@ -234,6 +244,11 @@ pub struct Snapshot {
     pub values: BTreeMap<String, Value>,
     #[serde(default)]
     pub needs: Vec<Need>,
+    /// Lists, bars and the like drawn next to the numbers (see [`block`]).
+    /// A kind fills them; the poller cuts them down ([`Snapshot::bound_details`])
+    /// before the snapshot is stored.
+    #[serde(default)]
+    pub details: Vec<Block>,
     pub fetched_at: Timestamp,
     /// A short reason when the fetch failed or the service is not well. Never
     /// contains a secret, a header or a URL (see [`FetchError`]).
@@ -248,9 +263,29 @@ impl Snapshot {
             status,
             values: BTreeMap::new(),
             needs: Vec::new(),
+            details: Vec::new(),
             fetched_at: Timestamp::now(),
             error: None,
         }
+    }
+
+    /// The same reading with `details` (what a kind's fetch sets, and what a
+    /// test sets to have blocks without a kind). They are cut down by the
+    /// poller, not here.
+    #[must_use]
+    pub fn with_details(mut self, details: Vec<Block>) -> Self {
+        self.details = details;
+        self
+    }
+
+    /// Cuts the details down to the limits ([`Block::bounded`]; at most
+    /// [`block::MAX_BLOCKS`] blocks, a block with nothing left goes).
+    pub fn bound_details(&mut self) {
+        self.details = std::mem::take(&mut self.details)
+            .into_iter()
+            .filter_map(Block::bounded)
+            .take(block::MAX_BLOCKS)
+            .collect();
     }
 
     /// A bad reading that says why.

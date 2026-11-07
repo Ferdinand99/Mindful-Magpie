@@ -14,7 +14,10 @@ export const LIMITS = {
   title: 80,
   groupTitle: 60,
   description: 160,
-  serviceMetrics: 4,
+  // A ceiling above the largest catalogue of any kind (the server's MAX_METRICS): a card may
+  // name any number of its kind's metrics, one up to all, each once. Which names exist is the
+  // server's to say.
+  serviceMetrics: 32,
   metricId: 40,
   url: 2048,
   emojiBytes: 64,
@@ -116,6 +119,16 @@ export function emojiProblem(emoji) {
   return null;
 }
 
+/** The sizes a card can have; a card with none takes the size of its service's kind. */
+export const SIZES = ["normal", "wide"];
+
+/** The code for a size the server would refuse (`bad_size`), or null. Only a card with a service has one. */
+export function sizeProblem(size, service) {
+  if (size === null || size === undefined) return null;
+  if (!SIZES.includes(size)) return "bad_size";
+  return service ? null : "bad_size";
+}
+
 /**
  * The code for a service binding the server would refuse, or null (none is
  * fine). `service` is `{ id, metrics }` or null. Mirrors `validate` in
@@ -146,7 +159,8 @@ export function checkGroup({ title }) {
 }
 
 /**
- * `values`: `title`, `description`, `url`, `emoji` ("" for none), `colour`, and `service` (`{ id, metrics }` or null).
+ * `values`: `title`, `description`, `url`, `emoji` ("" for none), `colour`, `service` (`{ id, metrics }` or null)
+ * and `size` ("normal", "wide" or null for the kind's own; only with a service).
  * The link may be empty when there is a service, and only then.
  */
 export function checkCard(values) {
@@ -158,6 +172,7 @@ export function checkCard(values) {
     emoji: emojiProblem(values.emoji),
     colour: PALETTE.includes(values.colour) ? null : "bad_colour",
     service: serviceProblem(values.service),
+    size: sizeProblem(values.size, values.service),
   });
 }
 

@@ -12,6 +12,7 @@ use vole_kit::state::Core;
 
 use super::{ServiceSummary, Viewer, store};
 use crate::integrations::{self, Format};
+use crate::layout::Size;
 
 /// One metric a card can show, with its label in the request's language.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -38,6 +39,8 @@ pub struct ServiceView {
     /// Where a card of the service links when it has no link of its own.
     /// Empty when the service has no link and no address.
     pub link: String,
+    /// The size a card of this service has when its card names none.
+    pub size: Size,
 }
 
 /// The services `viewer` may see, by name, with their metrics. Labels come in
@@ -68,6 +71,7 @@ pub fn view_of(s: &ServiceSummary) -> ServiceView {
                 .collect()
         })
         .unwrap_or_default();
+    let size = integrations::find(&s.kind).map_or(Size::Normal, |kind| kind.default_size());
     ServiceView {
         id: s.id,
         name: s.name.clone(),
@@ -75,5 +79,6 @@ pub fn view_of(s: &ServiceSummary) -> ServiceView {
         interval_s: s.interval_s,
         metrics,
         link: s.link.clone(),
+        size,
     }
 }

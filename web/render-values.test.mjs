@@ -116,6 +116,10 @@ function draw(card, opts = {}, lang = EN) {
   return { ...p, card: p.root.querySelector(".mm-card") };
 }
 
+// A card is a box; its title is the link (stretched over the card by the style sheet).
+const linkOf = (el) => el.querySelector(".mm-card-link");
+const hrefOf = (el) => linkOf(el)?.getAttribute("href") ?? null;
+
 const cells = (card) =>
   [...card.querySelectorAll(".mm-metric")].map((c) => [
     c.querySelector(".mm-metric-label").textContent,
@@ -254,7 +258,7 @@ test("a_bound_card_draws_its_cells_in_order_in_english", () => {
     ["CPU", "4.3%"],
     ["Memory", "1.5 GiB"],
   ]);
-  assert.equal(card.getAttribute("href"), "https://nas.example/");
+  assert.equal(hrefOf(card), "https://nas.example/");
   assert.equal(card.querySelector(".mm-card-title").textContent, "Storage");
   assert.ok(card.querySelector(".mm-tile"), "the tile is still drawn");
   assert.equal(card.getAttribute("data-service"), "7");
@@ -275,13 +279,14 @@ test("a_bound_card_draws_its_cells_in_norwegian", () => {
   assert.match(card.querySelector(".mm-age").textContent, /for 2 min.* siden/);
 });
 
-test("up_to_four_cells_and_no_more", () => {
-  const { card } = draw(bound(["cpu", "mem", "up", "net", "seen", "note"]));
-  assert.equal(cells(card).length, 4);
+test("every_chosen_metric_is_a_cell_and_there_is_no_cap", () => {
+  const { card } = draw(bound(["cpu", "mem", "up", "net", "seen", "note", "count"]));
+  assert.equal(cells(card).length, 7);
   assert.deepEqual(
     cells(card).map(([label]) => label),
-    ["CPU", "Memory", "Uptime", "Traffic"],
+    ["CPU", "Memory", "Uptime", "Traffic", "Seen", "Note", "Files"],
   );
+  assert.equal(card.querySelector(".mm-metrics").getAttribute("data-count"), "7");
   const ok = draw(bound(["seen", "note", "count", "net"])).card;
   assert.match(cells(ok)[0][1], /2 min/);
   assert.deepEqual(cells(ok).slice(1), [
@@ -372,8 +377,9 @@ test("tick_ages_ignores_cards_that_have_no_age", () => {
 
 test("a_service_that_is_gone_shows_its_notice_and_keeps_the_link", () => {
   const { card } = draw(bound(["cpu"]), { services: [] });
-  assert.equal(card.tagName, "A");
-  assert.equal(card.getAttribute("href"), "https://nas.example/");
+  assert.equal(card.tagName, "DIV");
+  assert.equal(linkOf(card).tagName, "A");
+  assert.equal(hrefOf(card), "https://nas.example/");
   assert.equal(card.querySelector(".mm-svc-notice").textContent, "This service no longer exists");
   assert.equal(card.querySelectorAll(".mm-metric").length, 0);
   const nb = draw(bound(["cpu"]), { services: [] }, NB).card;
@@ -493,10 +499,10 @@ test("drawing_never_moves_focus", () => {
   assert.equal(odd.length, 0);
 });
 
-// The output of the renderer before cards could be bound, for a fixed layout (captured from
-// render.js at the commit before this feature).
+// The output of the renderer for a fixed layout of plain cards (the card is a box and its title is the
+// link since cards can hold links of their own; the rest is as it was before cards could be bound).
 const GOLDEN =
-  '<section class="mm-group"><h2 aria-label="Group: Media" dir="auto" class="mm-group-title">Media</h2><div class="mm-cards"><a rel="noreferrer" href="https://sonarr.example/" class="mm-card glass"><span aria-hidden="true" data-colour="teal" class="mm-tile">S</span><span class="mm-card-text"><span dir="auto" class="mm-card-title">Sonarr</span><span dir="auto" class="mm-card-desc">Series</span></span></a><a rel="noreferrer" href="http://radarr.example/" class="mm-card glass"><span aria-hidden="true" data-colour="indigo" class="mm-tile">🎬</span><span class="mm-card-text"><span dir="auto" class="mm-card-title">Radarr</span></span></a><div class="mm-card mm-card-invalid glass"><span aria-hidden="true" data-colour="teal" class="mm-tile">B</span><span class="mm-card-text"><span dir="auto" class="mm-card-title">Broken</span><span class="mm-invalid">invalid link</span></span></div></div></section><section class="mm-group"><h2 aria-label="Group: Dev" dir="auto" class="mm-group-title">Dev</h2><div class="mm-cards"></div></section><nav aria-label="Bookmarks" class="mm-bookmarks"><a rel="noreferrer" href="https://hedgerow.tools/" dir="auto" class="mm-pill">Hedgerow</a></nav>';
+  '<section class="mm-group"><h2 aria-label="Group: Media" dir="auto" class="mm-group-title">Media</h2><div class="mm-cards"><div class="mm-card glass"><span aria-hidden="true" data-colour="teal" class="mm-tile">S</span><span class="mm-card-text"><a rel="noreferrer" href="https://sonarr.example/" dir="auto" class="mm-card-title mm-card-link">Sonarr</a><span dir="auto" class="mm-card-desc">Series</span></span></div><div class="mm-card glass"><span aria-hidden="true" data-colour="indigo" class="mm-tile">🎬</span><span class="mm-card-text"><a rel="noreferrer" href="http://radarr.example/" dir="auto" class="mm-card-title mm-card-link">Radarr</a></span></div><div class="mm-card mm-card-invalid glass"><span aria-hidden="true" data-colour="teal" class="mm-tile">B</span><span class="mm-card-text"><span dir="auto" class="mm-card-title">Broken</span><span class="mm-invalid">invalid link</span></span></div></div></section><section class="mm-group"><h2 aria-label="Group: Dev" dir="auto" class="mm-group-title">Dev</h2><div class="mm-cards"></div></section><nav aria-label="Bookmarks" class="mm-bookmarks"><a rel="noreferrer" href="https://hedgerow.tools/" dir="auto" class="mm-pill">Hedgerow</a></nav>';
 
 function plainLayout(service) {
   const c = (id, title, url, extra = {}) => ({
@@ -724,14 +730,14 @@ test("update_values_keeps_the_card_element_and_swaps_the_numbers", () => {
   assert.equal(link.isConnected, true);
   assert.ok(link.querySelector(".mm-tile") === tile);
   assert.ok(link.querySelector(".mm-card-text") === body);
-  assert.ok(link.querySelector(".mm-svc") !== oldSvc, "only the service part is new");
+  assert.ok(link.querySelector(".mm-svc") === oldSvc, "the service part is changed in place");
   assert.equal(link.querySelectorAll(".mm-svc").length, 1);
   assert.deepEqual(cells(link), [
     ["CPU", "55%"],
     ["Memory", "1.0 KiB"],
   ]);
   assert.equal(link.hasAttribute("data-stale"), false);
-  assert.equal(link.getAttribute("href"), "https://nas.example/");
+  assert.equal(hrefOf(link), "https://nas.example/");
   assert.deepEqual(calls, [], "no focus call");
 });
 
@@ -762,7 +768,7 @@ test("update_values_handles_waiting_and_a_vanished_service_in_place", () => {
   updateValues(p.root, layout, { ...EN, services: [], values: valuesDoc() });
   assert.ok(p.root.querySelector(".mm-card") === link);
   assert.equal(link.querySelector(".mm-svc-notice").textContent, "This service no longer exists");
-  assert.equal(link.getAttribute("href"), "https://nas.example/");
+  assert.equal(hrefOf(link), "https://nas.example/");
 });
 
 test("update_values_redraws_only_a_card_whose_binding_changed", () => {
@@ -885,35 +891,36 @@ function drawLinked(card, services, lang = EN) {
 
 test("a_bound_card_without_a_link_opens_the_link_of_its_service", () => {
   const el = drawLinked(linkCard(""), withLink("https://nas.example:8443"));
-  assert.equal(el.tagName, "A");
-  assert.equal(el.getAttribute("href"), "https://nas.example:8443/");
+  assert.equal(el.tagName, "DIV");
+  assert.equal(linkOf(el).tagName, "A");
+  assert.equal(hrefOf(el), "https://nas.example:8443/");
   assert.equal(el.querySelector(".mm-invalid"), null);
   // The same card in Norwegian.
   const nb = drawLinked(linkCard(""), withLink("https://nas.example:8443"), NB);
-  assert.equal(nb.getAttribute("href"), "https://nas.example:8443/");
+  assert.equal(hrefOf(nb), "https://nas.example:8443/");
 });
 
 test("the_cards_own_link_always_wins_over_the_service_link", () => {
   const el = drawLinked(linkCard("https://own.example/page"), withLink("https://nas.example/"));
-  assert.equal(el.getAttribute("href"), "https://own.example/page");
+  assert.equal(hrefOf(el), "https://own.example/page");
   // Also when the own link is bad: the card is invalid, it does not borrow the service's.
   const bad = drawLinked(linkCard("javascript:alert(1)"), withLink("https://nas.example/"));
   assert.equal(bad.tagName, "DIV");
-  assert.equal(bad.hasAttribute("href"), false);
+  assert.equal(linkOf(bad), null);
   assert.ok(bad.querySelector(".mm-invalid"));
 });
 
 test("a_bound_card_whose_service_is_gone_has_no_link_and_says_so", () => {
   const el = drawLinked(linkCard(""), [{ id: 99, name: "Other", kind: "http", interval_s: 60, link: "https://x.example/", metrics: [] }]);
   assert.equal(el.tagName, "DIV");
-  assert.equal(el.hasAttribute("href"), false);
+  assert.equal(linkOf(el), null);
   assert.equal(el.querySelector(".mm-svc-notice").textContent, LABELS_EN.service_missing);
   // Not marked as an invalid link: there is just no link.
   assert.equal(el.querySelector(".mm-invalid"), null);
   assert.equal(el.classList.contains("mm-card-invalid"), false);
   // With its own link a gone service still leaves the link.
   const own = drawLinked(linkCard("https://own.example/"), []);
-  assert.equal(own.getAttribute("href"), "https://own.example/");
+  assert.equal(hrefOf(own), "https://own.example/");
   assert.equal(own.querySelector(".mm-svc-notice").textContent, LABELS_EN.service_missing);
 });
 
@@ -921,7 +928,7 @@ test("a_service_with_no_usable_link_gives_a_card_without_one", () => {
   for (const link of ["", undefined, null, "javascript:alert(1)", "ftp://x/", 5]) {
     const el = drawLinked(linkCard(""), withLink(link));
     assert.equal(el.tagName, "DIV", String(link));
-    assert.equal(el.hasAttribute("href"), false, String(link));
+    assert.equal(linkOf(el), null, String(link));
     assert.equal(el.querySelector(".mm-invalid"), null, String(link));
   }
 });
@@ -931,12 +938,12 @@ test("a_changed_service_link_redraws_the_card_in_place", () => {
   const layout = layoutWith(linkCard(""));
   const opts = { ...EN, services: withLink("https://nas.example/"), values: valuesDoc() };
   render(p.root, layout, opts);
-  assert.equal(p.root.querySelector(".mm-card").getAttribute("href"), "https://nas.example/");
+  assert.equal(hrefOf(p.root.querySelector(".mm-card")), "https://nas.example/");
   const done = updateValues(p.root, layout, { ...opts, services: withLink("https://other.example/") });
   assert.equal(done, true);
-  assert.equal(p.root.querySelector(".mm-card").getAttribute("href"), "https://other.example/");
+  assert.equal(hrefOf(p.root.querySelector(".mm-card")), "https://other.example/");
   updateValues(p.root, layout, { ...opts, services: withLink("") });
-  assert.equal(p.root.querySelector(".mm-card").hasAttribute("href"), false);
+  assert.equal(linkOf(p.root.querySelector(".mm-card")), null);
 });
 
 test("a_bound_card_keeps_its_rows_at_the_top_when_the_row_of_cards_is_taller", () => {

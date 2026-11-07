@@ -606,3 +606,103 @@ async fn magpies_own_scripts_and_styles_are_revalidated_not_kept_for_an_hour() {
         assert_eq!(again.header("etag"), etag, "{path}");
     }
 }
+
+/// The `[detail]` section of a locale file: its keys.
+fn detail_keys(lang: &str) -> Vec<String> {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("locales/{lang}.toml"));
+    let toml = std::fs::read_to_string(path).unwrap();
+    let mut inside = false;
+    let mut keys = Vec::new();
+    for line in toml.lines() {
+        if line.starts_with('[') {
+            inside = line.trim() == "[detail]";
+        } else if inside {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            // Nothing in the section may be left unread (a text over two lines,
+            // a key with dashes): the extension's generated copy and this test
+            // would both miss it.
+            let (key, value) = line
+                .split_once(" = ")
+                .unwrap_or_else(|| panic!("{lang}: cannot read the [detail] line {line:?}"));
+            assert!(
+                !key.is_empty()
+                    && key
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                "{lang}: [detail] key {key:?} is not lower-case letters, digits and underscores"
+            );
+            assert!(
+                value.len() >= 2 && value.starts_with('"') && value.ends_with('"'),
+                "{lang}: [detail] {key} is not one quoted line"
+            );
+            keys.push(key.to_string());
+        }
+    }
+    keys
+}
+
+/// The keys the kit has under `[detail]` itself.
+const KIT_DETAIL_KEYS: [&str; 2] = ["expires", "request"];
+
+#[tokio::test]
+async fn every_detail_key_starts_with_the_id_of_a_kind() {
+    let _app = App::new().await;
+    let kinds: Vec<&str> = mindful_magpie::integrations::registry()
+        .iter()
+        .map(|k| k.kind())
+        .collect();
+    for key in detail_keys("en") {
+        assert!(
+            !KIT_DETAIL_KEYS.contains(&key.as_str()),
+            "{key} is a key of the kit's"
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|kind| key.starts_with(&format!("{kind}_"))),
+            "[detail] {key} must start with the id of a kind and an underscore ({kinds:?}), so that kinds and the kit do not collide"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_labels_carry_the_block_strings_and_every_detail_key() {
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    // Both languages name the same detail keys. (The kit has two keys of its own under the same
+    // heading, `expires` and `request`; they are carried too, and a kind must not reuse them.)
+    let keys = detail_keys("en");
+    assert_eq!(keys, detail_keys("nb"));
+    for lang in ["en", "nb"] {
+        let res = start_page(&mut web, lang).await;
+        let labels = json_block(&res.body, "mm-labels");
+        let more = labels["block_more"].as_str().unwrap();
+        assert!(more.contains("{n}"), "{lang}: {more}");
+        for key in &keys {
+            let text = labels[format!("detail.{key}").as_str()]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                !text.is_empty() && !text.starts_with("detail."),
+                "{lang}: no text for detail.{key}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_detail_key_is_known_when_the_locale_has_its_text() {
+    use mindful_magpie::integrations::block::{key_known, key_shape};
+    let _app = App::new().await;
+    for key in detail_keys("en") {
+        assert!(key_shape(&key), "{key} is shaped like a key");
+        assert!(key_known(&key), "{key} is known");
+    }
+    assert!(!key_known("no_such_key_in_the_locale"));
+    assert!(!key_known("Bad Shape"));
+    assert!(!key_known(""));
+}

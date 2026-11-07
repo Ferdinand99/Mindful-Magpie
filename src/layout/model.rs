@@ -30,8 +30,12 @@ pub const MAX_ID: usize = 40;
 /// of combining marks.
 pub const MAX_EMOJI_BYTES: usize = 64;
 
-/// The most numbers one card shows from its service.
-pub const MAX_METRICS: usize = 4;
+/// The most numbers one card can name from its service. A card shows any
+/// number of its kind's metrics, one up to all of them, each at most once; this
+/// is only a ceiling above the largest catalogue, so that a list of any length
+/// is refused by its length and not walked (a test keeps it above every kind's
+/// catalogue). The save checks the names against the kind's own.
+pub const MAX_METRICS: usize = 32;
 
 /// Longest id of an uploaded background image, in characters (the renderer
 /// accepts the same shape, `render.js`).
@@ -100,12 +104,28 @@ pub struct Card {
     /// the key, so such a layout reads and saves back unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<ServiceRef>,
+    /// How much room a card with a service takes. Absent means the default of
+    /// the service's kind (`Integration::default_size`), so a layout saved
+    /// before sizes existed reads and saves back unchanged. A card without a
+    /// service has no size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<Size>,
 }
 
-/// A card's binding to a service: which one, and 1 to 4 of its metrics, in
-/// the order the card shows them. The ids are the kind's (`MetricDef::id`);
-/// [`validate`] checks their shape and count, and the save checks the service
-/// exists, is visible to the user and has these metrics.
+/// A card's size: one grid column, or two on a wide screen (one below about
+/// 700 px).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Size {
+    Normal,
+    Wide,
+}
+
+/// A card's binding to a service: which one, and 1 or more of its metrics (at
+/// most all the kind has, none twice), in the order the card shows them. The
+/// ids are the kind's (`MetricDef::id`); [`validate`] checks their shape, count
+/// and that none is repeated, and the save checks the service exists, is
+/// visible to the user and has these metrics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceRef {
@@ -133,7 +153,7 @@ pub struct Bookmark {
 /// One thing wrong with a document: where, and a stable machine code
 /// (`too_long`, `required`, `bad_url`, `bad_scheme`, `too_many`, `bad_id`,
 /// `duplicate_id`, `bad_colour`, `bad_emoji`, `bad_preset`, `bad_image`,
-/// `bad_service`, `bad_metric`).
+/// `bad_service`, `bad_metric`, `bad_size`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FieldError {
     /// For example `groups[0].cards[2].url`.
@@ -277,7 +297,7 @@ impl Checker {
     }
 
     /// A card's service binding, as far as it can be told without the
-    /// database: an id that can be one, and 1 to 4 metric ids of the shape of
+    /// database: an id that can be one, and 1 or more metric ids of the shape of
     /// an id, none twice. One problem at most is reported: `bad_service` on
     /// `…service`, or one code on `…service.metrics`.
     fn service(&mut self, path: &str, service: &ServiceRef) {
@@ -382,6 +402,9 @@ pub fn validate(layout: &Layout) -> Result<(), Vec<FieldError>> {
             c.icon(&format!("{cp}.icon"), &card.icon);
             if let Some(service) = &card.service {
                 c.service(&cp, service);
+            } else if card.size.is_some() {
+                // A size is the size of a service's card.
+                c.err(format!("{cp}.size"), "bad_size");
             }
         }
     }

@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { build, files, stale } from "./build-extension.mjs";
+import { build, detailTarget, files, stale } from "./build-extension.mjs";
 
 test("extension/vendor is up to date with its sources", () => {
   assert.deepEqual(stale(), [], "run `npm run build:extension` in web/ and commit the result");
@@ -15,10 +15,7 @@ test("extension/vendor is up to date with its sources", () => {
 test("the build copies every file byte for byte", () => {
   const out = mkdtempSync(join(tmpdir(), "mm-vendor-"));
   try {
-    assert.deepEqual(
-      build(out),
-      files.map(([, target]) => target),
-    );
+    assert.deepEqual(build(out), [...files.map(([, target]) => target), detailTarget]);
     for (const [source, target] of files) {
       assert.ok(readFileSync(new URL(`../${source}`, import.meta.url)).equals(readFileSync(join(out, target))));
     }
@@ -31,7 +28,7 @@ test("the build copies every file byte for byte", () => {
 test("the vendor check notices a changed or missing file", () => {
   const out = mkdtempSync(join(tmpdir(), "mm-vendor-"));
   try {
-    assert.equal(stale(out).length, files.length, "nothing built yet: all missing");
+    assert.equal(stale(out).length, files.length + 1, "nothing built yet: all missing");
     build(out);
     writeFileSync(join(out, "extension/vendor/render.js"), "// edited\n");
     assert.deepEqual(stale(out), ["extension/vendor/render.js"]);
@@ -45,6 +42,7 @@ test("tokens.css has every custom property that render.css reads, in light and d
   const tokens = readFileSync(new URL("../extension/vendor/tokens.css", import.meta.url), "utf8");
   const used = new Set([...css.matchAll(/var\((--[a-z0-9-]+)/g)].map((m) => m[1]));
   used.delete("--mm-bg-image"); // set by the renderer, not a token
+  used.delete("--mm-pct"); // a bar's fill, set by the renderer
   for (const name of used) {
     const line = tokens.match(new RegExp(`^\\s*${name}: ([^;]+);`, "m"));
     assert.ok(line, `${name} is defined in tokens.css`);

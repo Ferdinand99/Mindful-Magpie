@@ -155,13 +155,19 @@ async fn an_admin_binds_a_card_and_the_layout_comes_back_with_it() {
 }
 
 #[tokio::test]
-async fn a_card_may_be_bound_to_one_to_four_metrics_of_a_visible_service() {
+async fn a_card_may_be_bound_to_one_up_to_all_metrics_of_a_visible_service() {
     let app = App::new().await;
     let mut admin = Web::new(&app, "ada", "admin").await;
     let id = service(&app, "Blog", Visibility::Admin, &[]).await;
-    for (i, metrics) in [vec!["status"], vec!["status", "latency_ms", "checked"]]
-        .into_iter()
-        .enumerate()
+    // Any number from one to all of the kind's (the http kind has three).
+    for (i, metrics) in [
+        vec!["status"],
+        vec!["status", "latency_ms", "checked"],
+        vec!["checked", "status"],
+        vec!["checked", "latency_ms", "status"],
+    ]
+    .into_iter()
+    .enumerate()
     {
         let res = save(
             &mut admin,
@@ -178,7 +184,6 @@ async fn too_many_no_and_repeated_metrics_are_refused_before_the_database() {
     let mut admin = Web::new(&app, "ada", "admin").await;
     let id = service(&app, "Blog", Visibility::Admin, &[]).await;
     for (metrics, code) in [
-        (vec!["a", "b", "c", "d", "e"], "too_many"),
         (vec![], "required"),
         (vec!["status", "status"], "duplicate_id"),
         (vec!["bad id!"], "bad_id"),
@@ -201,6 +206,36 @@ async fn too_many_no_and_repeated_metrics_are_refused_before_the_database() {
             "{metrics:?}"
         );
     }
+    // Far over what any kind has: refused by its length.
+    let many: Vec<String> = (0..100).map(|i| format!("m{i}")).collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    let res = save(
+        &mut admin,
+        &doc(0, vec![bound_card("c1", Some(bind(id, &many)))]),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", res.body);
+    assert_eq!(
+        res.json()["fields"],
+        json!([{ "path": "groups[0].cards[0].service.metrics", "code": "too_many" }])
+    );
+    // A name the kind does not have is refused at the save, even among known ones.
+    let res = save(
+        &mut admin,
+        &doc(
+            0,
+            vec![bound_card(
+                "c1",
+                Some(bind(id, &["status", "no_such_metric"])),
+            )],
+        ),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", res.body);
+    assert_eq!(
+        res.json()["fields"],
+        json!([{ "path": "groups[0].cards[0].service.metrics", "code": "bad_metric" }])
+    );
     let long = "x".repeat(41);
     let res = save(
         &mut admin,
@@ -552,12 +587,22 @@ async fn the_embed_has_only_what_the_user_may_see_and_never_a_secret() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        ["id", "interval_s", "kind", "link", "metrics", "name"]
+        [
+            "id",
+            "interval_s",
+            "kind",
+            "link",
+            "metrics",
+            "name",
+            "size"
+        ]
     );
     assert_eq!(first["link"], ORIGIN);
     assert_eq!(first["id"], admins);
     assert_eq!(first["kind"], "http");
     assert_eq!(first["interval_s"], 60);
+    // The size a card of the kind has when it names none (http: normal).
+    assert_eq!(first["size"], "normal");
     assert_eq!(
         first["metrics"],
         json!([
@@ -1144,4 +1189,52 @@ async fn an_unchanged_binding_to_a_gone_service_without_a_link_can_still_be_save
     )
     .await;
     assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", res.body);
+}
+
+#[tokio::test]
+async fn a_card_keeps_the_size_it_was_saved_with_and_an_old_one_has_none() {
+    let app = App::new().await;
+    let mut admin = Web::new(&app, "ada", "admin").await;
+    let id = service(&app, "Blog", Visibility::Admin, &[]).await;
+    let mut wide = bound_card("c1", Some(bind(id, &["status"])));
+    wide["size"] = json!("wide");
+    let plain = bound_card("c2", Some(bind(id, &["status"])));
+    let res = save(&mut admin, &doc(0, vec![wide, plain])).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let embedded = block(&page(&mut admin, "en").await.body, "mm-layout");
+    assert_eq!(embedded["groups"][0]["cards"][0]["size"], "wide");
+    // A card that names none stays without (the kind's default applies).
+    assert!(embedded["groups"][0]["cards"][1].get("size").is_none());
+    // A size on a card with no service is refused; so is one that is not a size.
+    let mut unbound = bound_card("c3", None);
+    unbound["size"] = json!("wide");
+    let res = save(&mut admin, &doc(1, vec![unbound])).await;
+    assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", res.body);
+    assert_eq!(
+        res.json()["fields"],
+        json!([{ "path": "groups[0].cards[0].size", "code": "bad_size" }])
+    );
+    let mut odd = bound_card("c4", Some(bind(id, &["status"])));
+    odd["size"] = json!("huge");
+    let res = save(&mut admin, &doc(1, vec![odd])).await;
+    assert!(res.status.is_client_error(), "{}", res.body);
+}
+
+#[tokio::test]
+async fn a_layout_saved_before_sizes_with_up_to_four_metrics_loads_unchanged() {
+    let app = App::new().await;
+    let mut admin = Web::new(&app, "ada", "admin").await;
+    let id = service(&app, "Blog", Visibility::Admin, &[]).await;
+    let old = doc(
+        0,
+        vec![
+            bound_card("c1", Some(bind(id, &["status", "latency_ms", "checked"]))),
+            bound_card("c2", None),
+        ],
+    );
+    assert_eq!(save(&mut admin, &old).await.status, StatusCode::OK);
+    let embedded = block(&page(&mut admin, "en").await.body, "mm-layout");
+    let mut expected = old.clone();
+    expected["version"] = json!(1);
+    assert_eq!(embedded, expected);
 }
