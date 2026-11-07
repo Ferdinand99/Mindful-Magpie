@@ -1,0 +1,126 @@
+# Format, lints and tests for every pull request and every push to main, plus
+# a Docker build of the image for both architectures on pull requests (nothing
+# is pushed). The toolchain matches rust-toolchain.toml and the Dockerfile's
+# RUST_VERSION.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Format, clippy and tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.99
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # The in-process app tests (tests/*.rs): setup, sign-in, users and the
+      # start page.
+      - name: Tests
+        run: cargo test --locked
+
+  # THIRD-PARTY-NOTICES holds the licence texts of the Rust crates in the image. It is made from
+  # the dependencies (scripts/notices.sh), so a changed dependency makes it stale: this job fails
+  # then. It also fails when a
+  # dependency has a licence that is not on the allowlist in about.toml, or one that cargo-about
+  # can not read.
+  notices:
+    name: Third-party notices (up to date, licences allowed)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.99
+
+      # Pinned version and pinned checksum. Keep the version equal to want_version in
+      # scripts/notices.sh.
+      - name: Install cargo-about
+        env:
+          CARGO_ABOUT_VERSION: "0.9.3"
+          CARGO_ABOUT_SHA256: "3ad1e94ea1e63d69d1961f4fb15ccbbe9575d906111f96d2cb4dce6df48f71b4"
+        run: |
+          name="cargo-about-${CARGO_ABOUT_VERSION}-x86_64-unknown-linux-musl"
+          curl -fsSL -o "$RUNNER_TEMP/cargo-about.tar.gz"             "https://github.com/EmbarkStudios/cargo-about/releases/download/${CARGO_ABOUT_VERSION}/${name}.tar.gz"
+          echo "${CARGO_ABOUT_SHA256}  $RUNNER_TEMP/cargo-about.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf "$RUNNER_TEMP/cargo-about.tar.gz" -C "$HOME/.local/bin" --strip-components=1 "${name}/cargo-about"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # A licence outside the allowlist and an unreadable licence must stop the check.
+      - name: cargo-about stops on a dependency it must not accept
+        run: scripts/test-notices-fail.sh
+
+      - name: The notices file is up to date
+        run: scripts/notices.sh --check
+
+  docker:
+    # Builds the image for linux/amd64 and linux/arm64 on native runners (no
+    # QEMU) to catch Dockerfile breakage before merging. Cache only;
+    # publishing is docker-publish.yml's job.
+    name: Docker ${{ matrix.platform }}
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Platform slug
+        run: echo "PLATFORM_PAIR=${{ matrix.platform }}" | sed 's#/#-#g' >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: server
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            REVISION=${{ github.sha }}
+          # Same cache scope as docker-publish.yml. The image is loaded (not
+          # pushed) so that the next step can look inside it.
+          cache-from: type=gha,scope=server-${{ env.PLATFORM_PAIR }}
+          load: true
+          tags: magpie-ci:server
+
+      # The image must carry the licence texts: the AGPL text and the notices of the
+      # crates in the binary.
+      - name: The image carries the licence texts
+        run: |
+          for file in THIRD-PARTY-NOTICES LICENSE; do
+            docker run --rm --entrypoint cat magpie-ci:server "/usr/share/doc/mindful-magpie/$file" > "$RUNNER_TEMP/$file"
+            cmp "$RUNNER_TEMP/$file" "$file"
+            echo "/usr/share/doc/mindful-magpie/$file is in the image ($(wc -c < "$RUNNER_TEMP/$file") bytes, same as $file)"
+          done

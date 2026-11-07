@@ -11,17 +11,26 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License: AGPL-3.0"></a>
 </p>
 
-> **Status: skeleton.** Mindful Magpie ("Magpie") is in its first steps. The server starts, serves a health probe
-> and its static files, and keeps its data in SQLite. Sign-in, setup and the start page itself follow. It is part of
-> the Hedgerow family and is built on [vole-kit](https://github.com/Ferdinand99/Vigilant-Vole), the shared kit that
-> brings sign-in, users, setup, translations and the design system.
+> **Status: under utvikling (in development).** Mindful Magpie ("Magpie") is a self-hosted start page for your
+> links and services. Today it has first-run setup, sign-in, users and roles, two-factor sign-in and passkeys, API
+> tokens, and an empty start page (clock, date and room for your groups) in the Hedgerow design. Links, services,
+> groups and widgets, the browser extension and the apps follow. It is part of the Hedgerow family and is built on
+> [vole-kit](https://github.com/Ferdinand99/Vigilant-Vole), the shared kit that brings sign-in, users, setup,
+> translations and the design system. Nothing is released yet. The spike that settled the new-tab approach is in
+> [`docs/spike-findings.md`](docs/spike-findings.md).
 
 ## Run it
 
+There is no release yet, so the image `ghcr.io/ferdinand99/mindful-magpie` does not exist until the first one. Build
+it from a checkout:
+
 ```bash
-docker compose up -d      # http://localhost:3010
-docker run --rm ghcr.io/ferdinand99/mindful-magpie:latest --help   # every flag and its MM_ variable
+docker build -t mindful-magpie:dev .
+docker run --rm mindful-magpie:dev --help   # every flag and its MM_ variable
 ```
+
+The first start logs a setup link (`/setup?token=...`); open it to create the first admin. `docker-compose.yml` runs
+the released image on `http://localhost:3010`, and has a commented `build: .` line to use your own build.
 
 The image is a single static binary on Alpine. Data lives in `/data` (the database `magpie.sqlite`, the session key
 and pre-migration backups). The container starts as root only to hand `/data` to its `magpie` user; set `PUID` and

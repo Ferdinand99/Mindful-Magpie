@@ -74,8 +74,9 @@ RUN apk add --no-cache ca-certificates tzdata su-exec \
 COPY --from=builder /usr/local/bin/mindful-magpie /usr/local/bin/mindful-magpie
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-# The licence text (AGPL-3.0).
-COPY --chmod=644 LICENSE /usr/share/doc/mindful-magpie/
+# The licence texts: Magpie's own (AGPL-3.0) and the notices of the crates in the
+# binary (scripts/notices.sh makes the file; CI checks that it is up to date).
+COPY --chmod=644 LICENSE THIRD-PARTY-NOTICES /usr/share/doc/mindful-magpie/
 
 ENV MM_DATA_DIR=/data \
     MM_PORT=3010
