@@ -849,3 +849,9 @@ test("a_bound_card_is_a_grid_so_the_text_keeps_the_tile_row", () => {
   assert.doesNotMatch(card, /flex-wrap/);
   assert.match(cssBlock(css, ".mm-svc"), /grid-column: 1 \/ -1/);
 });
+
+test("a_bound_card_keeps_its_rows_at_the_top_when_the_row_of_cards_is_taller", () => {
+  const css = readFileSync(new URL("../static/magpie/render.css", import.meta.url), "utf8");
+  // Without it the grid stretches its rows, and the title of a short card sits in the middle.
+  assert.match(cssBlock(css, ".mm-card.mm-bound"), /align-content: start/);
+});

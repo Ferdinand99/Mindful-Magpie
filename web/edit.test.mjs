@@ -2401,3 +2401,12 @@ test("a_number_the_service_no_longer_has_is_named_in_the_form_and_dropped_on_sav
   click(act(item(t2.root, "card", "c1"), "edit"));
   assert.equal(metricsPicker(sheet(t2.document)).querySelector('[role="status"]').hasAttribute("hidden"), true);
 });
+
+test("the_numbers_picker_has_room_above_its_legend", () => {
+  // The picker is a fieldset inside the Service field: without a rule its legend sits right under
+  // the hint of the select.
+  const css = readFileSync(new URL("../static/magpie.css", import.meta.url), "utf8");
+  const start = css.indexOf(".field[data-metrics] {");
+  assert.ok(start >= 0, "the rule is in magpie.css");
+  assert.match(css.slice(start, css.indexOf("}", start)), /margin-block-start: var\(--sp-3\)/);
+});
