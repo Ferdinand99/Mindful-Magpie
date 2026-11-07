@@ -6,9 +6,17 @@
 #                                commit to release, normally main); the tag is created by the release
 #
 # The version in extension/manifest.json must equal X.Y.Z. AMO refuses to sign the same version
-# twice, so a failed release after a successful signing needs a new version. Pull requests only
-# run `web-ext lint` (ci.yml). Secrets AMO_JWT_ISSUER and AMO_JWT_SECRET are used by the sign step
-# only and are never printed.
+# twice, so a failed signing after Mozilla accepted the upload needs a new version. Pull requests
+# only run `web-ext lint` (ci.yml). Secrets AMO_JWT_ISSUER and AMO_JWT_SECRET are used by the sign
+# step only (as WEB_EXT_API_KEY and WEB_EXT_API_SECRET in its environment) and are never printed.
+#
+# The sign job runs only for a tag or for main (the `if:` below). The secrets are repository
+# secrets, with no Environment: a workflow on any other branch cannot sign.
+#
+# When the sign job succeeded and only the release job failed, re-run the failed job only
+# ("Re-run failed jobs", or "Re-run" on the release job): it picks up the signed .xpi from the
+# artifact of the first run (kept 14 days) and does not sign again, so it is safe. Re-running the
+# whole workflow signs again, and Mozilla refuses the same version twice.
 name: Extension
 
 on:
@@ -31,6 +39,9 @@ permissions:
 jobs:
   sign:
     name: Build and sign
+    # Signing happens for a release tag, or for a manual run on main. A manual run on any other
+    # branch does nothing.
+    if: github.ref_type == 'tag' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     # AMO unlisted signing normally takes a few minutes; web-ext waits up to 15 minutes for it.
     timeout-minutes: 30
@@ -74,6 +85,24 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      # A manual run creates the tag later (in the release job). If the tag is already there on
+      # another commit, the release would describe other code than what is signed here, so stop
+      # before anything is signed. A tag on this very commit is fine (a repeated run).
+      - name: The release tag is free or points at this commit
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          tag="refs/tags/extension-v${VERSION}"
+          remote="$(git ls-remote --tags origin "$tag" "${tag}^{}")"
+          # An annotated tag lists the tag object and the commit (^{}); the commit is the one.
+          sha="$(echo "$remote" | awk -v t="${tag}^{}" '$2 == t {print $1}')"
+          [ -n "$sha" ] || sha="$(echo "$remote" | awk -v t="$tag" '$2 == t {print $1}')"
+          if [ -n "$sha" ] && [ "$sha" != "$GITHUB_SHA" ]; then
+            echo "::error::The tag extension-v${VERSION} already exists on another commit (${sha}). Use a new version, or run this workflow on that commit."
+            exit 1
+          fi
+
       - name: Lint
         working-directory: web
         run: npx --no-install web-ext lint --source-dir ../extension --self-hosted
@@ -82,24 +111,25 @@ jobs:
         working-directory: web
         run: node --test
 
-      - name: Build
+      # Only a check that the package builds. The file that is signed is made by `web-ext sign`
+      # from the same source directory in the next step; this zip is not signed or published.
+      - name: Build (check only)
         working-directory: web
         run: npx --no-install web-ext build --source-dir ../extension --artifacts-dir "$RUNNER_TEMP/build"
 
-      # The secrets go in through the environment of this step only. web-ext does not print them.
+      # The secrets go in through the environment of this step only (web-ext reads WEB_EXT_API_KEY
+      # and WEB_EXT_API_SECRET), not as command-line flags, which would show in the process list.
       - name: Sign with Mozilla (unlisted)
         working-directory: web
         env:
-          AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
-          AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+          WEB_EXT_API_KEY: ${{ secrets.AMO_JWT_ISSUER }}
+          WEB_EXT_API_SECRET: ${{ secrets.AMO_JWT_SECRET }}
         run: |
           npx --no-install web-ext sign \
             --source-dir ../extension \
             --artifacts-dir "$RUNNER_TEMP/signed" \
             --channel unlisted \
-            --approval-timeout 900000 \
-            --api-key "$AMO_JWT_ISSUER" \
-            --api-secret "$AMO_JWT_SECRET"
+            --approval-timeout 900000
 
       - name: Name the signed file
         env:
@@ -144,5 +174,5 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "Firefox extension ${VERSION}" \
-            --notes "Signed Mindful Magpie extension for Firefox (unlisted, signed by Mozilla). Open mindful-magpie-${VERSION}.xpi in Firefox to install it." \
+            --notes "Signed Mindful Magpie extension for Firefox (unlisted, signed by Mozilla). Download mindful-magpie-${VERSION}.xpi and drag it into a Firefox window to install it." \
             --latest=false
