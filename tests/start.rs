@@ -408,7 +408,17 @@ async fn start_page_embeds_the_labels_for_the_renderer() {
         let labels = json_block(&res.body, "mm-labels");
         assert_eq!(labels["empty"], empty, "{lang}");
         assert_eq!(labels["invalid_link"], invalid, "{lang}");
-        for key in ["group_label", "bookmarks_label"] {
+        for key in [
+            "group_label",
+            "bookmarks_label",
+            "service_missing",
+            "service_waiting",
+            "status_ok",
+            "status_warn",
+            "status_bad",
+            "status_unknown",
+            "updated",
+        ] {
             let text = labels[key].as_str().unwrap_or_default();
             assert!(!text.is_empty() && !text.contains("start."), "{lang} {key}");
         }

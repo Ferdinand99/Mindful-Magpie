@@ -1,7 +1,7 @@
 // The interface strings of the shared renderer, in English and Norwegian. The keys are the ones
 // the server writes into the start page's #mm-labels block (src/pages.rs, labels()); the texts
 // are the same as in locales/en.toml and locales/nb.toml (start.empty, start.invalid_link,
-// start.group_label, start.bookmarks_label), so the new tab reads like the web page. A test keeps
+// start.group_label, start.bookmarks_label and the service strings), so the new tab reads like the web page. A test keeps
 // the key lists equal to the server's.
 
 export const labels = {
@@ -10,12 +10,26 @@ export const labels = {
     invalid_link: "invalid link",
     group_label: "Group: {title}",
     bookmarks_label: "Bookmarks",
+    service_missing: "This service no longer exists",
+    service_waiting: "Waiting for the first answer",
+    status_ok: "Status: OK",
+    status_warn: "Status: warning",
+    status_bad: "Status: problem",
+    status_unknown: "Status: unknown",
+    updated: "Last updated {when}",
   },
   nb: {
     empty: "Startsiden er tom. Rediger den for å legge til tjenester og bokmerker.",
     invalid_link: "ugyldig lenke",
     group_label: "Gruppe: {title}",
     bookmarks_label: "Bokmerker",
+    service_missing: "Tjenesten finnes ikke lenger",
+    service_waiting: "Venter på første svar",
+    status_ok: "Status: OK",
+    status_warn: "Status: advarsel",
+    status_bad: "Status: feil",
+    status_unknown: "Status: ukjent",
+    updated: "Sist oppdatert {when}",
   },
 };
 

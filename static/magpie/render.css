@@ -3,11 +3,13 @@
 
    It needs the Hedgerow design tokens (the kit's style.css): --text, --muted,
    --line, --line-strong, --brand, --card, --bg, --fill, --r-lg, --sp-*,
-   --pal-red ... --pal-gray. The page that uses it gives render() an element to
-   fill (the page uses #groups) and lays out nothing but what is in it.
+   --ok-text, --warn-text, --bad-text, --neutral, --pal-red ... --pal-gray.
+   The page that uses it gives render() an element to fill (the page uses
+   #groups) and lays out nothing but what is in it.
 
    Contents: glass, backgrounds (presets and image), groups and cards, tiles,
-   bookmark pills, the empty state. */
+   cards bound to a service (status dot, metric cells, age), bookmark pills,
+   the empty state. */
 
 /* Glass: a translucent card over the background. */
 .glass,
@@ -200,6 +202,120 @@ a.mm-card {
 .mm-tile[data-colour="pink"] { background: var(--pal-pink); }
 .mm-tile[data-colour="brown"] { background: var(--pal-brown); }
 .mm-tile[data-colour="gray"] { background: var(--pal-gray); }
+/* Cards bound to a service ---------------------------------------------------
+   A bound card keeps its tile and text on the first row and adds one block
+   below (.mm-svc): up to four metric cells, then the status dot and the age.
+   Two columns hold two or four cells in 260px; a single cell takes the width.
+   A long value is cut with an ellipsis; the cell's title keeps all of it. */
+.mm-card.mm-bound {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--sp-2) var(--sp-3);
+}
+.mm-svc {
+  display: flex;
+  grid-column: 1 / -1;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-width: 0;
+  padding-block-start: var(--sp-2);
+  border-block-start: 1px solid var(--line);
+}
+.mm-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--sp-2) var(--sp-3);
+  min-width: 0;
+}
+.mm-metrics[data-count="1"] {
+  grid-template-columns: minmax(0, 1fr);
+}
+.mm-metric {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.mm-metric-label {
+  color: var(--muted);
+  font-size: 0.6875rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mm-metric-value {
+  font-size: 0.9375rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mm-svc-foot {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.6875rem;
+}
+.mm-age {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A notice is a sentence the reader needs whole: it wraps. */
+.mm-svc-notice {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-style: italic;
+  overflow-wrap: anywhere;
+}
+.mm-svc-foot .mm-svc-notice {
+  font-size: 0.6875rem;
+}
+.mm-svc-error {
+  color: var(--muted);
+  font-size: 0.6875rem;
+  overflow-wrap: anywhere;
+}
+/* The status dot. The shape tells the state as well as the colour: ok a circle,
+   warn a triangle, bad a square, unknown a ring. The fills are the kit's status
+   text colours (--ok-text, --warn-text, --bad-text), which keep at least 3:1
+   against the glass in both themes (the plain --warn yellow has about 1.6:1 on
+   light glass; web/render-values.test.mjs checks the numbers). */
+.mm-status {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--ok-text);
+}
+.mm-status[data-status="warn"] {
+  width: 11px;
+  height: 10px;
+  border-radius: 0;
+  background: var(--warn-text);
+  clip-path: polygon(50% 0, 100% 100%, 0 100%);
+}
+.mm-status[data-status="bad"] {
+  border-radius: 2px;
+  background: var(--bad-text);
+}
+.mm-status[data-status="unknown"] {
+  background: transparent;
+  box-shadow: inset 0 0 0 2px var(--neutral);
+}
+/* A value older than three intervals: the numbers turn to the muted colour and
+   lose their weight (the labels and the age line keep their colour; every text
+   keeps 4.5:1). The dot is not dimmed, it must stay visible. */
+.mm-card[data-stale] .mm-metric-value {
+  color: var(--muted);
+  font-weight: 400;
+}
+
 /* Bookmark pills ---------------------------------------------------------------- */
 .mm-bookmarks {
   display: flex;
