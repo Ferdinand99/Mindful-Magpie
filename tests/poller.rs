@@ -1155,8 +1155,8 @@ async fn a_kinds_own_bad_reading_with_an_error_in_it_is_not_down() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_real_failed_fetch_still_gives_down_after_the_same_number_of_readings() {
-    // The same error as above (`Invalid`, `Timeout`), but now the fetch failed
-    // (no reading was made): that is «down».
+    // Unlike the readings above, here the fetch itself failed (no reading was
+    // made), so the service is «not answering».
     let app = App::new().await;
     tokio::time::pause();
     set_mode("t_real_fail", Mode::ErrConnect);
