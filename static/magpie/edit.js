@@ -86,6 +86,7 @@ export const LABEL_KEYS = [
   "field_metrics",
   "help_metrics",
   "metrics_full",
+  "metrics_gone",
   "optional",
   "help_url",
   "help_emoji",
@@ -813,14 +814,17 @@ export function startEditing(root, getLayout, save, opts = {}) {
     }
     if (gone) select.appendChild(choice(String(bound.id), L("service_missing"), { selected: true, "data-gone": true }));
 
-    const legendId = uid("mm-f-metrics");
-    const hintId = `${legendId}-hint`;
-    const picker = h(doc, "div", { class: "stack-sm", "data-metrics": true });
-    const group = h(doc, "div", { class: "stack-sm", role: "group", "aria-labelledby": legendId });
+    const hintId = `${uid("mm-f-metrics")}-hint`;
+    // A fieldset with a legend: screen readers announce the group's name with each box.
+    const picker = h(doc, "fieldset", { class: "field", "data-metrics": true });
+    const group = h(doc, "div", { class: "stack-sm" });
     const hint = h(doc, "p", { class: "help", id: hintId, "aria-live": "polite" });
-    picker.appendChild(h(doc, "span", { class: "label", id: legendId, text: L("field_metrics") }));
+    // Ids the card has but the service no longer offers: said, then dropped on save.
+    const lost = h(doc, "p", { class: "help", role: "status", hidden: true });
+    picker.appendChild(h(doc, "legend", { text: L("field_metrics") }));
     picker.appendChild(group);
     picker.appendChild(hint);
+    picker.appendChild(lost);
 
     const chosen = () => [...select.querySelectorAll("option")].find((o) => o.selected ?? o.hasAttribute("selected"));
     const boxes = () => [...group.querySelectorAll('input[name="metric"]')];
@@ -847,6 +851,11 @@ export function startEditing(root, getLayout, save, opts = {}) {
       picker.removeAttribute("hidden");
       // Another service: its first number to start with.
       const start = keep ?? service.metrics.slice(0, 1).map((m) => m.id);
+      const offered = new Set(service.metrics.map((m) => m.id));
+      const missing = start.filter((id) => !offered.has(id));
+      lost.textContent = missing.length > 0 ? L("metrics_gone", { names: missing.join(", ") }) : "";
+      if (missing.length > 0) lost.removeAttribute("hidden");
+      else lost.setAttribute("hidden", "");
       for (const metric of service.metrics) {
         const box = h(doc, "input", { type: "checkbox", name: "metric", value: metric.id, "aria-describedby": hintId });
         if (start.includes(metric.id)) box.setAttribute("checked", "");
@@ -881,7 +890,11 @@ export function startEditing(root, getLayout, save, opts = {}) {
     if (value === "") return null;
     // The choice that says the service is gone leaves the binding as it was.
     if (option.hasAttribute("data-gone")) return card?.service ? structuredClone(card.service) : null;
-    const metrics = [...form.querySelectorAll('input[name="metric"]')].filter(isOn).map((box) => box.value);
+    const ticked = [...form.querySelectorAll('input[name="metric"]')].filter(isOn).map((box) => box.value);
+    // The card's own service: the numbers still ticked keep the card's order and
+    // new ones follow in the service's order. Another service: its order.
+    const stored = card?.service?.id === Number(value) ? card.service.metrics : [];
+    const metrics = [...stored.filter((id) => ticked.includes(id)), ...ticked.filter((id) => !stored.includes(id))];
     return { id: Number(value), metrics };
   }
 

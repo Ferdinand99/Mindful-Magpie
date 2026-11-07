@@ -381,6 +381,53 @@ async fn a_card_keeps_a_binding_whose_service_went_away_but_cannot_take_a_new_on
 }
 
 #[tokio::test]
+async fn a_stored_card_id_with_another_hidden_service_or_another_order_is_fully_checked() {
+    let app = App::new().await;
+    let _admin = Web::new(&app, "ada", "admin").await;
+    let mut vera = Web::new(&app, "vera", "viewer").await;
+    let mine = service(&app, "Mine", Visibility::All, &[]).await;
+    let hidden = service(&app, "Hidden-Name-XYZ", Visibility::Admin, &[]).await;
+    let first = doc(
+        0,
+        vec![bound_card("c1", Some(bind(mine, &["status", "checked"])))],
+    );
+    assert_eq!(save(&mut vera, &first).await.status, StatusCode::OK);
+
+    // The same card id, now naming a service the user cannot see.
+    let forged = doc(
+        1,
+        vec![bound_card("c1", Some(bind(hidden, &["status", "checked"])))],
+    );
+    let res = save(&mut vera, &forged).await;
+    assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", res.body);
+    assert_eq!(res.json()["fields"][0]["code"], "bad_service");
+    assert!(!res.body.contains("Hidden-Name-XYZ"));
+
+    // The same service and metrics in another order is another binding: it is
+    // checked, so once the service is hidden it is refused.
+    store::update(
+        &app.magpie.core,
+        mine,
+        &input("Mine", Visibility::Admin, &[]),
+    )
+    .await
+    .unwrap();
+    let reordered = doc(
+        1,
+        vec![bound_card("c1", Some(bind(mine, &["checked", "status"])))],
+    );
+    let res = save(&mut vera, &reordered).await;
+    assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", res.body);
+    assert_eq!(res.json()["fields"][0]["code"], "bad_service");
+    // Exactly as it was is still let through.
+    let same = doc(
+        1,
+        vec![bound_card("c1", Some(bind(mine, &["status", "checked"])))],
+    );
+    assert_eq!(save(&mut vera, &same).await.status, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn the_service_check_runs_in_the_version_transaction_a_stale_save_changes_nothing() {
     let app = App::new().await;
     let mut admin = Web::new(&app, "ada", "admin").await;
@@ -581,22 +628,56 @@ async fn services_for_follows_visible_to() {
 // ---------------------------------------------------------------------------
 // The extension's API
 
+/// The token the extension's connect flow gives `web`'s user: consent, then
+/// the code swapped for a token, as the extension does it.
+async fn extension_token(app: &App, web: &mut Web<'_>) -> String {
+    const REDIRECT: &str =
+        "https://9bd6a096502a3a8555d679b3f64704219dffb501.extensions.allizom.org/";
+    const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    let res = web
+        .post(
+            "/connect/extension",
+            &[
+                ("current_password", common::PASSWORD),
+                ("redirect_uri", REDIRECT),
+                ("state", "c3RhdGUtZnJvbS10aGUtZXh0ZW5zaW9u"),
+                ("code_challenge", CHALLENGE),
+                ("code_challenge_method", "S256"),
+                ("device", "Test"),
+                ("decision", "approve"),
+            ],
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    let location = url::Url::parse(res.header("location")).unwrap();
+    let code = location
+        .query_pairs()
+        .find(|(k, _)| k == "code")
+        .unwrap()
+        .1
+        .into_owned();
+    let res = common::post_json(
+        app,
+        "/api/v1/extension/token",
+        &json!({ "code": code, "code_verifier": VERIFIER }).to_string(),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    res.json()["token"].as_str().unwrap().to_string()
+}
+
 #[tokio::test]
 async fn me_start_adds_services_next_to_the_layout_and_keeps_its_shape() {
     let app = App::new().await;
     let mut admin = Web::new(&app, "ada", "admin").await;
-    let _vera = Web::new(&app, "vera", "viewer").await;
     let all = service(&app, "For all", Visibility::All, &[]).await;
     service(&app, "Admins-Only-Svc", Visibility::Admin, &[]).await;
     let layout = doc(0, vec![bound_card("c1", Some(bind(all, &["status"])))]);
     assert_eq!(save(&mut admin, &layout).await.status, StatusCode::OK);
 
-    let ada = user_id(&app, "ada").await;
-    let vera = user_id(&app, "vera").await;
-    let ada_token = make_token(&app, ada, TokenScope::Read, "ada-ext").await;
-    let vera_token = make_token(&app, vera, TokenScope::Read, "vera-ext").await;
-
-    let res = bearer_get(&app, "/api/v1/me/start", &ada_token).await;
+    let token = extension_token(&app, &mut admin).await;
+    let res = bearer_get(&app, "/api/v1/me/start", &token).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     let body = res.json();
     // The shape the released extension reads is untouched at the top level.
@@ -604,17 +685,123 @@ async fn me_start_adds_services_next_to_the_layout_and_keeps_its_shape() {
     assert!(body["groups"].is_array() && body["bookmarks"].is_array());
     assert_eq!(body["background"]["name"], "hav");
     assert_eq!(body["groups"][0]["cards"][0]["service"]["id"], all);
+    // The admin's own extension token shows the admin's services.
     assert_eq!(names(&body["services"]), ["Admins-Only-Svc", "For all"]);
     assert_eq!(body["services"][1]["metrics"][0]["format"], "number");
     assert_no_secrets(&res.body, "me/start for an admin");
-
-    // A viewer gets their own layout (none) and only what they may see.
-    let res = bearer_get(&app, "/api/v1/me/start", &vera_token).await;
-    let body = res.json();
-    assert_eq!(names(&body["services"]), ["For all"]);
-    assert!(!res.body.contains("Admins-Only-Svc"));
-    assert_no_secrets(&res.body, "me/start for a viewer");
     assert_eq!(res.header("cache-control"), "no-store");
+}
+
+#[tokio::test]
+async fn an_admins_plain_read_token_is_a_viewer_but_the_extensions_token_is_the_admin() {
+    let app = App::new().await;
+    let mut admin = Web::new(&app, "ada", "admin").await;
+    service(&app, "For all", Visibility::All, &[]).await;
+    service(&app, "Admins-Only-Svc", Visibility::Admin, &[]).await;
+    let ada = user_id(&app, "ada").await;
+
+    // A script's read-only token (Tokens page, no product scope): the kit's cap,
+    // a viewer, so a leaked one shows no admin-only name.
+    let plain = make_token(&app, ada, TokenScope::Read, "script").await;
+    let res = bearer_get(&app, "/api/v1/me/start", &plain).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(names(&res.json()["services"]), ["For all"]);
+    assert!(!res.body.contains("Admins-Only-Svc"));
+
+    // The token the connect flow gives: read-only plus the owner scope.
+    let ext = extension_token(&app, &mut admin).await;
+    let res = bearer_get(&app, "/api/v1/me/start", &ext).await;
+    assert_eq!(
+        names(&res.json()["services"]),
+        ["Admins-Only-Svc", "For all"]
+    );
+    // It is stored as a read token with the scope.
+    let (scope, scopes): (String, String) = app
+        .magpie
+        .core
+        .with_conn(|c| {
+            c.query_row(
+                "SELECT t.scope, group_concat(s.scope) FROM api_tokens t
+                 JOIN api_token_scopes s ON s.token_id = t.id
+                 WHERE t.name LIKE 'Utvidelse:%'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!((scope.as_str(), scopes.as_str()), ("read", "start:owner"));
+
+    // A read-and-write token is the account's own role: the kit's rule, unchanged.
+    let write = make_token(&app, ada, TokenScope::Write, "writer").await;
+    let res = bearer_get(&app, "/api/v1/me/start", &write).await;
+    assert_eq!(
+        names(&res.json()["services"]),
+        ["Admins-Only-Svc", "For all"]
+    );
+}
+
+#[tokio::test]
+async fn a_viewers_extension_token_never_sees_admin_only_services() {
+    let app = App::new().await;
+    let _admin = Web::new(&app, "ada", "admin").await;
+    let mut vera = Web::new(&app, "vera", "viewer").await;
+    let vera_id = user_id(&app, "vera").await;
+    service(&app, "For all", Visibility::All, &[]).await;
+    service(&app, "Admins-Only-Svc", Visibility::Admin, &[]).await;
+    service(&app, "Just Vera", Visibility::Users, &[vera_id]).await;
+
+    let ext = extension_token(&app, &mut vera).await;
+    let res = bearer_get(&app, "/api/v1/me/start", &ext).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(names(&res.json()["services"]), ["For all", "Just Vera"]);
+    assert!(!res.body.contains("Admins-Only-Svc"));
+    assert_no_secrets(&res.body, "me/start for a viewer's extension");
+
+    // A viewer who gives a plain token the scope by hand gains nothing: the
+    // scope only lifts the cap, the owner's own role still decides.
+    let plain = make_token(&app, vera_id, TokenScope::Read, "mine").await;
+    let id: i64 = app
+        .magpie
+        .core
+        .with_conn(|c| {
+            c.query_row("SELECT id FROM api_tokens WHERE name = 'mine'", [], |r| {
+                r.get(0)
+            })
+        })
+        .await
+        .unwrap();
+    app.magpie
+        .core
+        .with_conn(move |c| vole_kit::db::api_tokens::add_scope(c, id, "start:owner"))
+        .await
+        .unwrap();
+    let res = bearer_get(&app, "/api/v1/me/start", &plain).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(!res.body.contains("Admins-Only-Svc"));
+}
+
+#[tokio::test]
+async fn the_tokens_page_names_the_owner_scope_in_both_languages() {
+    let app = App::new().await;
+    let mut admin = Web::new(&app, "ada", "admin").await;
+    for (lang, label) in [("en", "Read, as you"), ("nb", "Lese, som deg")] {
+        let req = Request::get("/settings/tokens")
+            .header("accept-language", lang)
+            .body(Body::empty())
+            .unwrap();
+        let res = admin.send(req).await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        assert!(
+            res.body.contains("start:owner"),
+            "{lang}: the choice is offered"
+        );
+        assert!(res.body.contains(label), "{lang}: {label}");
+        assert!(
+            !res.body.contains("tokens.scope_owner"),
+            "{lang}: a missing key shows as itself"
+        );
+    }
 }
 
 #[tokio::test]

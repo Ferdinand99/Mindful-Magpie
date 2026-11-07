@@ -2078,8 +2078,9 @@ test("a_keyboard_flow_binds_a_card_to_a_service_with_two_numbers_and_saves_the_p
   // The numbers of the service, each a labelled checkbox in a labelled group; the first is on.
   const picker = metricsPicker(dialog);
   assert.equal(picker.hasAttribute("hidden"), false);
-  const group = picker.querySelector('[role="group"]');
-  assert.equal(picker.querySelector(`#${group.getAttribute("aria-labelledby")}`).textContent, LABELS.field_metrics);
+  assert.equal(picker.tagName, "FIELDSET", "the numbers are one fieldset");
+  assert.equal(picker.querySelector("legend").textContent, LABELS.field_metrics);
+  assert.equal(picker.querySelector('[role="group"]'), null, "the fieldset is the group, no role needed");
   assert.deepEqual(boxes(dialog).map((b) => b.value), ["status", "latency_ms", "checked"]);
   for (const box of boxes(dialog)) {
     assert.equal(box.closest("label")?.tagName, "LABEL", `${box.value} is inside a label`);
@@ -2309,9 +2310,67 @@ test("leaving_edit_mode_draws_bound_cards_with_the_services_again", async () => 
 test("every_label_the_service_field_uses_is_listed_and_translated", () => {
   const source = readFileSync(new URL("../static/magpie/edit.js", import.meta.url), "utf8");
   const listed = source.match(/export const LABEL_KEYS = \[([\s\S]*?)\];/)[1];
-  for (const key of ["field_service", "service_none", "service_missing", "help_service", "field_metrics", "help_metrics", "metrics_full", "err_service_metrics", "err_bad_service", "err_bad_metric"]) {
+  for (const key of ["field_service", "service_none", "service_missing", "help_service", "field_metrics", "help_metrics", "metrics_full", "metrics_gone", "err_service_metrics", "err_bad_service", "err_bad_metric"]) {
     assert.ok(listed.includes(`"${key}"`), `LABEL_KEYS lacks ${key}`);
     assert.ok(source.includes(`L("${key}"`), `${key} is used`);
     assert.ok(LABELS[key] && NB[key] && LABELS[key] !== NB[key], `${key} in both languages`);
   }
+});
+
+test("numbers_keep_the_cards_order_and_new_ones_follow_in_the_services_order", async () => {
+  // The card shows checked first, then status; latency is added.
+  const t = setup({ services: SERVICES, layout: layoutWith(bound(1, ["checked", "status"])) });
+  const ed = t.start();
+  click(act(item(t.root, "card", "c1"), "edit"));
+  const dialog = sheet(t.document);
+  assert.deepEqual(boxes(dialog).map(boxOn), [true, false, true]);
+  setBox(boxes(dialog)[1], true);
+  submit(dialog);
+  await tick();
+  assert.deepEqual(ed.draft().groups[0].cards[0].service.metrics, ["checked", "status", "latency_ms"]);
+
+  // Clearing one in the middle keeps the order of the rest.
+  click(act(item(t.root, "card", "c1"), "edit"));
+  const again = sheet(t.document);
+  setBox(boxes(again)[0], false);
+  submit(again);
+  await tick();
+  assert.deepEqual(ed.draft().groups[0].cards[0].service.metrics, ["checked", "latency_ms"]);
+
+  // Opening and saving a form unchanged is no change, even in a "foreign" order.
+  const t2 = setup({ services: SERVICES, layout: layoutWith(bound(1, ["checked", "status"])) });
+  const ed2 = t2.start();
+  click(act(item(t2.root, "card", "c1"), "edit"));
+  submit(sheet(t2.document));
+  await tick();
+  assert.equal(ed2.isDirty(), false);
+
+  // Another service gets its own order, not the card's.
+  click(act(item(t2.root, "card", "c1"), "edit"));
+  const other = sheet(t2.document);
+  chooseService(other, "2");
+  setBox(boxes(other)[2], true);
+  submit(other);
+  await tick();
+  assert.deepEqual(ed2.draft().groups[0].cards[0].service, { id: 2, metrics: ["a", "c"] });
+});
+
+test("a_number_the_service_no_longer_has_is_named_in_the_form_and_dropped_on_save", async () => {
+  const t = setup({ services: SERVICES, layout: layoutWith(bound(1, ["status", "uptime_old"])) });
+  const ed = t.start();
+  click(act(item(t.root, "card", "c1"), "edit"));
+  const dialog = sheet(t.document);
+  const note = metricsPicker(dialog).querySelector('[role="status"]');
+  assert.equal(note.hasAttribute("hidden"), false);
+  assert.equal(note.textContent, LABELS.metrics_gone.replace("{names}", "uptime_old"));
+  assert.deepEqual(boxes(dialog).map(boxOn), [true, false, false]);
+  submit(dialog);
+  await tick();
+  assert.deepEqual(ed.draft().groups[0].cards[0].service, { id: 1, metrics: ["status"] });
+
+  // Nothing missing: no note.
+  const t2 = setup({ services: SERVICES, layout: layoutWith(bound(1, ["status"])) });
+  t2.start();
+  click(act(item(t2.root, "card", "c1"), "edit"));
+  assert.equal(metricsPicker(sheet(t2.document)).querySelector('[role="status"]').hasAttribute("hidden"), true);
 });
