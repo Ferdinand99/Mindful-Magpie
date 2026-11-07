@@ -62,7 +62,8 @@ struct StartPage {
 /// `value` as JSON that is safe inside `<script type="application/json">`.
 /// The HTML parser ends such a block at the first `</script`, and `<!--` can
 /// make it swallow the end tag, so both are written with escapes that JSON
-/// reads back as the same text (`<\/` is `</`, and `<` is `<`).
+/// reads back as the same text: `<\/` is `</`, and a backslash followed by
+/// `u003c` is `<`.
 fn json_for_html(value: &impl serde::Serialize) -> String {
     serde_json::to_string(value)
         .unwrap_or_else(|_| "null".into())
@@ -132,9 +133,8 @@ async fn start(
     // version so that a save over the broken document is accepted, and say so.
     let (layout, corrupt) = match layout::load(&core, user.id).await {
         Ok(layout) => (layout, false),
-        Err(StoreError::Corrupt(err)) => {
-            tracing::warn!(user = user.id, "stored layout is unreadable: {err}");
-            let version = layout::stored_version(&core, user.id).await?;
+        Err(StoreError::Corrupt { version, source }) => {
+            tracing::warn!(user = user.id, "stored layout is unreadable: {source}");
             (
                 Layout {
                     version,
@@ -204,14 +204,17 @@ async fn save_layout(
 /// the empty one and leaves a readable layout alone. It is a plain form post,
 /// so it works without JavaScript and the page can always be repaired.
 async fn reset_layout(State(core): State<Core>, user: CurrentUser) -> ApiResult<Redirect> {
-    if let Err(StoreError::Corrupt(_)) = layout::load(&core, user.id).await {
-        let version = layout::stored_version(&core, user.id).await?;
+    if let Err(StoreError::Corrupt { version, .. }) = layout::load(&core, user.id).await {
+        // The version comes from the same read that found the document
+        // broken. If a valid save lands before this one, the versions differ
+        // and the save below is a conflict: the new layout is never wiped.
         let fresh = Layout {
             version,
             ..Layout::default()
         };
         match layout::save(&core, user.id, &fresh).await {
-            // Saved, or another tab got there first: either way, show the page.
+            // Saved, or a save from another tab got there first: either way,
+            // show the page as it is now.
             Ok(_) | Err(SaveError::Conflict { .. }) => {}
             Err(err) => return Err(ApiError::internal(err)),
         }
@@ -227,4 +230,37 @@ async fn settings_home(user: CurrentUser) -> Redirect {
     } else {
         "/settings/security"
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::json_for_html;
+
+    #[test]
+    fn json_for_html_cannot_end_or_swallow_the_block() {
+        for text in [
+            "</script>",
+            "</SCRIPT",
+            "</ScRiPt>",
+            "</script ",
+            "</script\n",
+            "<!--",
+            "<!--<!--",
+            "<!-- <script>",
+            r"\<!--",
+            r"\</script>",
+            "a</b><!--c-->",
+        ] {
+            let value = json!({ "title": text, "list": [text] });
+            let out = json_for_html(&value);
+            // What a browser would end the block at, or be confused by.
+            assert!(!out.contains("</"), "{text:?} -> {out}");
+            assert!(!out.contains("<!--"), "{text:?} -> {out}");
+            // And the data comes back unchanged.
+            let back: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(back, value, "{text:?} -> {out}");
+        }
+    }
 }

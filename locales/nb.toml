@@ -26,7 +26,7 @@ site_name_placeholder = "Startside hjemme…"
 tz_after = ". Dette kan endres i Innstillinger."
 
 [users]
-roles_help = "Lesere kan se, men ikke endre noe. Redaktører kan endre startsiden. Administratorer kan gjøre alt, også brukere."
+roles_help = "Alle setter opp sin egen startside. Lesere kan ikke endre noe annet; redaktører kan også endre felles innstillinger; administratorer kan gjøre alt, også brukere."
 
 [tokens]
 sub = "La skript og KI-assistenter lese startsiden din."

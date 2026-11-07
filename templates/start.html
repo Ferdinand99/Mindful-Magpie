@@ -28,8 +28,8 @@
 
 {#- The stored layout could not be read. The button is a plain form post, so it works without scripts. -#}
 {% if corrupt %}
-<section class="glass mm-notice" id="mm-corrupt" aria-label="{{ tr("start.corrupt_reset") }}">
-  {{ m::callout("warning", tr("start.corrupt")) }}
+<section class="glass mm-notice" id="mm-corrupt" aria-labelledby="mm-corrupt-text">
+  <div id="mm-corrupt-text">{{ m::callout("warning", tr("start.corrupt")) }}</div>
   <form method="post" action="/start/layout/reset">
     <button type="submit" class="btn btn-secondary">{{ tr("start.corrupt_reset") }}</button>
   </form>

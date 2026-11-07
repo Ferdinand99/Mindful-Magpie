@@ -26,7 +26,7 @@ site_name_placeholder = "Home start page…"
 tz_after = ". You can change this in Settings."
 
 [users]
-roles_help = "Viewers can look but not change anything. Editors can change the start page. Admins can do everything, including users."
+roles_help = "Everyone arranges their own start page. Viewers can't change anything else; editors can also change shared settings; admins can do everything, including users."
 
 [tokens]
 sub = "Let scripts and AI assistants read your start page."

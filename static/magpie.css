@@ -133,6 +133,6 @@ body:has(.main.start) .topbar-inner {
   gap: var(--sp-3) var(--sp-4);
   padding: var(--sp-3) var(--sp-4);
 }
-.mm-notice .callout {
+.mm-notice > div {
   flex: 1 1 18rem;
 }

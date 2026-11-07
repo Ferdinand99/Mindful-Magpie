@@ -443,7 +443,17 @@ fn validation_icons() {
     }
     assert_eq!(layout::PALETTE.len(), 13);
     // One grapheme is an emoji, however many code points it has.
-    for ok in ["🙂", "👨‍👩‍👧‍👦", "🇳🇴", "1️⃣", "👍🏽"] {
+    // (The last two are the subdivision flags of England and Scotland: the
+    // black flag, tag letters and the cancel tag.)
+    for ok in [
+        "🙂",
+        "👨‍👩‍👧‍👦",
+        "🇳🇴",
+        "1️⃣",
+        "👍🏽",
+        "\u{1f3f4}\u{e0067}\u{e0062}\u{e0065}\u{e006e}\u{e0067}\u{e007f}",
+        "\u{1f3f4}\u{e0067}\u{e0062}\u{e0073}\u{e0063}\u{e0074}\u{e007f}",
+    ] {
         let mut l = sample();
         l.groups[0].cards[0].icon.emoji = Some(ok.into());
         assert_eq!(codes(&l), vec![], "{ok}");
@@ -464,6 +474,13 @@ fn validation_icons() {
         "\u{feff}",
         "\u{2060}",
         "\u{7f}",
+        // Tag characters hide text: only a whole subdivision flag may have them.
+        "A\u{e0067}\u{e007f}",
+        "A\u{e0067}\u{e0062}\u{e007f}",
+        "\u{e0067}",
+        "\u{1f3f4}\u{e0067}\u{e0062}\u{e0065}\u{e006e}\u{e0067}",
+        "\u{1f642}\u{e0067}\u{e007f}",
+        "\u{1f3f4}\u{e007f}",
         "a\u{300}\u{301}".repeat(2).as_str(),
     ] {
         expect(
@@ -611,4 +628,41 @@ fn the_error_list_is_capped_at_100() {
     assert_eq!(errors.len(), 100);
     // The first ones, in document order.
     assert_eq!(errors[0].0, "groups[0].cards[0].url");
+}
+
+#[tokio::test]
+async fn an_unreadable_layout_reports_the_version_it_was_read_at() {
+    let app = App::new().await;
+    let ada = add_user(&app, "ada", "admin").await;
+    app.exec(format!(
+        "INSERT INTO layouts (user_id, version, doc, updated_at) \
+         VALUES ({ada}, 7, '{{\"groups\": 1', '2026-01-01T00:00:00Z')"
+    ))
+    .await;
+    match layout::load(&app.magpie.core, ada).await {
+        Err(layout::StoreError::Corrupt { version, .. }) => assert_eq!(version, 7),
+        other => panic!("{other:?}"),
+    }
+    // A save that carries that version replaces the document; one that
+    // carries any other (a valid save landed in between) is a conflict.
+    let stale = Layout {
+        version: 6,
+        ..Layout::default()
+    };
+    let err = layout::save(&app.magpie.core, ada, &stale)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SaveError::Conflict { current: 7 }), "{err:?}");
+    let fresh = Layout {
+        version: 7,
+        ..Layout::default()
+    };
+    assert_eq!(
+        layout::save(&app.magpie.core, ada, &fresh).await.unwrap(),
+        8
+    );
+    assert_eq!(
+        layout::load(&app.magpie.core, ada).await.unwrap().version,
+        8
+    );
 }

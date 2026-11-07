@@ -52,7 +52,12 @@ fn block(page: &str, id: &str) -> Value {
         .find(&open)
         .unwrap_or_else(|| panic!("no {id} block in {page}"))
         + open.len();
-    let end = page[start..].find("</script>").expect("block never closes") + start;
+    // A browser ends the block at `</script` in any case, whatever follows.
+    let end = page[start..]
+        .to_ascii_lowercase()
+        .find("</script")
+        .expect("block never closes")
+        + start;
     serde_json::from_str(&page[start..end]).unwrap_or_else(|e| panic!("{e}: {}", &page[start..end]))
 }
 
@@ -275,6 +280,18 @@ async fn an_unreadable_layout_shows_a_notice_and_can_be_saved_over() {
         res.body
     );
     assert!(res.body.contains("Start på nytt"), "{}", res.body);
+    // The notice is named after its text, not after its button.
+    assert!(
+        res.body.contains(r#"aria-labelledby="mm-corrupt-text""#),
+        "{}",
+        res.body
+    );
+    assert!(res.body.contains(r#"id="mm-corrupt-text""#), "{}", res.body);
+    assert!(
+        !res.body.contains(r#"aria-label="Start på nytt""#),
+        "{}",
+        res.body
+    );
     // The page still gets a layout: the default, at the stored version, so a
     // save over it is accepted.
     let layout = block(&res.body, "mm-layout");
@@ -328,4 +345,39 @@ async fn start_over_leaves_a_readable_layout_alone() {
         .body(Body::empty())
         .unwrap();
     assert_eq!(web.send(req).await.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_viewer_saves_their_own_layout_and_only_that() {
+    // Everyone arranges their own start page, whatever their role.
+    let app = App::new().await;
+    let mut ada = Web::new(&app, "ada", "admin").await;
+    let mut vi = Web::new(&app, "vi", "viewer").await;
+    assert_eq!(save(&mut ada, &doc(0, "Ada's card")).await.status, 200);
+
+    let res = save(&mut vi, &doc(0, "Vi's card")).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.json(), json!({ "version": 1 }));
+
+    let vi_page = page(&mut vi).await;
+    assert!(vi_page.body.contains("Vi's card"));
+    assert!(!vi_page.body.contains("Ada's card"));
+    let ada_page = page(&mut ada).await;
+    assert!(ada_page.body.contains("Ada's card"));
+    assert!(!ada_page.body.contains("Vi's card"));
+    assert_eq!(app.count("SELECT COUNT(*) FROM layouts").await, 2);
+}
+
+#[tokio::test]
+async fn start_over_refuses_another_origin() {
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    corrupt(&app, "ada", 3).await;
+    let req = Request::post("/start/layout/reset")
+        .header(header::ORIGIN, "https://evil.example")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(web.send(req).await.status, StatusCode::FORBIDDEN);
+    // Nothing changed: the document is still the broken one.
+    assert!(page(&mut web).await.body.contains("mm-corrupt"));
 }

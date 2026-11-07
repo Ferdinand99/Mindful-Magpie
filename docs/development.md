@@ -41,7 +41,7 @@ Builds and tests run in Docker on a build host (a shared Docker daemon), not on 
 cargo commands that run inside a Rust 1.99 container with clippy and rustfmt installed.
 
 ```bash
-cargo test --locked                                  # 55 tests: boot, auth and users, start page, layout
+cargo test --locked                                  # 59 tests: boot, auth and users, start page, layout
 cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --all --check
 docker build -t magpie:dev .

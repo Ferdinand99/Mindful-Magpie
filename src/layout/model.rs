@@ -139,22 +139,37 @@ fn is_format(c: char) -> bool {
         | '\u{1d173}'..='\u{1d17a}' | '\u{e0001}' | '\u{e0020}'..='\u{e007f}')
 }
 
-/// The invisible parts real emoji are built from: the zero width joiner, the
-/// variation selectors and the tag characters of subdivision flags.
+/// The invisible parts real emoji are built from: the zero width joiner and
+/// the variation selectors.
 fn is_emoji_glue(c: char) -> bool {
-    matches!(
-        c,
-        '\u{200d}' | '\u{fe0e}' | '\u{fe0f}' | '\u{e0020}'..='\u{e007f}'
-    )
+    matches!(c, '\u{200d}' | '\u{fe0e}' | '\u{fe0f}')
+}
+
+/// A tag character (U+E0020 to U+E007F).
+fn is_tag(c: char) -> bool {
+    matches!(c, '\u{e0020}'..='\u{e007f}')
+}
+
+/// Whether `emoji` is a subdivision flag: the black flag, tag characters and
+/// the cancel tag (U+E007F) that ends the sequence. Tag characters are
+/// invisible, so they are accepted only in this shape.
+fn is_subdivision_flag(emoji: &str) -> bool {
+    emoji
+        .strip_prefix('\u{1f3f4}')
+        .and_then(|rest| rest.strip_suffix('\u{e007f}'))
+        .is_some_and(|tags| !tags.is_empty() && tags.chars().all(is_tag))
 }
 
 /// Whether `emoji` has no whitespace, control or format characters (except
-/// the glue that emoji sequences need) and at least one character that shows.
+/// the glue that emoji sequences need, and the tags of a subdivision flag) and
+/// at least one character that shows.
 fn is_visible_symbol(emoji: &str) -> bool {
-    emoji
-        .chars()
-        .all(|c| !c.is_whitespace() && !c.is_control() && (!is_format(c) || is_emoji_glue(c)))
-        && emoji.chars().any(|c| !is_emoji_glue(c))
+    let flag = is_subdivision_flag(emoji);
+    emoji.chars().all(|c| {
+        !c.is_whitespace()
+            && !c.is_control()
+            && (!is_format(c) || is_emoji_glue(c) || (flag && is_tag(c)))
+    }) && emoji.chars().any(|c| !is_emoji_glue(c) && !is_tag(c))
 }
 
 /// The most problems [`validate`] returns.

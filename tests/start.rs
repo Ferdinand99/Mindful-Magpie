@@ -191,7 +191,12 @@ fn json_block(page: &str, id: &str) -> serde_json::Value {
         .find(&open)
         .unwrap_or_else(|| panic!("no {id} block in {page}"))
         + open.len();
-    let end = page[start..].find("</script>").expect("block never closes") + start;
+    // A browser ends the block at `</script` in any case, whatever follows.
+    let end = page[start..]
+        .to_ascii_lowercase()
+        .find("</script")
+        .expect("block never closes")
+        + start;
     serde_json::from_str(&page[start..end]).unwrap_or_else(|e| panic!("{e}: {}", &page[start..end]))
 }
 
@@ -245,7 +250,7 @@ async fn start_page_embeds_the_users_layout() {
 async fn hostile_titles_cannot_close_the_json_block() {
     let app = App::new().await;
     let mut web = Web::new(&app, "ada", "admin").await;
-    let hostile = "</script><script>alert(1)</script><!-- <script>";
+    let hostile = "</SCRIPT x></script ><script>alert(1)</script><!-- <script>";
     save_card(&mut web, hostile).await;
 
     let res = start_page(&mut web, "en").await;
@@ -267,7 +272,11 @@ async fn hostile_titles_cannot_close_the_json_block() {
     for id in ["mm-layout", "mm-labels"] {
         let open = format!(r#"<script type="application/json" id="{id}">"#);
         let start = outside.find(&open).unwrap() + open.len();
-        let end = outside[start..].find("</script>").unwrap() + start;
+        let end = outside[start..]
+            .to_ascii_lowercase()
+            .find("</script")
+            .unwrap()
+            + start;
         outside.replace_range(start..end, "");
     }
     for (at, _) in outside.match_indices("<script") {

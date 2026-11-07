@@ -14,8 +14,14 @@ pub enum StoreError {
     #[error(transparent)]
     Db(#[from] DbError),
     /// The stored document is not a layout (it was changed outside Magpie).
-    #[error("the stored layout is not a valid layout document: {0}")]
-    Corrupt(serde_json::Error),
+    /// `version` is the stored version, read in the same query as the
+    /// document: a save over the broken document must carry it, and a save
+    /// that landed in between is then a conflict, never an overwrite.
+    #[error("the stored layout is not a valid layout document: {source}")]
+    Corrupt {
+        version: u64,
+        source: serde_json::Error,
+    },
 }
 
 /// Why a layout was not saved.
@@ -49,9 +55,11 @@ pub async fn load(core: &Core, user_id: i64) -> Result<Layout, StoreError> {
     let Some((version, doc)) = row else {
         return Ok(Layout::default());
     };
-    let mut layout: Layout = serde_json::from_str(&doc).map_err(StoreError::Corrupt)?;
     // The column is the truth; the copy inside the document is for humans.
-    layout.version = u64::try_from(version).unwrap_or_default();
+    let version = u64::try_from(version).unwrap_or_default();
+    let mut layout: Layout =
+        serde_json::from_str(&doc).map_err(|source| StoreError::Corrupt { version, source })?;
+    layout.version = version;
     Ok(layout)
 }
 
@@ -92,20 +100,4 @@ pub async fn save(core: &Core, user_id: i64, layout: &Layout) -> Result<u64, Sav
     })
     .await?;
     outcome.map_err(|current| SaveError::Conflict { current })
-}
-
-/// The stored version (0 when nothing is stored), read without parsing the
-/// document. A page whose stored document cannot be read still needs it: a
-/// save over the broken document must carry this version.
-pub async fn stored_version(core: &Core, user_id: i64) -> Result<u64, DbError> {
-    let version: Option<i64> = db::interact(&core.db, move |c| {
-        c.query_row(
-            "SELECT version FROM layouts WHERE user_id = ?1",
-            params![user_id],
-            |r| r.get(0),
-        )
-        .optional()
-    })
-    .await?;
-    Ok(version.map_or(0, |v| u64::try_from(v).unwrap_or_default()))
 }
