@@ -151,7 +151,7 @@ test("back_navigation_restores_the_background", () => {
   assert.equal(document.querySelectorAll("section.mm-group").length, 1);
 });
 
-// Plan 4, task 3b: start.js hands #mm-services to the renderer.
+// start.js hands #mm-services to the renderer.
 const BOUND = {
   ...LAYOUT,
   groups: [
@@ -170,7 +170,7 @@ test("draw_passes_the_services_block_to_the_renderer", () => {
   const card = document.querySelector(".mm-card");
   assert.ok(card.classList.contains("mm-bound"), "a bound card");
   assert.equal(card.getAttribute("data-service"), "4");
-  // No answer yet (the values come in the next task): the card says it is waiting.
+  // No answer yet (the values come with the event stream): the card says it is waiting.
   assert.equal(card.querySelector(".mm-svc-notice").textContent, "Waiting");
   assert.equal(card.querySelector(".mm-status").getAttribute("data-status"), "unknown");
 });

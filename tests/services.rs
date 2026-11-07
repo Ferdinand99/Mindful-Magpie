@@ -1,4 +1,4 @@
-//! Services (Plan 4, task 1): the admin pages, sealed secrets, «Test», who
+//! Services: the admin pages, sealed secrets, «Test», who
 //! sees what, and the built-in `http` kind against a stub server that runs in
 //! the test process.
 
@@ -766,6 +766,8 @@ async fn http_times_out_as_bad_with_an_error() {
     assert_eq!(snap.status, Status::Bad);
     let error = snap.error.expect("an error");
     assert!(error.to_lowercase().contains("time"), "{error}");
+    // A site that is down was still checked: «Last checked» shows when.
+    assert!(snap.values["checked"].num.is_some(), "{:?}", snap.values);
     assert!(!error.contains(SECRET));
     assert!(
         !error.contains("127.0.0.1"),
@@ -970,7 +972,7 @@ async fn the_service_routes_are_behind_the_csrf_guard() {
 }
 
 // ---------------------------------------------------------------------------
-// A stored secret never follows a changed address (Ruling G)
+// A stored secret never follows a changed address
 
 type AuthLog = std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>;
 
@@ -1079,6 +1081,66 @@ async fn the_same_origin_with_another_path_keeps_the_secret() {
         assert_eq!(res.status, StatusCode::SEE_OTHER, "{new_url}: {}", res.body);
         assert_eq!(stored_secret(&app, id).await.unwrap(), before);
     }
+}
+
+#[tokio::test]
+async fn a_trailing_dot_on_the_host_is_a_changed_origin_and_the_secret_is_not_reused() {
+    let app = App::new().await;
+    let mut admin = Web::new(&app, "root", "admin").await;
+    let id = create_via_page(&mut admin, "Blog", "http://blog.example/health", SECRET).await;
+    let before = stored_secret(&app, id).await.unwrap();
+    let dotted = "http://blog.example./health";
+    // Saving: refused, and the stored key stays.
+    let res = admin
+        .post(
+            &format!("/settings/services/{id}"),
+            &form("Blog", dotted, ""),
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", res.body);
+    assert_eq!(stored_secret(&app, id).await.unwrap(), before);
+    // «Test»: nothing is fetched and no stored key is used.
+    let id_text = id.to_string();
+    let mut f = form("Blog", dotted, "");
+    f.push(("id", &id_text));
+    let res = admin.post("/settings/services/test", &f).await;
+    assert!(
+        res.body.contains("data-test-status=\"unknown\""),
+        "{}",
+        res.body
+    );
+    assert!(
+        res.body
+            .contains("Type the key again when the address changes"),
+        "{}",
+        res.body
+    );
+}
+
+#[tokio::test]
+async fn a_fetch_context_is_refused_for_a_service_that_changed_since_it_was_read() {
+    let app = App::new().await;
+    let core = &app.magpie.core;
+    let mut with_secret = input("S", Visibility::Admin, &[]);
+    with_secret.secret = SecretChange::Replace(SECRET.into());
+    let id = store::create(core, &with_secret).await.unwrap();
+    let held = store::get(core, id).await.unwrap().unwrap();
+    // The row changes behind the holder's back (a new key and address, a
+    // later `updated_at`).
+    app.exec(format!(
+        "UPDATE services SET url = 'http://10.0.0.99/', updated_at = '2099-01-01T00:00:00Z' WHERE id = {id}"
+    ))
+    .await;
+    match store::fetch_ctx(core, &held).await {
+        Err(store::CtxError::Changed) => {}
+        other => panic!("{other:?}"),
+    }
+    // Deleted: the same.
+    store::delete(core, id).await.unwrap();
+    assert!(matches!(
+        store::fetch_ctx(core, &held).await,
+        Err(store::CtxError::Changed)
+    ));
 }
 
 #[tokio::test]

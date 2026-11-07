@@ -222,10 +222,35 @@ function formatBytes(n, lang, suffix) {
   return `${shown} ${BYTE_UNITS[unit]}${suffix}`;
 }
 
+/** `abs` rounded half up to `digits` decimals, on its decimal text ("4.25" gives 4.3, which toFixed would not). */
+function roundHalfUp(abs, digits) {
+  const text = String(abs);
+  // Exponent notation (very small or very large): the plain arithmetic is good enough there.
+  if (/e/i.test(text)) return Math.round(abs * 10 ** digits) / 10 ** digits;
+  return Number(`${Math.round(Number(`${text}e${digits}`))}e-${digits}`);
+}
+
+/**
+ * A whole number has no decimals ("100 %", "45 %"); from 99 up to 100 there are two ("99.87 %": an
+ * uptime must not read 99), capped at 99.99 so that only an exact 100 reads 100; anything else with
+ * a fraction has one ("45.3 %"). Rounded half up, and a number that rounds to a whole one has none.
+ */
 function formatPercent(n, lang) {
-  const digits = Math.round(Math.abs(n) * 10) / 10 < 10 ? 1 : 0;
+  const abs = Math.abs(n);
+  let digits = 0;
+  let shown = abs;
+  if (!Number.isInteger(abs)) {
+    if (abs >= 99 && abs < 100) {
+      digits = 2;
+      shown = Math.min(roundHalfUp(abs, 2), 99.99);
+    } else {
+      digits = 1;
+      shown = roundHalfUp(abs, 1);
+    }
+    if (Number.isInteger(shown)) digits = 0;
+  }
   return formatNumber(
-    n,
+    n < 0 && shown !== 0 ? -shown : shown,
     lang,
     { style: "unit", unit: "percent", minimumFractionDigits: digits, maximumFractionDigits: digits },
     "%",
@@ -282,7 +307,8 @@ function sinceMs(value) {
  * `since` counts from, the wall clock by default.
  *
  *   number         1,234,567: grouped by locale, at most two decimals
- *   percent        0-100 in; one decimal under 10 ("4.3%"), none from 10; not clamped
+ *   percent        0-100 in; none for a whole number ("45%"), two from 99 up to 100 ("99.87%", never
+ *                  "100%" unless exactly 100), else one ("45.3%"); rounded half up; not clamped
  *   bytes          binary units B, KiB, MiB, GiB, TiB ("1.5 GiB"); TiB is the top unit
  *   bytes_per_sec  the same with "/s" ("2.5 MiB/s")
  *   duration       seconds in; the largest unit and the next one if not zero ("3 d 4 h", nb "3 d 4 t", "1 d")
@@ -640,13 +666,19 @@ function drawNeed(doc, item, href, opts, nowMs) {
     chip.setAttribute("href", href);
     chip.setAttribute("rel", "noreferrer");
   }
-  chip.appendChild(drawStatus(doc, labels, item.level));
-  chip.appendChild(isolated(doc, "span", "mm-need-name", item.service_name));
-  chip.appendChild(separator(doc));
-  chip.appendChild(isolated(doc, "span", "mm-need-text", item.label));
+  // The separator stays with the part before it, so when the chip is too narrow for one line it
+  // breaks between the parts (the name, the text, the age), never inside the name or at a lone dot.
+  const lead = make(doc, "span", "mm-need-lead");
+  lead.appendChild(drawStatus(doc, labels, item.level));
+  lead.appendChild(isolated(doc, "span", "mm-need-name", item.service_name));
+  lead.appendChild(separator(doc));
+  chip.appendChild(lead);
   const sinceMs = toMs(item.since);
+  const main = make(doc, "span", "mm-need-main");
+  main.appendChild(isolated(doc, "span", "mm-need-text", item.label));
+  if (sinceMs !== null) main.appendChild(separator(doc));
+  chip.appendChild(main);
   if (sinceMs !== null) {
-    chip.appendChild(separator(doc));
     const age = make(doc, "span", "mm-need-age", formatRelative(Math.min(sinceMs, nowMs), nowMs, opts.lang));
     // What tickAges() counts from.
     age.setAttribute("data-since", String(sinceMs));
@@ -947,7 +979,7 @@ function applyBackground(doc, background, opts) {
  *     format }] }]`, the services the viewer can see. A bound id that is not in
  *     the list gets the notice `service_missing`; the card keeps its link.
  *   - `opts.values`: `{ now, services: { "<id>": { name, kind, interval_s,
- *     status, values: { "<metric>": { num, text } }, needs, fetched_at,
+ *     status, values: { "<metric>": { num, text } }, fetched_at,
  *     error_label? } } }`. `now` and `fetched_at` are ISO 8601 strings or epoch
  *     seconds; ages count from `now`, never from the clock, so a page can draw
  *     the same thing twice. A service with no entry shows `service_waiting`.

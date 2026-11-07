@@ -837,16 +837,18 @@ async fn test(State(core): State<Core>, user: CurrentUser, body: Bytes) -> ApiRe
         SecretChange::Replace(secret) => Some(secret.clone()),
         SecretChange::Clear => None,
         SecretChange::Keep => match raw.get("id").parse::<i64>() {
-            Ok(id) => match store::get(&core, id).await? {
-                Some(service) if service.kind == input.kind && service.has_secret => {
+            // One row: the origin is compared with the very row the secret is
+            // opened from.
+            Ok(id) => match store::stored_secret(&core, id).await? {
+                Some(stored) if stored.kind == input.kind && stored.has_secret() => {
                     // The stored secret only goes to the address it was saved for.
-                    if !same_origin(service.url.as_deref(), input.url.as_deref()) {
+                    if !same_origin(stored.url.as_deref(), input.url.as_deref()) {
                         return Ok(
                             HtmlTemplate(unknown(i18n::t("err.secret_origin").to_string()))
                                 .into_response(),
                         );
                     }
-                    match store::open_secret(&core, id).await {
+                    match stored.open(&core) {
                         Ok(secret) => secret,
                         Err(store::CtxError::SecretUnreadable(_)) => {
                             return Ok(HtmlTemplate(unknown(reason_text(
@@ -854,7 +856,7 @@ async fn test(State(core): State<Core>, user: CurrentUser, body: Bytes) -> ApiRe
                             )))
                             .into_response());
                         }
-                        Err(store::CtxError::Db(err)) => return Err(ApiError::internal(err)),
+                        Err(err) => return Err(ApiError::internal(err)),
                     }
                 }
                 _ => None,

@@ -1,4 +1,4 @@
-//! The background poller (Plan 4, task 2): when it fetches, how it backs off,
+//! The background poller: when it fetches, how it backs off,
 //! what it stores and announces, and that a slow, hostile or secret-holding
 //! service stays contained.
 //!
@@ -87,6 +87,12 @@ enum Mode {
     Ok,
     /// `Ok` with a bad reading that says why (what the http kind does).
     Bad,
+    /// `Ok` with a bad reading that says `HTTP 500`.
+    Http500,
+    /// `Ok` with a bad reading: the address is not allowed.
+    BadForbidden,
+    /// `Ok` with a bad reading: a redirect to another scheme.
+    BadRedirectScheme,
     /// `Err(Config)`: no reading could be made, the settings are no good.
     Err,
     /// `Err(Connect)`.
@@ -234,6 +240,9 @@ impl Integration for Stub {
                 Mode::ErrAuth => Err(FetchError::Auth),
                 Mode::ErrKkTooOld => Err(FetchError::KkTooOld),
                 Mode::Bad => Ok(Snapshot::failed(&FetchError::Connect)),
+                Mode::BadForbidden => Ok(Snapshot::failed(&FetchError::Forbidden)),
+                Mode::BadRedirectScheme => Ok(Snapshot::failed(&FetchError::RedirectScheme)),
+                Mode::Http500 => Ok(Snapshot::failed(&FetchError::Status(500))),
                 Mode::Ok => Ok(ok_snapshot(n, marker)),
             }
         })
@@ -296,7 +305,7 @@ async fn add_stub(app: &App, name: &str, tag: &str, marker: &str, interval_s: i6
     .await
 }
 
-fn start_with(
+async fn start_with(
     app: &App,
     kinds: fn(&str) -> Option<&'static dyn Integration>,
     spread: u64,
@@ -311,6 +320,7 @@ fn start_with(
             spread: Duration::from_secs(spread),
         },
     )
+    .await
 }
 
 /// Long enough that the paused clock reaches anything the test waits for;
@@ -438,7 +448,7 @@ async fn a_service_is_fetched_on_start_and_then_every_interval() {
     tokio::time::pause();
     let id = add_stub(&app, "Interval", "t_interval", "a", 60).await;
     let started = Instant::now();
-    let poller = start_with(&app, stub_kinds, 5);
+    let poller = start_with(&app, stub_kinds, 5).await;
     wait_calls("t_interval", 3).await;
     let c = calls("t_interval");
     assert!(
@@ -460,7 +470,7 @@ async fn the_first_fetches_are_spread_over_the_start_up_window() {
         add_stub(&app, tag, tag, "", 600).await;
     }
     let started = Instant::now();
-    let _poller = start_with(&app, stub_kinds, 5);
+    let _poller = start_with(&app, stub_kinds, 5).await;
     let mut first = Vec::new();
     for tag in &tags {
         wait_calls(tag, 1).await;
@@ -490,7 +500,7 @@ async fn an_interval_below_the_kinds_minimum_is_raised_to_it() {
         1,
     )
     .await;
-    let _poller = start_with(&app, stub_kinds, 0);
+    let _poller = start_with(&app, stub_kinds, 0).await;
     wait_calls("t_clamp", 3).await;
     let c = calls("t_clamp");
     assert_gap("1st to 2nd", secs(c[1].at, c[0].at), 10.0);
@@ -503,7 +513,7 @@ async fn a_failing_fetch_backs_off_twofold_to_ten_minutes_and_resets_on_success(
     tokio::time::pause();
     set_mode("t_backoff", Mode::Err);
     let id = add_stub(&app, "Backoff", "t_backoff", "", 150).await;
-    let poller = start_with(&app, stub_kinds, 0);
+    let poller = start_with(&app, stub_kinds, 0).await;
     wait_calls("t_backoff", 1).await;
     // The failure is a bad reading with a short reason, not a missing one.
     let s = wait_snapshot(&poller, id, |_| true).await;
@@ -525,6 +535,39 @@ async fn a_failing_fetch_backs_off_twofold_to_ten_minutes_and_resets_on_success(
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn a_bad_reading_that_says_why_is_fetched_again_on_the_interval_without_backing_off() {
+    let app = App::new().await;
+    tokio::time::pause();
+    // What the http kind answers when a site gives HTTP 500, times out or
+    // refuses the connection: a reading, not a failed fetch.
+    set_mode("t_no_backoff", Mode::Http500);
+    let id = add_service(
+        &app,
+        "http",
+        "Down",
+        None,
+        json!({ "tag": "t_no_backoff" }),
+        150,
+    )
+    .await;
+    let poller = start_with(&app, stub_as_http_kinds, 0).await;
+    wait_calls("t_no_backoff", 5).await;
+    let s = wait_snapshot(&poller, id, |_| true).await;
+    assert_eq!(s.status, Status::Bad);
+    assert_eq!(s.error.as_deref(), Some("HTTP 500"));
+    let c = calls("t_no_backoff");
+    for n in 1..5 {
+        assert_gap("a bad reading", secs(c[n].at, c[n - 1].at), 150.0);
+    }
+    // And the site coming back is seen on the next interval, not late.
+    set_mode("t_no_backoff", Mode::Ok);
+    wait_calls("t_no_backoff", 6).await;
+    let c = calls("t_no_backoff");
+    assert_gap("recovery", secs(c[5].at, c[4].at), 150.0);
+    wait_snapshot(&poller, id, |s| s.status == Status::Ok).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn one_hanging_service_does_not_delay_another() {
     let app = App::new().await;
     tokio::time::pause();
@@ -532,7 +575,7 @@ async fn one_hanging_service_does_not_delay_another() {
     let hung = add_stub(&app, "Hangs", "t_hang", "", 10).await;
     let fine = add_stub(&app, "Fine", "t_fine", "", 10).await;
     let started = Instant::now();
-    let poller = start_with(&app, stub_kinds, 0);
+    let poller = start_with(&app, stub_kinds, 0).await;
     wait_calls("t_fine", 3).await;
     assert!(
         secs(Instant::now(), started) < 25.0,
@@ -556,7 +599,7 @@ async fn a_panicking_kind_gives_a_bad_snapshot_and_is_fetched_again() {
     tokio::time::pause();
     set_mode("t_panic", Mode::Panic);
     let id = add_stub(&app, "Panics", "t_panic", "", 10).await;
-    let poller = start_with(&app, stub_kinds, 0);
+    let poller = start_with(&app, stub_kinds, 0).await;
     wait_calls("t_panic", 1).await;
     let s = wait_snapshot(&poller, id, |_| true).await;
     assert_eq!(s.status, Status::Bad);
@@ -575,7 +618,7 @@ async fn a_snapshot_is_stored_and_loaded_on_restart_before_the_first_fetch() {
     let app = App::new().await;
     tokio::time::pause();
     let id = add_stub(&app, "Stored", "t_stored", "kept", 60).await;
-    let poller = start_with(&app, stub_kinds, 0);
+    let poller = start_with(&app, stub_kinds, 0).await;
     wait_calls("t_stored", 1).await;
     let first = wait_snapshot(&poller, id, |_| true).await;
     // One row, holding the reading.
@@ -588,11 +631,9 @@ async fn a_snapshot_is_stored_and_loaded_on_restart_before_the_first_fetch() {
     }
 
     // A new poller, whose first fetch is a long way off.
-    let poller = start_with(&app, stub_kinds, 1000);
-    until_state("the stored snapshot to load", || {
-        poller.snapshot(id).is_some()
-    })
-    .await;
+    let poller = start_with(&app, stub_kinds, 1000).await;
+    // Already there when start returns: a request right after the server
+    // binds sees it.
     let loaded = poller.snapshot(id).unwrap();
     assert_eq!(loaded.fetched_at, first.fetched_at, "its own time, not now");
     assert_eq!(*loaded, *first);
@@ -622,7 +663,7 @@ async fn an_older_stored_shape_loads_and_a_corrupt_row_is_skipped() {
     now.values.insert("n".into(), Value::num(5.0));
     store_snapshot(&app, current, &now).await;
 
-    let poller = start_with(&app, stub_kinds, 1000);
+    let poller = start_with(&app, stub_kinds, 1000).await;
     until_state("the stored snapshots to load", || {
         poller.snapshot(current).is_some()
     })
@@ -650,7 +691,7 @@ async fn a_broadcast_goes_out_for_every_new_snapshot() {
     tokio::time::pause();
     let a = add_stub(&app, "A", "t_bc_a", "", 10).await;
     let b = add_stub(&app, "B", "t_bc_b", "", 10).await;
-    let poller = start_with(&app, stub_kinds, 0);
+    let poller = start_with(&app, stub_kinds, 0).await;
     let mut rx = poller.subscribe();
     let third = |s: &Snapshot| s.values.get("n") == Some(&Value::num(3.0));
     wait_snapshot(&poller, a, third).await;
@@ -674,7 +715,7 @@ async fn an_update_fetches_again_at_once_with_the_new_settings() {
     let app = App::new().await;
     tokio::time::pause();
     let id = add_stub(&app, "Changing", "t_update", "old", 3600).await;
-    let poller = start_with(&app, stub_kinds, 0);
+    let poller = start_with(&app, stub_kinds, 0).await;
     wait_calls("t_update", 1).await;
     wait_snapshot(&poller, id, |_| true).await;
 
@@ -703,7 +744,7 @@ async fn an_update_fetches_again_at_once_with_the_new_settings() {
 async fn a_new_service_is_fetched_at_once_without_the_start_up_stagger() {
     let app = App::new().await;
     tokio::time::pause();
-    let poller = start_with(&app, stub_kinds, 1000);
+    let poller = start_with(&app, stub_kinds, 1000).await;
     let id = add_stub(&app, "Added", "t_created", "", 60).await;
     let started = Instant::now();
     app.magpie
@@ -721,7 +762,7 @@ async fn a_deleted_service_stops_and_its_row_is_gone() {
     tokio::time::pause();
     let id = add_stub(&app, "Doomed", "t_delete", "", 10).await;
     let other = add_stub(&app, "Stays", "t_stays", "", 10).await;
-    let poller = start_with(&app, stub_kinds, 0);
+    let poller = start_with(&app, stub_kinds, 0).await;
     wait_snapshot(&poller, id, |_| true).await;
     wait_snapshot(&poller, other, |_| true).await;
     assert!(stored_json(&app, id).await.is_some());
@@ -759,7 +800,7 @@ async fn a_fetch_that_is_out_when_the_service_is_deleted_leaves_nothing_behind()
     tokio::time::pause();
     set_mode("t_late", Mode::Block);
     let id = add_stub(&app, "Late", "t_late", "", 10).await;
-    let poller = start_with(&app, stub_kinds, 0);
+    let poller = start_with(&app, stub_kinds, 0).await;
     let mut rx = poller.subscribe();
     wait_calls("t_late", 1).await;
 
@@ -798,12 +839,12 @@ async fn a_fetch_that_is_out_when_the_service_is_deleted_leaves_nothing_behind()
 async fn reload_and_remove_work_without_an_event() {
     let app = App::new().await;
     tokio::time::pause();
-    let poller = start_with(&app, stub_kinds, 1000);
+    let poller = start_with(&app, stub_kinds, 1000).await;
     let id = add_stub(&app, "Handle", "t_handle", "", 60).await;
     poller.reload(id);
     wait_snapshot(&poller, id, |_| true).await;
     let mut rx = poller.subscribe();
-    poller.remove(id);
+    poller.remove_for_tests(id);
     assert!(
         poller.snapshot(id).is_none(),
         "gone as soon as remove returns"
@@ -820,7 +861,7 @@ async fn an_idle_handle_holds_set_snapshots_and_announces_removal() {
     poller.set_snapshot_for_tests(7, Snapshot::new(Status::Warn));
     assert_eq!(poller.snapshot(7).unwrap().status, Status::Warn);
     assert_eq!(rx.try_recv(), Ok(Change::Snapshot(7)));
-    poller.remove(7);
+    poller.remove_for_tests(7);
     assert!(poller.snapshot(7).is_none());
     assert_eq!(rx.try_recv(), Ok(Change::Removed(7)));
 }
@@ -831,7 +872,7 @@ async fn after_missed_events_only_new_or_changed_services_are_restarted() {
     tokio::time::pause();
     let a = add_stub(&app, "Unchanged", "t_rs_a", "", 600).await;
     let b = add_stub(&app, "Changed", "t_rs_b", "", 600).await;
-    let poller = start_with(&app, stub_kinds, 5);
+    let poller = start_with(&app, stub_kinds, 5).await;
     wait_calls("t_rs_a", 1).await;
     wait_calls("t_rs_b", 1).await;
     wait_snapshot(&poller, a, |_| true).await;
@@ -877,7 +918,7 @@ async fn two_bad_fetches_in_a_row_make_a_need_and_a_good_one_clears_it() {
     tokio::time::pause();
     set_mode("t_need", Mode::Bad);
     let id = add_service(&app, "http", "Needy", None, json!({ "tag": "t_need" }), 10).await;
-    let poller = start_with(&app, stub_as_http_kinds, 0);
+    let poller = start_with(&app, stub_as_http_kinds, 0).await;
     wait_calls("t_need", 1).await;
     let first = wait_snapshot(&poller, id, |_| true).await;
     assert_eq!(first.status, Status::Bad);
@@ -918,7 +959,7 @@ async fn an_error_counts_as_a_bad_fetch_for_the_need() {
         10,
     )
     .await;
-    let poller = start_with(&app, stub_as_http_kinds, 0);
+    let poller = start_with(&app, stub_as_http_kinds, 0).await;
     let s = wait_snapshot(&poller, id, |s| !s.needs.is_empty()).await;
     assert_eq!(s.needs[0].key, DOWN_KEY);
     assert_eq!(calls("t_need_err").len(), 2);
@@ -937,7 +978,7 @@ async fn unusable_settings_or_secret_need_an_admin_not_the_site() {
     ] {
         set_mode(tag, mode);
         let id = add_stub(&app, tag, tag, "", 10).await;
-        let poller = start_with(&app, stub_kinds, 0);
+        let poller = start_with(&app, stub_kinds, 0).await;
         let s = wait_snapshot(&poller, id, |s| !s.needs.is_empty()).await;
         assert_eq!(
             calls(tag).len(),
@@ -965,9 +1006,44 @@ async fn unusable_settings_or_secret_need_an_admin_not_the_site() {
         10,
     )
     .await;
-    let poller = start_with(&app, stub_as_http_kinds, 0);
+    let poller = start_with(&app, stub_as_http_kinds, 0).await;
     let s = wait_snapshot(&poller, id, |s| !s.needs.is_empty()).await;
     assert_eq!(s.needs[0].key, CONFIG_KEY);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_forbidden_address_or_redirect_needs_an_admin_not_the_site() {
+    let app = App::new().await;
+    tokio::time::pause();
+    for (tag, mode) in [
+        ("t_forbidden", Mode::BadForbidden),
+        ("t_redirect_scheme", Mode::BadRedirectScheme),
+    ] {
+        set_mode(tag, mode);
+        let id = add_service(&app, "http", tag, None, json!({ "tag": tag }), 10).await;
+        let poller = start_with(&app, stub_as_http_kinds, 0).await;
+        let s = wait_snapshot(&poller, id, |s| !s.needs.is_empty()).await;
+        assert_eq!(s.needs.len(), 1, "{tag}");
+        assert_eq!(s.needs[0].key, CONFIG_KEY, "{tag}");
+        assert_eq!(s.needs[0].label_key, "need.service_config", "{tag}");
+        drop(poller);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_supervisor_that_panics_is_logged_at_error() {
+    fn panicking_kinds(_: &str) -> Option<&'static dyn Integration> {
+        panic!("the kinds lookup panics");
+    }
+    let app = App::new().await;
+    tokio::time::pause();
+    add_stub(&app, "Doomed", "t_doomed", "", 60).await;
+    let _poller = start_with(&app, panicking_kinds, 0).await;
+    until_state("the supervisor's end to be logged", || {
+        logged().contains("supervisor panicked")
+    })
+    .await;
+    assert!(logged().contains("ERROR"), "{}", logged());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -976,7 +1052,7 @@ async fn a_kind_without_the_rule_gets_no_down_need() {
     tokio::time::pause();
     set_mode("t_no_rule", Mode::Bad);
     let id = add_stub(&app, "NoRule", "t_no_rule", "", 10).await;
-    let poller = start_with(&app, stub_kinds, 0);
+    let poller = start_with(&app, stub_kinds, 0).await;
     wait_calls("t_no_rule", 3).await;
     let s = wait_snapshot(&poller, id, |_| true).await;
     assert!(s.needs.is_empty());
@@ -994,7 +1070,7 @@ async fn a_need_that_is_showing_survives_a_restart() {
     stored.needs.push(down_need());
     store_snapshot(&app, id, &stored).await;
 
-    let poller = start_with(&app, stub_as_http_kinds, 0);
+    let poller = start_with(&app, stub_as_http_kinds, 0).await;
     // One bad fetch after the restart: the need is still there, it did not
     // go and come back (an acknowledgement would reopen).
     let s = wait_snapshot(&poller, id, |s| s.fetched_at > stored.fetched_at).await;
@@ -1013,7 +1089,7 @@ async fn a_bad_snapshot_without_a_need_counts_as_the_first_bad_reading() {
     let mut stored = Snapshot::failed(&FetchError::Connect);
     stored.fetched_at = Timestamp::from_second(1_700_000_000).unwrap();
     store_snapshot(&app, id, &stored).await;
-    let poller = start_with(&app, stub_as_http_kinds, 0);
+    let poller = start_with(&app, stub_as_http_kinds, 0).await;
     // Bad before the restart, bad after it: two in a row.
     let s = wait_snapshot(&poller, id, |s| s.fetched_at > stored.fetched_at).await;
     assert_eq!(s.needs.len(), 1, "{s:?}");
@@ -1033,7 +1109,7 @@ async fn a_need_that_is_showing_survives_an_update_of_an_unrelated_field() {
         10,
     )
     .await;
-    let poller = start_with(&app, stub_as_http_kinds, 0);
+    let poller = start_with(&app, stub_as_http_kinds, 0).await;
     wait_calls("t_keep_upd", 2).await;
     let shown = wait_snapshot(&poller, id, |s| !s.needs.is_empty()).await;
 
@@ -1166,7 +1242,7 @@ async fn hostile_answers_give_a_bad_snapshot_with_a_reason_and_no_panic() {
         60,
     )
     .await;
-    let poller = start_with(&app, stub_kinds, 0);
+    let poller = start_with(&app, stub_kinds, 0).await;
 
     let s = real_snapshot(&poller, ok).await;
     assert_eq!(s.status, Status::Ok, "{s:?}");
@@ -1242,7 +1318,7 @@ async fn no_secret_and_no_userinfo_reaches_a_log_a_snapshot_or_the_database() {
         },
     )
     .await;
-    let poller = start_with(&app, stub_kinds, 0);
+    let poller = start_with(&app, stub_kinds, 0).await;
 
     let s = real_snapshot(&poller, id).await;
     assert_eq!(s.status, Status::Ok, "the secret was sent: {s:?}");
@@ -1297,7 +1373,7 @@ async fn a_secret_that_cannot_be_opened_is_recorded_as_such_not_as_bad_settings(
         "UPDATE services SET secret = 'sealed:v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' WHERE id = {id}"
     ))
     .await;
-    let poller = start_with(&app, stub_kinds, 0);
+    let poller = start_with(&app, stub_kinds, 0).await;
     let s = real_snapshot(&poller, id).await;
     assert_eq!(s.status, Status::Bad);
     assert_eq!(
@@ -1341,7 +1417,7 @@ async fn a_site_that_never_answers_is_bad_with_a_timeout_and_the_others_go_on() 
     .await;
     add_stub(&app, "Other", "t_real_other", "", 1).await;
     let started = std::time::Instant::now();
-    let poller = start_with(&app, stub_kinds, 0);
+    let poller = start_with(&app, stub_kinds, 0).await;
     let s = real_snapshot(&poller, hung).await;
     let took = started.elapsed();
     assert_eq!(s.status, Status::Bad, "{s:?}");

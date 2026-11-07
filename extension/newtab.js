@@ -1,4 +1,4 @@
-import { start } from "./newtab-core.js";
+import { connectionChanged, start } from "./newtab-core.js";
 import { createView } from "./newtab-view.js";
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -17,11 +17,11 @@ document.addEventListener("DOMContentLoaded", () => {
     onChange: (callback) => document.addEventListener("visibilitychange", callback),
   };
   // A new server or token makes this tab's data stale: stop refreshing at once (newtab-core.js also
-  // checks the saved settings before every write).
+  // checks the saved settings before every write). Saving the same values again changes nothing.
   const connection = {
     onChange: (callback) =>
       browser.storage.onChanged.addListener((changes, area) => {
-        if (area === "local" && (changes.serverUrl || changes.token)) callback();
+        if (connectionChanged(changes, area)) callback();
       }),
   };
   start({

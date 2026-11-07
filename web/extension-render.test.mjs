@@ -389,3 +389,35 @@ test("a failed new image releases the old blob, and the old id is fetched again 
   assert.equal(v.urls.created.length, 2);
   assert.equal(bgImage(v.html), `url("${v.urls.created[1]}")`);
 });
+
+test("the acknowledged toggle opens the list in the new tab", () => {
+  const v = makeView();
+  const NOW = 1_760_000_000;
+  const needs = [
+    { service_id: 1, service_name: "Blog", key: "down", level: "bad", label: "down", since: NOW - 60, acked: true },
+  ];
+  const view = {
+    status: "fresh",
+    data: layout({ groups: [{ id: "g1", title: "Home", cards: [card("a", "Blog")] }] }),
+    services: [{ id: 1, name: "Blog", kind: "http", interval_s: 60, metrics: [] }],
+    values: { now: NOW, services: {}, needs },
+  };
+  v.draw(view, CONN);
+  const toggle = v.root.querySelector(".mm-needs-toggle");
+  assert.ok(toggle, "the toggle is drawn");
+  assert.equal(toggle.textContent, "1 acknowledged");
+  const list = v.root.querySelector(".mm-needs-acked");
+  assert.ok(list.hasAttribute("hidden"));
+  const click = (el) => el.dispatchEvent(new v.doc.defaultView.Event("click", { bubbles: true, cancelable: true }));
+  click(toggle);
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  assert.equal(list.hasAttribute("hidden"), false);
+  // Still wired after a redraw (the listener is on the root, not on the toggle).
+  v.draw({ ...view, data: layout({ ...view.data }) }, CONN);
+  const again = v.root.querySelector(".mm-needs-toggle");
+  click(again);
+  assert.equal(again.getAttribute("aria-expanded"), "true");
+  click(again);
+  assert.equal(again.getAttribute("aria-expanded"), "false");
+  assert.ok(v.root.querySelector(".mm-needs-acked").hasAttribute("hidden"));
+});

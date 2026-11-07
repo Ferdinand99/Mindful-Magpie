@@ -2026,7 +2026,7 @@ test("an_editor_whose_page_was_swapped_away_is_dropped_by_afterSettle", async ()
   assert.equal(fresh.hasAttribute("data-editing"), false);
 });
 
-// ---- cards bound to services (Plan 4, task 3b) ---------------------------------
+// ---- cards bound to services ---------------------------------------------------
 
 const metric = (id, label, format = "number") => ({ id, label, format });
 const service = (id, name, metrics) => ({ id, name, kind: "http", interval_s: 60, metrics });
@@ -2329,7 +2329,7 @@ test("leaving_edit_mode_draws_bound_cards_with_the_services_again", async () => 
   const el = t.root.querySelector(".mm-card.mm-bound");
   assert.ok(el, "the card is drawn as a bound card, not as a plain link");
   assert.equal(el.getAttribute("data-service"), "1");
-  // No answer yet (the values come in the next task): the card says it is waiting.
+  // No answer yet (the values come with the event stream): the card says it is waiting.
   assert.equal(el.querySelector(".mm-svc-notice").textContent, LABELS.service_waiting);
   assert.equal(el.querySelector(".mm-status").getAttribute("data-status"), "unknown");
 });

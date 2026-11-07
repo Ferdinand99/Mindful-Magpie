@@ -680,7 +680,7 @@ async fn the_exchange_is_rate_limited() {
     assert!(at >= 5, "limited too early: after {at} requests");
 }
 
-// ---- fix round 1 -----------------------------------------------------------
+// ---- parallel use, the consent form, the token cap and who may connect ---------
 
 fn sha1_hex(text: &str) -> String {
     use sha1::{Digest as _, Sha1};
@@ -894,6 +894,24 @@ async fn reconnecting_the_same_device_leaves_one_token() {
         let app = &app;
         async move { bearer_get(app, "/api/v1/me/start", &token).await.status }
     };
+    // The replacement carries the extension's `start:owner` scope, and only
+    // that: one scope row for the one token of the device.
+    let scopes: Vec<String> = app
+        .magpie
+        .core
+        .with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT s.scope FROM api_tokens t
+                 JOIN api_token_scopes s ON s.token_id = t.id
+                 WHERE t.name = ?1 AND t.user_id = ?2",
+            )?;
+            stmt.query_map(rusqlite::params![name, ada], |r| r.get(0))?
+                .collect()
+        })
+        .await
+        .unwrap();
+    assert_eq!(scopes, ["start:owner"]);
+
     assert_eq!(status(first).await, StatusCode::UNAUTHORIZED, "replaced");
     assert_eq!(status(second).await, StatusCode::OK);
     assert_eq!(status(mac).await, StatusCode::OK);

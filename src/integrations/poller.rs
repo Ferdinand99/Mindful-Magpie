@@ -5,12 +5,13 @@
 //! Pages and the extension never fetch. They read [`PollerHandle::snapshot`],
 //! which is an in-memory lookup, so a slow or dead service can't slow them.
 //!
-//! **Shape.** [`Poller::start`] spawns one supervisor task. It loads the
-//! stored snapshots (so a restart shows the last values, with their own age,
-//! before the first fetch), then runs one task per service. The supervisor
+//! **Shape.** [`Poller::start`] loads the stored snapshots (so a restart
+//! shows the last values, with their own age, before the first fetch, and a
+//! request right after the server binds already sees them) and then spawns
+//! one supervisor task, which runs one task per service. The supervisor
 //! listens for [`ServiceEvent`]s (the services pages announce a created,
 //! changed or deleted service on `Magpie::service_events`, after the change is
-//! stored) and for [`PollerHandle::reload`] and [`PollerHandle::remove`]; a
+//! stored) and for [`PollerHandle::reload`]; a
 //! changed service gets a new task that fetches at once, a deleted one loses
 //! its task, its snapshot and its row. Fetches run in a task of their own with
 //! a deadline, so a hung or panicking kind costs its own service one bad
@@ -19,16 +20,19 @@
 //! **Schedule.** The first fetch after start is staggered over
 //! [`START_SPREAD`] so a restart does not hit every service at once. After
 //! that a service is fetched every `interval` (the service's, at least the
-//! kind's minimum), ±10 %. A failed fetch (no reading, a timeout, or a bad
-//! reading that carries an error) doubles the wait, up to [`MAX_BACKOFF`] (or
-//! the interval when that is longer); a good one resets it.
+//! kind's minimum), ±10 %. A failed fetch (no reading, or the deadline, or a
+//! panic) doubles the wait, up to [`MAX_BACKOFF`] (or the interval when that
+//! is longer); a reading resets it. A bad reading, even one that says why (a
+//! site that answers 500, or not at all), is the service's state, not a
+//! failure of the fetch: it is read again at the normal interval.
 //!
 //! **«Trenger deg».** A kind sees one fetch at a time, so "bad twice in a row"
 //! is the poller's: from the second bad reading in a row a service gets a
 //! need. It is [`DOWN_KEY`] («the site does not answer») for a kind that has
 //! the rule (see [`down_label`]), or [`CONFIG_KEY`] («set it up again») when
-//! the reading failed because the settings or the stored secret can't be used:
-//! that needs an admin, not the site. The count survives a restart, an update
+//! the reading failed because the settings, the address or the stored secret
+//! can't be used (an address that is not allowed, a redirect to another
+//! scheme): that needs an admin, not the site. The count survives a restart, an update
 //! and a resync: it is taken up again from the stored snapshot, so a need
 //! that is showing does not go and come back (an acknowledgement would
 //! reopen).
@@ -194,10 +198,13 @@ impl PollerHandle {
         }
     }
 
-    /// Forgets the service: its task stops, its snapshot and its row go, and
-    /// [`Change::Removed`] is announced. [`PollerHandle::snapshot`] answers
-    /// `None` from the moment this returns.
-    pub fn remove(&self, service_id: i64) {
+    /// Forgets the service as if it were deleted: its task stops, its
+    /// snapshot and its row go, and [`Change::Removed`] is announced.
+    /// [`PollerHandle::snapshot`] answers `None` from the moment this returns.
+    /// **For tests only** (hidden from the docs): the pages never call it,
+    /// they announce [`ServiceEvent::Deleted`] and the poller follows.
+    #[doc(hidden)]
+    pub fn remove_for_tests(&self, service_id: i64) {
         self.shared.forget(service_id);
         match &self.control {
             // The poller announces it once the row is gone too.
@@ -245,17 +252,18 @@ pub struct Poller;
 
 impl Poller {
     /// Starts polling every stored service with `http` and follows `events`.
-    /// Needs a running tokio runtime.
-    pub fn start(
+    /// The stored snapshots are in memory when this returns. Needs a running
+    /// tokio runtime.
+    pub async fn start(
         core: Core,
         http: reqwest::Client,
         events: &broadcast::Sender<ServiceEvent>,
     ) -> PollerHandle {
-        Self::start_with(core, http, events, Options::default())
+        Self::start_with(core, http, events, Options::default()).await
     }
 
     /// [`Poller::start`] with other [`Options`].
-    pub fn start_with(
+    pub async fn start_with(
         core: Core,
         http: reqwest::Client,
         events: &broadcast::Sender<ServiceEvent>,
@@ -274,7 +282,16 @@ impl Poller {
             running: HashMap::new(),
             next_generation: 0,
         };
-        tokio::spawn(supervisor.run(commands, events));
+        supervisor.load_stored().await;
+        let run = tokio::spawn(supervisor.run(commands, events));
+        // A panic in the supervisor would stop all polling without a word.
+        tokio::spawn(async move {
+            if let Err(err) = run.await
+                && err.is_panic()
+            {
+                tracing::error!("the poller's supervisor panicked: no service is fetched any more");
+            }
+        });
         PollerHandle {
             shared,
             control: Some(control),
@@ -318,7 +335,6 @@ impl Supervisor {
         mut commands: mpsc::UnboundedReceiver<Control>,
         events: broadcast::Receiver<ServiceEvent>,
     ) {
-        self.load_stored().await;
         match store::list(&self.core).await {
             Ok(services) => {
                 tracing::info!(services = services.len(), "poller started");
@@ -530,7 +546,12 @@ impl Job {
         let mut failures: u32 = 0;
         let mut bad_in_a_row: u32 = self.seed;
         loop {
-            let (mut snapshot, failed) = self.fetch().await;
+            let Some((mut snapshot, failed)) = self.fetch().await else {
+                // Changed while this task waited: the new task of the service
+                // is on its way (the service event), this one only waits.
+                tokio::time::sleep(jitter(interval)).await;
+                continue;
+            };
             failures = if failed { failures + 1 } else { 0 };
             bad_in_a_row = if snapshot.status == Status::Bad {
                 bad_in_a_row + 1
@@ -590,10 +611,12 @@ impl Job {
     }
 
     /// One fetch: the reading, and whether the fetch failed (no reading, a
-    /// timeout, or a bad reading with an error).
-    async fn fetch(&self) -> (Snapshot, bool) {
+    /// timeout or a panic; a bad reading is not a failure). `None` when the
+    /// service was changed after this task started: its replacement fetches.
+    async fn fetch(&self) -> Option<(Snapshot, bool)> {
         let mut ctx = match store::fetch_ctx(&self.core, &self.service).await {
             Ok(ctx) => ctx,
+            Err(store::CtxError::Changed) => return None,
             Err(err) => {
                 tracing::warn!(
                     service_id = self.service.id,
@@ -601,18 +624,18 @@ impl Job {
                     %err,
                     "poller can't prepare a fetch"
                 );
-                return (Snapshot::failed(&err.fetch_error()), true);
+                return Some((Snapshot::failed(&err.fetch_error()), true));
             }
         };
         ctx.http = self.http.clone();
         let kind = self.kind;
         let fetch = tokio::spawn(async move { kind.fetch(&ctx).await });
         let _stop = AbortOnDrop(fetch.abort_handle());
-        match tokio::time::timeout(FETCH_DEADLINE, fetch).await {
-            Ok(Ok(Ok(snapshot))) => {
-                let failed = snapshot.status == Status::Bad && snapshot.error.is_some();
-                (snapshot, failed)
-            }
+        Some(match tokio::time::timeout(FETCH_DEADLINE, fetch).await {
+            // A reading is the service's state, also a bad one that says why
+            // (a site that answers 500 or not at all): it is fetched again at
+            // the normal interval, not backed off from.
+            Ok(Ok(Ok(snapshot))) => (snapshot, false),
             Ok(Ok(Err(err))) => (Snapshot::failed(&err), true),
             Ok(Err(err)) => {
                 if err.is_panic() {
@@ -625,7 +648,7 @@ impl Job {
                 (Snapshot::failed(&FetchError::Other), true)
             }
             Err(_) => (Snapshot::failed(&FetchError::Timeout), true),
-        }
+        })
     }
 
     /// Writes the snapshot over the service's row. A service that is gone gets
@@ -695,20 +718,25 @@ fn need_marks(snapshot: &Snapshot) -> Vec<(&str, Level, u64)> {
         .collect()
 }
 
-/// Whether the reading failed because the settings or the secret can't be
-/// used, or the service refused the key, which an admin has to fix.
+/// The failures that an admin has to fix, not the site: settings that can't
+/// be used, an address that is not allowed, a redirect that is not allowed,
+/// a secret that can't be opened, a key the service refused and a Keen
+/// Kestrel that has to be upgraded.
+const CONFIG_ERRORS: [FetchError; 6] = [
+    FetchError::Config,
+    FetchError::Forbidden,
+    FetchError::RedirectScheme,
+    FetchError::SecretUnreadable,
+    FetchError::Auth,
+    FetchError::KkTooOld,
+];
+
+/// Whether the reading failed because of one of [`CONFIG_ERRORS`].
 fn is_config_error(snapshot: &Snapshot) -> bool {
-    snapshot.error.as_deref().is_some_and(|text| {
-        [
-            FetchError::Config,
-            FetchError::SecretUnreadable,
-            FetchError::Auth,
-            // An admin has to upgrade Keen Kestrel.
-            FetchError::KkTooOld,
-        ]
-        .iter()
-        .any(|e| text == e.to_string())
-    })
+    snapshot
+        .error
+        .as_deref()
+        .is_some_and(|text| CONFIG_ERRORS.iter().any(|e| e.to_string() == text))
 }
 
 /// The need of a service that has had bad readings in a row, if its kind has

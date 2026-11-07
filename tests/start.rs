@@ -573,3 +573,36 @@ async fn start_page_is_not_kept_in_the_htmx_history_cache() {
         "this htmx does not know hx-history=false"
     );
 }
+
+#[tokio::test]
+async fn magpies_own_scripts_and_styles_are_revalidated_not_kept_for_an_hour() {
+    // Their URLs carry no version, so after an update a browser must not run
+    // the old script against the new server. The kit's ETag stays: an
+    // unchanged file is a 304.
+    let app = App::new().await;
+    for path in [
+        "/static/magpie/start.js",
+        "/static/magpie/edit.js",
+        "/static/magpie/render.js",
+        "/static/magpie/render.css",
+        "/static/magpie.css",
+        "/static/clock.js",
+    ] {
+        let res = app.get(path).await;
+        assert_eq!(res.status, StatusCode::OK, "{path}");
+        assert_eq!(res.header("cache-control"), "no-cache", "{path}");
+        let etag = res.header("etag").to_string();
+        assert!(!etag.is_empty(), "{path} has an ETag");
+        let again = app
+            .send(
+                Request::get(path)
+                    .header("if-none-match", &etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(again.status, StatusCode::NOT_MODIFIED, "{path}");
+        assert_eq!(again.header("cache-control"), "no-cache", "{path}");
+        assert_eq!(again.header("etag"), etag, "{path}");
+    }
+}

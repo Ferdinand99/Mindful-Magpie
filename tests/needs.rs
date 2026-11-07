@@ -1,4 +1,4 @@
-//! «Trenger deg» and acknowledgements (Plan 4, task 5): which needs a user
+//! «Trenger deg» and acknowledgements: which needs a user
 //! gets (`needs` in the values document), what an acknowledgement hides and
 //! when it stops hiding, and the routes that make and take back an
 //! acknowledgement.
@@ -129,7 +129,7 @@ async fn needs_of(web: &mut Web<'_>) -> Vec<Value> {
         .clone()
 }
 
-fn need(key: &str, level: Level, score: f64, name: &str) -> Need {
+fn need(key: &str, level: Level, score: f64) -> Need {
     Need {
         key: key.into(),
         level,
@@ -138,12 +138,8 @@ fn need(key: &str, level: Level, score: f64, name: &str) -> Need {
         } else {
             "need.http_down".into()
         },
-        // The page shows the service's name beside the text; `name` stays a
-        // parameter of this helper for the calls' sake.
-        params: {
-            let _ = name;
-            Default::default()
-        },
+        // The page shows the service's name beside the text.
+        params: Default::default(),
         score,
         since: None,
     }
@@ -316,8 +312,8 @@ async fn needs_are_listed_with_a_translated_label_and_their_age() {
     w.set(
         w.blog,
         vec![
-            need("disk", Level::Warn, 88.0, "Blog"),
-            need("down", Level::Bad, 1.0, "Blog"),
+            need("disk", Level::Warn, 88.0),
+            need("down", Level::Bad, 1.0),
         ],
     );
     let list = needs_of(&mut bob).await;
@@ -327,7 +323,7 @@ async fn needs_are_listed_with_a_translated_label_and_their_age() {
     assert_eq!(list[0]["level"], "bad");
     assert_eq!(list[0]["service_id"], w.blog);
     assert_eq!(list[0]["service_name"], "Blog");
-    assert_eq!(list[0]["label"], "not answering");
+    assert_eq!(list[0]["label"], "down");
     assert_eq!(list[0]["acked"], false);
     // The need began with the reading that first had it.
     assert_eq!(list[0]["since"], 1_760_000_000);
@@ -336,14 +332,14 @@ async fn needs_are_listed_with_a_translated_label_and_their_age() {
 
     // In Norwegian, from the same data.
     let nb = embed_in(&mut bob, "nb").await;
-    assert_eq!(nb["needs"][0]["label"], "svarer ikke");
+    assert_eq!(nb["needs"][0]["label"], "nede");
 }
 
 #[tokio::test]
 async fn a_need_carries_no_text_but_the_services_name() {
     let w = world().await;
     let mut bob = w.viewer("bob").await;
-    let mut hostile = need("down", Level::Bad, 1.0, "Blog");
+    let mut hostile = need("down", Level::Bad, 1.0);
     // Anything else a snapshot holds is not shown: only the translated label.
     hostile
         .params
@@ -379,7 +375,7 @@ async fn needs_come_only_from_services_that_are_bound_and_visible() {
     )
     .await;
     for id in [w.blog, unbound, hidden, private] {
-        w.set(id, vec![need("down", Level::Bad, 1.0, "X")]);
+        w.set(id, vec![need("down", Level::Bad, 1.0)]);
     }
     // Bob's card is bound to Blog only.
     let list = needs_of(&mut bob).await;
@@ -424,7 +420,7 @@ async fn an_ack_hides_the_need_for_that_user_only() {
     let mut bob = w.viewer("bob").await;
     let mut cy = w.viewer("cy").await;
     let mut ada = w.admin().await;
-    w.set(w.blog, vec![need("down", Level::Bad, 1.0, "Blog")]);
+    w.set(w.blog, vec![need("down", Level::Bad, 1.0)]);
 
     let res = ack(&mut bob, w.blog, "down").await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
@@ -444,7 +440,7 @@ async fn two_users_acknowledge_independently() {
     let w = world().await;
     let mut bob = w.viewer("bob").await;
     let mut cy = w.viewer("cy").await;
-    w.set(w.blog, vec![need("down", Level::Bad, 1.0, "Blog")]);
+    w.set(w.blog, vec![need("down", Level::Bad, 1.0)]);
 
     assert_eq!(ack(&mut bob, w.blog, "down").await.status, StatusCode::OK);
     assert_eq!(ack(&mut cy, w.blog, "down").await.status, StatusCode::OK);
@@ -462,29 +458,29 @@ async fn two_users_acknowledge_independently() {
 async fn a_need_that_gets_worse_shows_again() {
     let w = world().await;
     let mut bob = w.viewer("bob").await;
-    w.set(w.blog, vec![need("disk", Level::Warn, 88.0, "Blog")]);
+    w.set(w.blog, vec![need("disk", Level::Warn, 88.0)]);
     assert_eq!(ack(&mut bob, w.blog, "disk").await.status, StatusCode::OK);
     assert_eq!(needs_of(&mut bob).await[0]["acked"], true);
 
     // The same level and a lower or equal score: still hidden.
-    w.set(w.blog, vec![need("disk", Level::Warn, 88.0, "Blog")]);
+    w.set(w.blog, vec![need("disk", Level::Warn, 88.0)]);
     assert_eq!(needs_of(&mut bob).await[0]["acked"], true);
-    w.set(w.blog, vec![need("disk", Level::Warn, 80.0, "Blog")]);
+    w.set(w.blog, vec![need("disk", Level::Warn, 80.0)]);
     assert_eq!(needs_of(&mut bob).await[0]["acked"], true);
 
     // The score rises (88 to 92): shown again.
-    w.set(w.blog, vec![need("disk", Level::Warn, 92.0, "Blog")]);
+    w.set(w.blog, vec![need("disk", Level::Warn, 92.0)]);
     assert_eq!(needs_of(&mut bob).await[0]["acked"], false);
 
     // Acknowledged again at 92, then warn to bad at the same score.
     assert_eq!(ack(&mut bob, w.blog, "disk").await.status, StatusCode::OK);
     assert_eq!(needs_of(&mut bob).await[0]["acked"], true);
-    w.set(w.blog, vec![need("disk", Level::Bad, 92.0, "Blog")]);
+    w.set(w.blog, vec![need("disk", Level::Bad, 92.0)]);
     assert_eq!(needs_of(&mut bob).await[0]["acked"], false);
 
     // An ack at bad stays hidden when the need falls back to warn.
     assert_eq!(ack(&mut bob, w.blog, "disk").await.status, StatusCode::OK);
-    w.set(w.blog, vec![need("disk", Level::Warn, 92.0, "Blog")]);
+    w.set(w.blog, vec![need("disk", Level::Warn, 92.0)]);
     assert_eq!(needs_of(&mut bob).await[0]["acked"], true);
 }
 
@@ -492,7 +488,7 @@ async fn a_need_that_gets_worse_shows_again() {
 async fn an_ack_takes_level_and_score_from_the_server_not_the_client() {
     let w = world().await;
     let mut bob = w.viewer("bob").await;
-    w.set(w.blog, vec![need("disk", Level::Warn, 88.0, "Blog")]);
+    w.set(w.blog, vec![need("disk", Level::Warn, 88.0)]);
     let body = json!({
         "service_id": w.blog, "key": "disk",
         "level": "bad", "score": 1_000_000.0, "acked_at": "2999-01-01T00:00:00Z"
@@ -513,7 +509,7 @@ async fn an_ack_takes_level_and_score_from_the_server_not_the_client() {
     assert_eq!((level.as_str(), score), ("warn", 88.0));
     assert!(at.starts_with("20") && !at.starts_with("2999"), "{at}");
     // A rise past what the server stored shows it again.
-    w.set(w.blog, vec![need("disk", Level::Warn, 89.0, "Blog")]);
+    w.set(w.blog, vec![need("disk", Level::Warn, 89.0)]);
     assert_eq!(needs_of(&mut bob).await[0]["acked"], false);
 }
 
@@ -523,9 +519,9 @@ async fn a_need_that_began_after_the_ack_shows_again() {
     // reading and an ack crossing) does not hide the need that came back.
     let w = world().await;
     let mut bob = w.viewer("bob").await;
-    w.set(w.blog, vec![need("down", Level::Bad, 1.0, "Blog")]);
+    w.set(w.blog, vec![need("down", Level::Bad, 1.0)]);
     assert_eq!(ack(&mut bob, w.blog, "down").await.status, StatusCode::OK);
-    let mut back = need("down", Level::Bad, 1.0, "Blog");
+    let mut back = need("down", Level::Bad, 1.0);
     back.since = Some(Timestamp::now() + jiff::SignedDuration::from_secs(60));
     w.set(w.blog, vec![back]);
     assert_eq!(needs_of(&mut bob).await[0]["acked"], false);
@@ -566,19 +562,19 @@ impl Integration for Flaky {
             let mut s = Snapshot::new(Status::Ok);
             s.values.insert("status".into(), Reading::num(200.0));
             match MODE.load(Ordering::SeqCst) {
-                1 => s.needs.push(need("disk", Level::Warn, 88.0, "Blog")),
-                2 => s.needs.push(need("other", Level::Warn, 10.0, "Blog")),
-                3 => s.needs.push(need("disk", Level::Warn, 92.0, "Blog")),
-                4 => s.needs.push(need("disk", Level::Bad, 88.0, "Blog")),
+                1 => s.needs.push(need("disk", Level::Warn, 88.0)),
+                2 => s.needs.push(need("other", Level::Warn, 10.0)),
+                3 => s.needs.push(need("disk", Level::Warn, 92.0)),
+                4 => s.needs.push(need("disk", Level::Bad, 88.0)),
                 // A kind's date in the future, and a score that is no number.
                 5 => {
-                    let mut n = need("late", Level::Warn, f64::NAN, "Blog");
+                    let mut n = need("late", Level::Warn, f64::NAN);
                     n.since = Some(Timestamp::now() + jiff::SignedDuration::from_secs(86_400));
                     s.needs.push(n);
                 }
                 // A kind's date in the past: kept.
                 6 => {
-                    let mut n = need("early", Level::Warn, 5.0, "Blog");
+                    let mut n = need("early", Level::Warn, 5.0);
                     n.since = Some(Timestamp::now() - jiff::SignedDuration::from_secs(3_600));
                     s.needs.push(n);
                 }
@@ -633,7 +629,8 @@ async fn a_need_that_goes_and_comes_back_shows_again() {
             kinds: flaky_kinds,
             spread: Duration::ZERO,
         },
-    );
+    )
+    .await;
     let first = wait_poller(&poller, w.blog, None, |s| !s.needs.is_empty()).await;
     // The poller dates a need that has no date, and keeps the date while the
     // need stays.
@@ -701,7 +698,7 @@ async fn an_ack_on_a_service_the_user_cannot_use_is_a_plain_404() {
     let hidden = service(&w.app, "Router", Visibility::Admin, &[]).await;
     let unbound = service(&w.app, "Wiki", Visibility::All, &[]).await;
     for id in [w.blog, hidden, unbound] {
-        w.set(id, vec![need("down", Level::Bad, 1.0, "X")]);
+        w.set(id, vec![need("down", Level::Bad, 1.0)]);
     }
     let missing = ack(&mut bob, 987_654, "down").await;
     assert_eq!(missing.status, StatusCode::NOT_FOUND);
@@ -732,7 +729,7 @@ async fn an_ack_on_a_service_the_user_cannot_use_is_a_plain_404() {
 async fn the_ack_routes_need_the_same_origin_proof_and_a_session() {
     let w = world().await;
     let mut bob = w.viewer("bob").await;
-    w.set(w.blog, vec![need("down", Level::Bad, 1.0, "Blog")]);
+    w.set(w.blog, vec![need("down", Level::Bad, 1.0)]);
     let body = json!({ "service_id": w.blog, "key": "down" }).to_string();
     for path in ["/start/needs/ack", "/start/needs/unack"] {
         // Signed in, but nothing shows the request comes from our own page.
@@ -798,7 +795,7 @@ async fn deleting_a_service_or_a_user_deletes_their_acks() {
     .await;
     let mut cy = w.viewer("cy").await;
     for id in [w.blog, wiki] {
-        w.set(id, vec![need("down", Level::Bad, 1.0, "X")]);
+        w.set(id, vec![need("down", Level::Bad, 1.0)]);
     }
     for id in [w.blog, wiki] {
         assert_eq!(ack(&mut bob, id, "down").await.status, StatusCode::OK);
@@ -820,7 +817,7 @@ async fn deleting_a_service_or_a_user_deletes_their_acks() {
 // «Config» is for admins
 
 fn config_need() -> Need {
-    need("config", Level::Bad, 1.0, "Blog")
+    need("config", Level::Bad, 1.0)
 }
 
 #[tokio::test]
@@ -828,10 +825,7 @@ async fn a_config_need_is_never_shown_to_a_non_admin() {
     let w = world().await;
     let mut bob = w.viewer("bob").await;
     let mut ada = w.admin().await;
-    w.set(
-        w.blog,
-        vec![config_need(), need("disk", Level::Warn, 90.0, "Blog")],
-    );
+    w.set(w.blog, vec![config_need(), need("disk", Level::Warn, 90.0)]);
 
     // The page.
     let page = embed(&mut bob).await;
@@ -901,7 +895,7 @@ async fn an_ack_reaches_the_open_streams_of_that_user_only() {
     let w = world().await;
     let mut bob = w.viewer("bob").await;
     let cy = w.viewer("cy").await;
-    w.set(w.blog, vec![need("down", Level::Bad, 1.0, "Blog")]);
+    w.set(w.blog, vec![need("down", Level::Bad, 1.0)]);
     let mut tab1 = open_live(&bob).await;
     let mut tab2 = open_live(&bob).await;
     let mut other = open_live(&cy).await;
@@ -937,7 +931,7 @@ async fn a_need_that_appears_or_goes_is_an_event() {
     let mut live = open_live(&bob).await;
     assert_eq!(live.event().await["needs"], json!([]));
     tokio::time::pause();
-    w.set(w.blog, vec![need("down", Level::Bad, 1.0, "Blog")]);
+    w.set(w.blog, vec![need("down", Level::Bad, 1.0)]);
     let update = live.event().await;
     assert_eq!(update["needs"][0]["key"], "down");
     w.set(w.blog, vec![]);
@@ -1057,7 +1051,7 @@ async fn the_cap_on_a_users_streams_is_per_app_so_tests_of_one_user_number_do_no
 // ---------------------------------------------------------------------------
 // An acknowledgement is spent once it stops hiding
 
-fn flaky_poller(w: &World) -> PollerHandle {
+async fn flaky_poller(w: &World) -> PollerHandle {
     Poller::start_with(
         w.app.magpie.core.clone(),
         integrations::client().clone(),
@@ -1067,6 +1061,7 @@ fn flaky_poller(w: &World) -> PollerHandle {
             spread: Duration::ZERO,
         },
     )
+    .await
 }
 
 /// Waits for a reading after `after` that has the need `key` with `level` and `score`.
@@ -1100,7 +1095,7 @@ async fn a_need_that_got_worse_and_then_eased_stays_shown() {
     let mut bob = w.viewer("bob").await;
     tokio::time::pause();
     MODE.store(1, Ordering::SeqCst);
-    let poller = flaky_poller(&w);
+    let poller = flaky_poller(&w).await;
 
     // Acknowledged at 88; the next reading is the same: it stays hidden.
     let s1 = wait_need(&poller, &w, None, "disk", Level::Warn, 88.0).await;
@@ -1146,7 +1141,7 @@ async fn the_poller_cuts_a_future_date_back_and_makes_a_score_that_is_no_number_
     let w = world().await;
     tokio::time::pause();
     MODE.store(5, Ordering::SeqCst);
-    let poller = flaky_poller(&w);
+    let poller = flaky_poller(&w).await;
     let s = wait_poller(&poller, w.blog, None, |s| !s.needs.is_empty()).await;
     assert_eq!(s.needs[0].key, "late");
     assert_eq!(
@@ -1172,7 +1167,7 @@ async fn the_poller_cuts_a_future_date_back_and_makes_a_score_that_is_no_number_
 async fn a_score_that_is_no_number_is_stored_as_zero_and_still_hides() {
     let w = world().await;
     let mut bob = w.viewer("bob").await;
-    w.set(w.blog, vec![need("odd", Level::Warn, f64::NAN, "Blog")]);
+    w.set(w.blog, vec![need("odd", Level::Warn, f64::NAN)]);
     assert_eq!(ack(&mut bob, w.blog, "odd").await.status, StatusCode::OK);
     let stored: f64 = w
         .app
@@ -1247,7 +1242,7 @@ async fn the_labels_of_the_app_kinds_get_their_count() {
     let w = world().await;
     let mut bob = w.viewer("bob").await;
     let counted = |key: &str, level: Level, label_key: &str, count: &str| {
-        let mut n = need(key, level, 2.0, "Blog");
+        let mut n = need(key, level, 2.0);
         n.label_key = label_key.into();
         n.params.insert("count".into(), count.into());
         n
