@@ -1,16 +1,15 @@
 //! The `proxmox` kind («Proxmox VE») against a stub server on 127.0.0.1: a
 //! realistic `cluster/resources` answer, an offline node, full storage, a
-//! refused token, answers that are not what was expected, the needs, the node
-//! rows, and that the token secret goes nowhere but into the request.
+//! refused token, a token that sees nothing, answers that are not what was
+//! expected, the needs, the node rows, and that the token secret goes nowhere
+//! but into the request.
 
-use std::io::Write;
-use std::sync::{Arc, Mutex, Once, OnceLock};
+mod common;
+
 use std::time::Duration;
 
-use axum::Router;
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, Uri};
-use axum::response::{IntoResponse, Response};
+use common::stub::{self, Answer, Stub};
+use common::{locale, log};
 use mindful_magpie::integrations::proxmox::{NodeRow, node_rows};
 use mindful_magpie::integrations::{
     self, FetchCtx, FetchError, Integration, Level, Snapshot, Status,
@@ -21,122 +20,9 @@ const SECRET: &str = "5f1c9e2a-77b0-4c1e-9d3a-Zq81x7w4mK";
 const TOKEN_ID: &str = "magpie@pve!start";
 const RESOURCES: &str = "/api2/json/cluster/resources";
 
-// ---------------------------------------------------------------------------
-// Capturing what is logged
-
-#[derive(Clone)]
-struct LogBuffer(Arc<Mutex<Vec<u8>>>);
-
-impl Write for LogBuffer {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn log_buffer() -> &'static LogBuffer {
-    static BUFFER: OnceLock<LogBuffer> = OnceLock::new();
-    static INSTALL: Once = Once::new();
-    let buffer = BUFFER.get_or_init(|| LogBuffer(Arc::new(Mutex::new(Vec::new()))));
-    INSTALL.call_once(|| {
-        let writer = buffer.clone();
-        // Also bridges the `log` records of reqwest and hyper.
-        tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .try_init()
-            .expect("no other subscriber in this test binary");
-    });
-    buffer
-}
-
-fn logged() -> String {
-    String::from_utf8_lossy(&log_buffer().0.lock().unwrap()).into_owned()
-}
-
-// ---------------------------------------------------------------------------
-// The stub
-
-/// What the stub answers.
-#[derive(Clone)]
-enum Answer {
-    Json(Json),
-    Raw(&'static str),
-    Status(u16),
-    /// Never answers.
-    Hang,
-}
-
-/// One request the stub saw.
-#[derive(Clone, Debug)]
-struct Hit {
-    path: String,
-    query: Option<String>,
-    authorization: Option<String>,
-}
-
-#[derive(Clone)]
-struct Stub {
-    resources: Answer,
-    hits: Arc<Mutex<Vec<Hit>>>,
-}
-
-impl Stub {
-    fn hits_on(&self, path: &str) -> Vec<Hit> {
-        self.hits
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|h| h.path == path)
-            .cloned()
-            .collect()
-    }
-}
-
-async fn answer(State(stub): State<Stub>, uri: Uri, headers: HeaderMap) -> Response {
-    stub.hits.lock().unwrap().push(Hit {
-        path: uri.path().to_string(),
-        query: uri.query().map(str::to_string),
-        authorization: headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string),
-    });
-    let what = match uri.path() {
-        RESOURCES => stub.resources.clone(),
-        _ => Answer::Status(404),
-    };
-    match what {
-        Answer::Json(v) => axum::Json(v).into_response(),
-        Answer::Raw(text) => (
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            text,
-        )
-            .into_response(),
-        Answer::Status(code) => StatusCode::from_u16(code).unwrap().into_response(),
-        Answer::Hang => {
-            tokio::time::sleep(Duration::from_secs(3600)).await;
-            StatusCode::OK.into_response()
-        }
-    }
-}
-
-/// Starts a stub on a free port; its address (no trailing slash) and handle.
-async fn serve(resources: Answer) -> (String, Stub) {
-    let stub = Stub {
-        resources,
-        hits: Arc::new(Mutex::new(Vec::new())),
-    };
-    let app = Router::new().fallback(answer).with_state(stub.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (format!("http://{addr}"), stub)
+/// A stub whose `cluster/resources` answers `what`.
+async fn serve(what: Answer) -> (String, Stub) {
+    stub::serve_one(RESOURCES, what).await
 }
 
 fn kind() -> &'static dyn Integration {
@@ -245,27 +131,12 @@ fn close(a: Option<f64>, b: f64) -> bool {
 
 /// The text called `name` in `[section]` of a locale file, when there is a
 /// non-empty one.
-fn text_of(locale: &str, section: &str, name: &str) -> Option<String> {
-    let mut inside = false;
-    for line in locale.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            inside = line == format!("[{section}]");
-        } else if inside
-            && let Some((key, value)) = line.split_once(" = ")
-            && key == name
-        {
-            return Some(value.trim_matches('"').to_string()).filter(|t| !t.is_empty());
-        }
-    }
-    None
+fn text_of(file: &str, section: &str, name: &str) -> Option<String> {
+    locale::text(file, section, name).filter(|t| !t.is_empty())
 }
 
 fn locales() -> [(&'static str, &'static str); 2] {
-    [
-        ("en", include_str!("../locales/en.toml")),
-        ("nb", include_str!("../locales/nb.toml")),
-    ]
+    locale::LOCALES
 }
 
 // ---------------------------------------------------------------------------
@@ -404,7 +275,7 @@ async fn a_realistic_cluster_becomes_values_and_an_ok_status() {
     // One call, with the token in Proxmox's own header.
     let hits = stub.hits_on(RESOURCES);
     assert_eq!(hits.len(), 1);
-    assert_eq!(stub.hits.lock().unwrap().len(), 1);
+    assert_eq!(stub.seen().len(), 1);
     assert_eq!(hits[0].query, None);
     assert_eq!(
         hits[0].authorization.as_deref(),
@@ -459,8 +330,8 @@ async fn full_storage_warns_at_85_and_is_bad_at_95() {
         (84, Status::Ok, None),
         (85, Status::Warn, Some(Level::Warn)),
         (94, Status::Warn, Some(Level::Warn)),
-        (95, Status::Warn, Some(Level::Bad)),
-        (100, Status::Warn, Some(Level::Bad)),
+        (95, Status::Bad, Some(Level::Bad)),
+        (100, Status::Bad, Some(Level::Bad)),
     ] {
         // The disk is 100 GiB, so a GiB is a percent.
         let doc = changed("storage/pve1/local", |s| s["disk"] = json!(used * GIB));
@@ -632,14 +503,51 @@ async fn malformed_answers_give_no_reading_and_do_not_panic() {
         r#"{"data": null}"#,
         r#"{"data": 5}"#,
         r#"{"data": {}}"#,
-        // A token that may see nothing gets an empty list.
-        r#"{"data": []}"#,
-        r#"{"data": [{"type": "qemu", "status": "running"}]}"#,
         "\u{0}\u{1}\u{2}",
     ] {
         let (url, _) = serve(Answer::Raw(raw)).await;
         assert_eq!(fetch_err(&url).await, FetchError::Invalid, "{raw:?}");
     }
+}
+
+#[tokio::test]
+async fn a_token_that_sees_nothing_has_its_own_error_and_hint() {
+    // A token without a role gets an empty list; one that sees guests but no
+    // node is as good as that.
+    for raw in [
+        r#"{"data": []}"#,
+        r#"{"data": [{"type": "qemu", "status": "running"}]}"#,
+        r#"{"data": [5, null, "x"]}"#,
+    ] {
+        let (url, _) = serve(Answer::Raw(raw)).await;
+        let err = fetch_err(&url).await;
+        assert_eq!(err, FetchError::NothingVisible, "{raw:?}");
+        assert_eq!(err.to_string(), "key sees nothing");
+        assert_eq!(
+            integrations::error_text_key(&err.to_string()),
+            Some("fetch_err.nothing_visible")
+        );
+    }
+    // A `data` that is not a list stays "unexpected answer".
+    for raw in [
+        r#"{"data": {}}"#,
+        r#"{"data": null}"#,
+        r#"{"data": 5}"#,
+        "{}",
+    ] {
+        let (url, _) = serve(Answer::Raw(raw)).await;
+        assert_eq!(fetch_err(&url).await, FetchError::Invalid, "{raw:?}");
+    }
+    let (en, nb) = (locale::LOCALES[0].1, locale::LOCALES[1].1);
+    assert_eq!(
+        text_of(nb, "fetch_err", "nothing_visible").as_deref(),
+        Some("Nøkkelen ser ingenting – sjekk rollen")
+    );
+    assert!(
+        text_of(en, "fetch_err", "nothing_visible")
+            .unwrap()
+            .contains("check its role")
+    );
 }
 
 #[tokio::test]
@@ -732,21 +640,16 @@ async fn settings_it_cannot_use_are_errors_that_name_no_value() {
         .unwrap_err();
     assert_eq!(err, FetchError::Forbidden);
     // Nothing of this was sent.
-    assert!(stub.hits.lock().unwrap().is_empty());
+    assert!(stub.seen().is_empty());
 }
 
 #[tokio::test]
 async fn a_path_in_the_address_is_kept() {
     // Proxmox behind a proxy prefix.
     let (url, stub) = serve(Answer::Status(404)).await;
+    stub.route("/pve/api2/json/cluster/resources", Answer::Status(404));
     let _ = fetch_err(&format!("{url}/pve/")).await;
-    let paths: Vec<_> = stub
-        .hits
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|h| h.path.clone())
-        .collect();
+    let paths: Vec<_> = stub.seen().iter().map(|h| h.path.clone()).collect();
     assert_eq!(paths, ["/pve/api2/json/cluster/resources"]);
 }
 
@@ -795,7 +698,7 @@ async fn the_rows_are_not_in_the_snapshot() {
 
 #[tokio::test]
 async fn the_token_secret_is_in_the_request_only() {
-    let _ = log_buffer();
+    let _ = log::buffer();
     let mut snapshots = Vec::new();
     let mut errors = Vec::new();
 
@@ -836,9 +739,9 @@ async fn the_token_secret_is_in_the_request_only() {
         "a snapshot mentions the header"
     );
 
-    let log = logged();
+    let log = log::logged();
     assert!(
-        log.contains("hyper_util") || log.contains("reqwest"),
+        log::client_lines_seen(&log),
         "the capture sees the HTTP client's own lines"
     );
     assert!(!log.contains(SECRET), "the log holds the secret");
@@ -846,26 +749,84 @@ async fn the_token_secret_is_in_the_request_only() {
 }
 
 #[tokio::test]
-async fn a_redirect_to_another_host_does_not_carry_the_header() {
-    // The target is a second stub on another port; reqwest drops the header
-    // on a cross-origin redirect, and the client's redirects are checked.
-    let (target, target_stub) = serve(Answer::Json(cluster())).await;
-    let location = format!("{target}{RESOURCES}");
-    let app = Router::new().fallback(move || {
-        let location = location.clone();
-        async move { axum::response::Redirect::temporary(&location) }
-    });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let origin = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+async fn a_redirect_to_another_origin_never_carries_the_header() {
+    // `Authorization` is the header the client drops itself, but Magpie
+    // refuses the redirect instead, so the other origin sees nothing at all.
+    for redirect in stub::redirects() {
+        let (target, target_stub) = serve(Answer::Json(cluster())).await;
+        let origin = stub::redirector(redirect, format!("{target}{RESOURCES}")).await;
+        assert_eq!(fetch_err(&origin).await, FetchError::RedirectScheme);
+        assert!(target_stub.seen().is_empty(), "{:?}", target_stub.seen());
+    }
+}
 
-    let s = fetch(&origin).await;
-    assert_eq!(s.status, Status::Ok);
-    assert_eq!(num(&s, "nodes_total"), Some(2.0));
-    let hits = target_stub.hits_on(RESOURCES);
-    assert_eq!(hits.len(), 1);
+#[tokio::test]
+async fn the_status_is_as_bad_as_the_worst_need() {
+    // Storage at 95 or more is a bad need and so a bad card, not a warning.
+    for (used, status) in [(84, Status::Ok), (85, Status::Warn), (95, Status::Bad)] {
+        let doc = changed("storage/pve1/local", |s| s["disk"] = json!(used * GIB));
+        let (url, _) = serve(Answer::Json(doc)).await;
+        let s = fetch(&url).await;
+        assert_eq!(s.status, status, "{used} %");
+        let worst = s.needs.iter().map(|n| n.level).max();
+        match worst {
+            None => assert_eq!(s.status, Status::Ok),
+            Some(Level::Warn) => assert_eq!(s.status, Status::Warn),
+            Some(Level::Bad) => assert_eq!(s.status, Status::Bad),
+        }
+    }
+}
+
+#[tokio::test]
+async fn cpu_and_memory_come_from_the_nodes_that_are_online() {
+    // An offline node that still carries figures (the last it had) does not
+    // pull the means: only pve1 counts.
+    let doc = changed("node/pve2", |n| {
+        n["status"] = json!("offline");
+        n["cpu"] = json!(0.90);
+        n["mem"] = json!(64 * GIB);
+        n["maxmem"] = json!(64 * GIB);
+    });
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let s = fetch(&url).await;
+    assert!(close(num(&s, "cpu"), 10.0), "{:?}", num(&s, "cpu"));
+    assert!(close(num(&s, "ram"), 25.0), "{:?}", num(&s, "ram"));
+    // All nodes offline: no figure rather than a stale one.
+    let mut doc = cluster();
+    for i in 0..2 {
+        doc["data"][i]["status"] = json!("offline");
+    }
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let s = fetch(&url).await;
+    assert!(!s.values.contains_key("cpu"));
+    assert!(!s.values.contains_key("ram"));
+    assert_eq!(s.status, Status::Bad);
+}
+
+#[test]
+fn the_texts_read_like_the_other_app_kinds() {
+    let (en, nb) = (locale::LOCALES[0].1, locale::LOCALES[1].1);
     assert_eq!(
-        hits[0].authorization, None,
-        "the header stays with its host"
+        text_of(en, "metric", "pve_nodes_total").as_deref(),
+        Some("Nodes total")
+    );
+    assert_eq!(
+        text_of(en, "metric", "pve_guests_total").as_deref(),
+        Some("Guests total")
+    );
+    assert_eq!(
+        text_of(nb, "metric", "pve_nodes_total").as_deref(),
+        Some("Noder i alt")
+    );
+    // The token id's error says that only ASCII names are accepted.
+    assert!(
+        text_of(en, "err", "pve_token_id")
+            .unwrap()
+            .contains("ASCII")
+    );
+    assert!(
+        text_of(nb, "err", "pve_token_id")
+            .unwrap()
+            .contains("ASCII")
     );
 }

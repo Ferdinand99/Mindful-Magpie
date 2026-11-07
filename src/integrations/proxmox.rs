@@ -6,8 +6,8 @@
 //! `PVEAuditor`, which is read-only.
 //!
 //! The token is sent as `Authorization: PVEAPIToken=<id>=<secret>`, marked
-//! sensitive so it stays out of debug output and is not carried to another
-//! host by a redirect. The id (`user@realm!tokenid`) is a setting; its shape
+//! sensitive so it stays out of debug output; a redirect to another origin is
+//! refused. The id (`user@realm!tokenid`) is a setting; its shape
 //! is checked, so nothing that could end a header line gets into the header.
 //! The secret is the service's secret.
 //!
@@ -21,7 +21,6 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use reqwest::header::HeaderValue;
 use serde_json::Value as Json;
 
 use super::api;
@@ -156,10 +155,10 @@ pub fn token_id_ok(id: &str) -> bool {
     id.chars().count() <= TOKEN_ID_CHARS && part(user) && part(realm) && part(token)
 }
 
-/// `PVEAPIToken=<id>=<secret>` as a sensitive header value. A missing or
-/// malformed id, or a missing secret or one that cannot be a header value, is
+/// `Authorization: PVEAPIToken=<id>=<secret>`. A missing or malformed id, or
+/// a missing secret or one that cannot be a header value, is
 /// [`FetchError::Config`].
-fn auth(settings: &Json, secret: Option<&str>) -> Result<HeaderValue, FetchError> {
+fn auth(settings: &Json, secret: Option<&str>) -> Result<api::Credential, FetchError> {
     let id = settings
         .get("token_id")
         .and_then(Json::as_str)
@@ -167,10 +166,7 @@ fn auth(settings: &Json, secret: Option<&str>) -> Result<HeaderValue, FetchError
         .filter(|id| token_id_ok(id))
         .ok_or(FetchError::Config)?;
     let secret = secret.filter(|s| !s.is_empty()).ok_or(FetchError::Config)?;
-    let mut value = HeaderValue::from_str(&format!("PVEAPIToken={id}={secret}"))
-        .map_err(|_| FetchError::Config)?;
-    value.set_sensitive(true);
-    Ok(value)
+    api::Credential::raw("authorization", &format!("PVEAPIToken={id}={secret}"))
 }
 
 /// The text of `item[key]`, when it is one.
@@ -235,9 +231,9 @@ fn is_template(item: &Json) -> bool {
     }
 }
 
-/// The reading of a `cluster/resources` answer. Without a `data` list, or
-/// without one node in it, there is nothing to show: [`FetchError::Invalid`]
-/// (a token that may see nothing gets an empty list).
+/// The reading of a `cluster/resources` answer. Without a `data` list there
+/// is nothing to show: [`FetchError::Invalid`]. A list with no node in it is
+/// what a token that may see nothing gets: [`FetchError::NothingVisible`].
 fn read_answer(doc: &Json) -> Result<Reading, FetchError> {
     let items: Vec<&Json> = entries(doc).ok_or(FetchError::Invalid)?.collect();
     let of_type = |kind: &'static str| {
@@ -249,7 +245,7 @@ fn read_answer(doc: &Json) -> Result<Reading, FetchError> {
 
     let nodes: Vec<&Json> = of_type("node").collect();
     if nodes.is_empty() {
-        return Err(FetchError::Invalid);
+        return Err(FetchError::NothingVisible);
     }
     let nodes_online = nodes
         .iter()
@@ -260,11 +256,17 @@ fn read_answer(doc: &Json) -> Result<Reading, FetchError> {
         .filter(|n| text(n, "status") == Some("offline"))
         .count();
 
-    let cpus: Vec<f64> = nodes.iter().filter_map(|n| cpu_percent(n)).collect();
+    // An offline node reports no load (or the last one it had): CPU and memory
+    // are those of the nodes that are online.
+    let online: Vec<&&Json> = nodes
+        .iter()
+        .filter(|n| text(n, "status") == Some("online"))
+        .collect();
+    let cpus: Vec<f64> = online.iter().filter_map(|n| cpu_percent(n)).collect();
     let cpu = (!cpus.is_empty()).then(|| cpus.iter().sum::<f64>() / cpus.len() as f64);
 
-    // Σmem / Σmaxmem over the nodes that report both.
-    let (mem, max_mem) = nodes
+    // Σmem / Σmaxmem over the online nodes that report both.
+    let (mem, max_mem) = online
         .iter()
         .filter_map(|n| Some((amount(n.get("mem"))?, amount(n.get("maxmem"))?)))
         .fold((0.0, 0.0), |(m, x), (mem, max)| (m + mem, x + max));
@@ -309,7 +311,8 @@ fn snapshot(reading: &Reading) -> Snapshot {
             None
         }
     });
-    let status = if reading.nodes_offline > 0.0 {
+    // The card is as bad as the worst of its needs.
+    let status = if reading.nodes_offline > 0.0 || storage_level == Some(Level::Bad) {
         Status::Bad
     } else if storage_level.is_some() {
         Status::Warn
@@ -523,13 +526,18 @@ mod tests {
     #[test]
     fn the_header_is_sensitive_and_checked() {
         let settings = json!({ "token_id": " root@pam!magpie " });
-        let value = auth(&settings, Some("1234-abcd")).unwrap();
+        let credential = auth(&settings, Some("1234-abcd")).unwrap();
+        let request = credential
+            .apply(reqwest::Client::new().get("http://h/"))
+            .build()
+            .unwrap();
+        let value = request.headers().get("authorization").unwrap();
         assert!(value.is_sensitive());
         assert_eq!(
             value.to_str().unwrap(),
             "PVEAPIToken=root@pam!magpie=1234-abcd"
         );
-        assert!(!format!("{value:?}").contains("1234-abcd"));
+        assert!(!format!("{credential:?}").contains("1234-abcd"));
         for secret in [None, Some(""), Some("a\r\nb")] {
             assert_eq!(auth(&settings, secret).unwrap_err(), FetchError::Config);
         }
@@ -570,14 +578,15 @@ mod tests {
 
     #[test]
     fn no_nodes_is_not_a_reading() {
+        for doc in [json!({}), json!({ "data": null }), json!({ "data": {} })] {
+            assert_eq!(read_answer(&doc).unwrap_err(), FetchError::Invalid);
+        }
+        // A list with no node is what a token that sees nothing gets.
         for doc in [
-            json!({}),
-            json!({ "data": null }),
-            json!({ "data": {} }),
             json!({ "data": [] }),
             json!({ "data": [{ "type": "qemu", "status": "running" }] }),
         ] {
-            assert_eq!(read_answer(&doc).unwrap_err(), FetchError::Invalid);
+            assert_eq!(read_answer(&doc).unwrap_err(), FetchError::NothingVisible);
         }
     }
 
@@ -596,7 +605,7 @@ mod tests {
         assert_eq!(s.status, Status::Warn);
         assert_eq!(s.needs[0].level, Level::Warn);
         let s = snapshot(&reading(0.0, Some(95.9)));
-        assert_eq!(s.status, Status::Warn);
+        assert_eq!(s.status, Status::Bad, "as bad as the worst need");
         assert_eq!(s.needs[0].level, Level::Bad);
         assert_eq!(s.needs[0].params["count"], "95");
         assert_eq!(s.needs[0].score, 95.9);
