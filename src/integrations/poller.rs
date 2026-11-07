@@ -24,8 +24,14 @@
 //! the interval when that is longer); a good one resets it.
 //!
 //! **«Trenger deg».** A kind sees one fetch at a time, so "bad twice in a row"
-//! is the poller's: from the second bad reading in a row a service of a kind
-//! that has the rule (see [`down_label`]) gets the need [`DOWN_KEY`].
+//! is the poller's: from the second bad reading in a row a service gets a
+//! need. It is [`DOWN_KEY`] («the site does not answer») for a kind that has
+//! the rule (see [`down_label`]), or [`CONFIG_KEY`] («set it up again») when
+//! the reading failed because the settings or the stored secret can't be used:
+//! that needs an admin, not the site. The count survives a restart, an update
+//! and a resync: it is taken up again from the stored snapshot, so a need
+//! that is showing does not go and come back (an acknowledgement would
+//! reopen).
 //!
 //! **Secrets.** The sealed secret is opened for the length of one fetch, in
 //! [`super::FetchCtx`] (whose `Debug` hides it). Nothing here logs settings,
@@ -59,6 +65,10 @@ const JITTER: f64 = 0.1;
 const DOWN_AFTER: u32 = 2;
 /// The key of the need «bad twice in a row»; what an acknowledgement refers to.
 pub const DOWN_KEY: &str = "down";
+/// The key of the need «the settings or the secret can't be used».
+pub const CONFIG_KEY: &str = "config";
+/// The translation key of the [`CONFIG_KEY`] need, for every kind.
+pub const CONFIG_LABEL: &str = "need.service_config";
 
 /// Finds a kind by its stored name.
 pub type Kinds = fn(&str) -> Option<&'static dyn Integration>;
@@ -166,7 +176,7 @@ pub struct PollerHandle {
 
 impl PollerHandle {
     /// A handle with no poller behind it: it holds only what
-    /// [`PollerHandle::set_snapshot`] puts in. What `Magpie` starts with until
+    /// [`PollerHandle::set_snapshot_for_tests`] puts in. What `Magpie` starts with until
     /// the server starts the real one, and what tests that need only
     /// snapshots use.
     pub fn idle() -> Self {
@@ -213,9 +223,12 @@ impl PollerHandle {
     }
 
     /// Puts `snapshot` in as the service's latest, as a fetch would (and
-    /// announces it), without storing it. For tests of pages that show
-    /// snapshots; a running poller replaces it at its next fetch.
-    pub fn set_snapshot(&self, service_id: i64, snapshot: Snapshot) {
+    /// announces it), without storing it. **For tests only** (hidden from the
+    /// docs): the integration tests are separate crates, so a `cfg(test)`
+    /// would hide it from them too. A running poller replaces it at its next
+    /// fetch.
+    #[doc(hidden)]
+    pub fn set_snapshot_for_tests(&self, service_id: i64, snapshot: Snapshot) {
         {
             let mut state = self.shared.write();
             state.snapshots.insert(service_id, Arc::new(snapshot));
@@ -276,8 +289,27 @@ struct Supervisor {
     shared: Arc<Shared>,
     /// Dropping the set (when the supervisor ends) stops every service task.
     tasks: JoinSet<()>,
-    running: HashMap<i64, AbortHandle>,
+    running: HashMap<i64, Running>,
     next_generation: u64,
+}
+
+/// A service's running task, and the service as it was started with.
+struct Running {
+    abort: AbortHandle,
+    service: Service,
+}
+
+/// Whether a restart of the task would change nothing: the same kind, name,
+/// address, settings, interval and secret (a replaced secret changes
+/// `updated_at`).
+fn same_job(a: &Service, b: &Service) -> bool {
+    a.kind == b.kind
+        && a.name == b.name
+        && a.url == b.url
+        && a.settings == b.settings
+        && a.has_secret == b.has_secret
+        && a.interval_s == b.interval_s
+        && a.updated_at == b.updated_at
 }
 
 impl Supervisor {
@@ -357,7 +389,7 @@ impl Supervisor {
     fn spawn(&mut self, service: Service, delay: Duration) {
         let id = service.id;
         if let Some(old) = self.running.remove(&id) {
-            old.abort();
+            old.abort.abort();
         }
         let Some(kind) = (self.options.kinds)(&service.kind) else {
             tracing::warn!(service_id = id, kind = %service.kind, "poller has no such kind");
@@ -366,7 +398,13 @@ impl Supervisor {
         };
         self.next_generation += 1;
         let generation = self.next_generation;
-        self.shared.write().live.insert(id, generation);
+        // The count of bad readings carries on from the current snapshot (the
+        // stored one after a restart).
+        let seed = {
+            let mut state = self.shared.write();
+            state.live.insert(id, generation);
+            state.snapshots.get(&id).map_or(0, |s| bad_seed(s))
+        };
         let job = Job {
             core: self.core.clone(),
             http: self.http.clone(),
@@ -375,8 +413,13 @@ impl Supervisor {
             kind,
             generation,
             delay,
+            seed,
         };
-        self.running.insert(id, self.tasks.spawn(job.run()));
+        let running = Running {
+            service: job.service.clone(),
+            abort: self.tasks.spawn(job.run()),
+        };
+        self.running.insert(id, running);
     }
 
     async fn reload(&mut self, id: i64) {
@@ -389,7 +432,7 @@ impl Supervisor {
 
     async fn remove(&mut self, id: i64) {
         if let Some(task) = self.running.remove(&id) {
-            task.abort();
+            task.abort.abort();
         }
         self.shared.forget(id);
         // Normally the row went with the service already.
@@ -406,8 +449,11 @@ impl Supervisor {
         let _ = self.shared.changes.send(Change::Removed(id));
     }
 
-    /// After missed events: every stored service gets a fresh task, and a
-    /// task of a service that is gone stops.
+    /// After missed events: a service that is new, or whose settings, interval
+    /// or secret changed, gets a fresh task (after the start-up stagger, since
+    /// many may have changed); one that is unchanged keeps its task, with its
+    /// schedule, backoff and count of bad readings. A task of a service that is
+    /// gone stops.
     async fn resync(&mut self) {
         let services = match store::list(&self.core).await {
             Ok(services) => services,
@@ -427,7 +473,13 @@ impl Supervisor {
             self.remove(id).await;
         }
         for service in services {
-            self.spawn(service, Duration::ZERO);
+            if let Some(running) = self.running.get(&service.id)
+                && same_job(&running.service, &service)
+            {
+                continue;
+            }
+            let delay = start_delay(self.options.spread);
+            self.spawn(service, delay);
         }
     }
 }
@@ -453,6 +505,8 @@ struct Job {
     kind: &'static dyn Integration,
     generation: u64,
     delay: Duration,
+    /// Bad readings in a row so far (see [`bad_seed`]).
+    seed: u32,
 }
 
 /// Aborts a task when dropped, so a fetch does not outlive the loop that
@@ -474,7 +528,7 @@ impl Job {
         // Failed fetches in a row (they back the schedule off), and bad
         // readings in a row (they make the need).
         let mut failures: u32 = 0;
-        let mut bad_in_a_row: u32 = 0;
+        let mut bad_in_a_row: u32 = self.seed;
         loop {
             let (mut snapshot, failed) = self.fetch().await;
             failures = if failed { failures + 1 } else { 0 };
@@ -484,11 +538,10 @@ impl Job {
                 0
             };
             if bad_in_a_row >= DOWN_AFTER
-                && let Some(label_key) = down_label(&self.service.kind)
+                && snapshot.status == Status::Bad
+                && let Some(need) = bad_need(&self.service, &snapshot)
             {
-                snapshot
-                    .needs
-                    .push(down_need(label_key, &self.service.name));
+                snapshot.needs.push(need);
             }
             tracing::debug!(
                 service_id = self.service.id,
@@ -579,15 +632,48 @@ impl Job {
     }
 }
 
-fn down_need(label_key: &str, name: &str) -> Need {
-    Need {
-        key: DOWN_KEY.to_string(),
+/// Whether the reading failed because the settings or the secret can't be
+/// used, which an admin has to fix.
+fn is_config_error(snapshot: &Snapshot) -> bool {
+    snapshot.error.as_deref().is_some_and(|text| {
+        text == FetchError::Config.to_string() || text == FetchError::SecretUnreadable.to_string()
+    })
+}
+
+/// The need of a service that has had bad readings in a row, if its kind has
+/// one for this reading.
+fn bad_need(service: &Service, snapshot: &Snapshot) -> Option<Need> {
+    let (key, label_key) = if is_config_error(snapshot) {
+        (CONFIG_KEY, CONFIG_LABEL)
+    } else {
+        (DOWN_KEY, down_label(&service.kind)?)
+    };
+    Some(Need {
+        key: key.to_string(),
         level: Level::Bad,
         label_key: label_key.to_string(),
-        params: [("name".to_string(), name.to_string())].into(),
+        params: [("name".to_string(), service.name.clone())].into(),
         // Constant: the service is down or it is not, so an acknowledgement
         // is not undone by the next fetch.
         score: 1.0,
+    })
+}
+
+/// How many bad readings in a row a snapshot stands for, when the poller
+/// takes up the count again (after a restart, or when a service is
+/// updated): one less than the need needs if it is already showing one, so
+/// the next bad reading keeps it; one if it is merely bad; else none.
+fn bad_seed(snapshot: &Snapshot) -> u32 {
+    if snapshot
+        .needs
+        .iter()
+        .any(|n| n.key == DOWN_KEY || n.key == CONFIG_KEY)
+    {
+        DOWN_AFTER - 1
+    } else if snapshot.status == Status::Bad {
+        1
+    } else {
+        0
     }
 }
 

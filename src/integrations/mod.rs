@@ -172,11 +172,17 @@ impl fmt::Debug for FetchCtx {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub status: Status,
+    // The stored shape may be older than this code: whatever a later version
+    // adds to these types has to have a default (`#[serde(default)]`), so an
+    // old row still loads.
+    #[serde(default)]
     pub values: BTreeMap<String, Value>,
+    #[serde(default)]
     pub needs: Vec<Need>,
     pub fetched_at: Timestamp,
     /// A short reason when the fetch failed or the service is not well. Never
     /// contains a secret, a header or a URL (see [`FetchError`]).
+    #[serde(default)]
     pub error: Option<String>,
 }
 
@@ -214,7 +220,9 @@ pub enum Status {
 /// One metric's value: a number, a text, or both.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Value {
+    #[serde(default)]
     pub num: Option<f64>,
+    #[serde(default)]
     pub text: Option<String>,
 }
 
@@ -249,8 +257,10 @@ pub struct Need {
     pub key: String,
     pub level: Level,
     pub label_key: String,
+    #[serde(default)]
     pub params: BTreeMap<String, String>,
     /// Higher is worse.
+    #[serde(default)]
     pub score: f64,
 }
 
