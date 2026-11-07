@@ -953,14 +953,20 @@ export function startEditing(root, getLayout, save, opts = {}) {
 
     let remove = null;
     let input = null;
+    let pickButton = null;
+    let fileName = null;
     let status = null;
     let problem = null;
     if (background) {
       const id = uid("mm-f-image");
       const upload = h(doc, "div", { class: "field", "data-field": "image" });
-      upload.appendChild(h(doc, "label", { class: "label", for: id, text: L("bg_upload") }));
-      input = h(doc, "input", { type: "file", id, name: "image", accept: "image/png,image/jpeg,image/webp" });
-      upload.appendChild(input);
+      // The real file input stays (visually hidden, focusable) inside a label that
+      // looks like the kit's secondary button; the kit draws the focus ring on the
+      // label (`.btn:has(> input:focus-visible)`). The chosen file's name sits next to it.
+      input = h(doc, "input", { type: "file", id, name: "image", class: "vh", accept: "image/png,image/jpeg,image/webp" });
+      pickButton = h(doc, "label", { class: "btn btn-secondary mm-file-btn" }, [h(doc, "span", { text: L("bg_upload") }), input]);
+      fileName = h(doc, "span", { class: "mm-file-name", "aria-hidden": "true" });
+      upload.appendChild(h(doc, "div", { class: "mm-file-row" }, [pickButton, fileName]));
       upload.appendChild(h(doc, "p", { class: "help", id: `${id}-help`, text: L("bg_upload_help") }));
       problem = h(doc, "p", { class: "field-error", id: `${id}-error`, "data-for": "image", hidden: true });
       upload.appendChild(problem);
@@ -1017,11 +1023,17 @@ export function startEditing(root, getLayout, save, opts = {}) {
         markBusy(remove);
       }
       if (input) markBusy(input);
+      if (pickButton) markBusy(pickButton);
       body.setAttribute("aria-busy", busy ? "true" : "false");
     }
 
     function setStatus(text) {
       if (status) status.textContent = text;
+    }
+
+    /** The name of the file on its way, or nothing. */
+    function setFileName(text) {
+      if (fileName) fileName.textContent = text;
     }
 
     function setBusy(next, text = "") {
@@ -1043,9 +1055,11 @@ export function startEditing(root, getLayout, save, opts = {}) {
       const file = input.files?.[0];
       if (!file || busy || saving) return;
       showProblem(null);
+      setFileName(file.name ?? "");
       const refused = await pictureProblem(file);
       if (refused) {
         input.value = "";
+        setFileName("");
         showProblem(refused);
         input.focus();
         return;
@@ -1058,6 +1072,7 @@ export function startEditing(root, getLayout, save, opts = {}) {
         result = null;
       }
       input.value = "";
+      setFileName("");
       const id = result?.body?.id;
       if (result?.status === 200 && typeof id === "string") {
         if (!active) {
