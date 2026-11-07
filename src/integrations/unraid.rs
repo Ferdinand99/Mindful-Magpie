@@ -1,6 +1,6 @@
 //! The `unraid` kind («Unraid»): the server's own GraphQL API (built in from
 //! Unraid 7.2). One `POST /graphql` gives the array, the disks, the parity
-//! check, the containers and, for the top bar, CPU and memory.
+//! check, the containers and, for the top bar, the name, CPU and memory.
 //!
 //! The secret is an API key, sent as the header `x-api-key`. Create it under
 //! Settings → Management Access → API Keys with the role VIEWER.
@@ -9,7 +9,15 @@
 //! and no usable `data` is no reading ([`FetchError::Invalid`], or
 //! [`FetchError::Auth`] when every error says the key may not read it). An
 //! answer with `data` and `errors` (a role that may not read one field, say)
-//! gives the metrics that did come, and fewer of them.
+//! gives the metrics that did come, and fewer of them. When the errors are
+//! about the array or the containers the card is a warning with the reason;
+//! errors about `info` or `metrics` (only the top bar's figures) are silent.
+//!
+//! **An older schema.** A server that does not know `metrics` or `info`
+//! rejects the whole query (HTTP 400, or `GRAPHQL_VALIDATION_FAILED` with no
+//! data). The kind then asks again with the core query (array and
+//! containers only) and remembers the address for an hour, so these extras can
+//! never break the card; the server row then has no name, CPU or memory.
 //!
 //! **The disk figure.** `disk_used` is the use of the *fullest* disk (data
 //! disks and cache pools), not of the array as a whole: Unraid fills disks
@@ -29,14 +37,13 @@
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
-use reqwest::header::{HeaderName, HeaderValue};
 use serde_json::{Value as Json, json};
 
-use super::api;
+use super::api::{self, Credential, OldAddresses};
 use super::{
     BoxFuture, FetchCtx, FetchError, Field, FieldKind, Format, Integration, Level, MetricDef, Need,
     Snapshot, Status, Value,
@@ -50,6 +57,8 @@ pub struct UnraidKind;
 
 /// The header that carries the key.
 const KEY_HEADER: &str = "x-api-key";
+/// The addresses whose server rejected the full query.
+static CORE_ONLY: OldAddresses = OldAddresses::new();
 /// Disk use, in percent, where the card turns to a warning.
 pub const DISK_WARN: f64 = 85.0;
 /// Disk use, in percent, where the need turns bad.
@@ -68,12 +77,24 @@ const QUERY: &str = "query {
     state
     capacity { kilobytes { used total } }
     parityCheckStatus { running errors date }
-    disks { status fsSize fsUsed fsFree }
-    caches { status fsSize fsUsed fsFree }
+    disks { fsSize fsUsed fsFree }
+    caches { fsSize fsUsed fsFree }
   }
   docker { containers { state } }
   info { os { hostname } }
   metrics { cpu { percentTotal } memory { percentTotal } }
+}";
+
+/// The same without `info` and `metrics`, for a server that rejects those.
+const CORE_QUERY: &str = "query {
+  array {
+    state
+    capacity { kilobytes { used total } }
+    parityCheckStatus { running errors date }
+    disks { fsSize fsUsed fsFree }
+    caches { fsSize fsUsed fsFree }
+  }
+  docker { containers { state } }
 }";
 
 static FIELDS: [Field; 1] = [Field {
@@ -313,7 +334,7 @@ fn snapshot(reading: Reading) -> Snapshot {
             DISK_NEED,
             level,
             "need.unraid_disk",
-            Some(disk.round()),
+            Some(disk.floor()),
             disk,
         ));
     }
@@ -353,6 +374,45 @@ fn all_refused(errors: Option<&Json>) -> bool {
     })
 }
 
+/// What the errors of an answer that has data say about the part of it that
+/// matters: `None` when they are only about `info` and `metrics` (or there
+/// are none), else why (the key may not read it, or something else).
+fn core_error(errors: Option<&Json>) -> Option<FetchError> {
+    let list = errors.and_then(Json::as_array)?;
+    let core: Vec<&Json> = list
+        .iter()
+        .filter(|error| {
+            !matches!(
+                error.pointer("/path/0").and_then(Json::as_str),
+                Some("info" | "metrics")
+            )
+        })
+        .collect();
+    if core.is_empty() {
+        None
+    } else if all_refused(Some(&Json::Array(core.into_iter().cloned().collect()))) {
+        Some(FetchError::Auth)
+    } else {
+        Some(FetchError::Invalid)
+    }
+}
+
+/// Whether the server rejected the query itself (it asks for a field this
+/// Unraid does not have): `errors` with a validation code and nothing usable
+/// in `data`.
+fn query_rejected(doc: &Json) -> bool {
+    doc.get("data").is_none_or(|data| !data.is_object())
+        && doc
+            .get("errors")
+            .and_then(Json::as_array)
+            .is_some_and(|list| {
+                list.iter().any(|error| {
+                    error.pointer("/extensions/code").and_then(Json::as_str)
+                        == Some("GRAPHQL_VALIDATION_FAILED")
+                })
+            })
+}
+
 /// The snapshot of a GraphQL answer.
 fn answer(doc: &Json) -> Result<Snapshot, FetchError> {
     let reading = doc
@@ -361,35 +421,52 @@ fn answer(doc: &Json) -> Result<Snapshot, FetchError> {
         .map(reading)
         .filter(|r| *r != Reading::default());
     match reading {
-        Some(reading) => Ok(snapshot(reading)),
+        Some(reading) => {
+            let mut snapshot = snapshot(reading);
+            // A part that matters could not be read: not quite well.
+            if let Some(error) = core_error(doc.get("errors")) {
+                if snapshot.status == Status::Ok {
+                    snapshot.status = Status::Warn;
+                }
+                snapshot.error = Some(error.to_string());
+            }
+            Ok(snapshot)
+        }
         None if all_refused(doc.get("errors")) => Err(FetchError::Auth),
         None => Err(FetchError::Invalid),
     }
 }
 
-/// The key as a header value, marked sensitive. No key, or one that cannot
-/// be a header value, is [`FetchError::Config`].
-fn key_value(secret: Option<&str>) -> Result<HeaderValue, FetchError> {
-    let secret = secret.filter(|s| !s.is_empty()).ok_or(FetchError::Config)?;
-    let mut value = HeaderValue::from_str(secret).map_err(|_| FetchError::Config)?;
-    value.set_sensitive(true);
-    Ok(value)
+/// One POST of `query`.
+async fn ask(
+    ctx: &FetchCtx,
+    url: &url::Url,
+    key: &Credential,
+    query: &str,
+) -> Result<Json, FetchError> {
+    api::post_json(&ctx.http, url.clone(), key, &json!({ "query": query }))
+        .await?
+        .found()
 }
 
 async fn read(ctx: &FetchCtx) -> Result<Snapshot, FetchError> {
     let base = api::base_url(&ctx.settings)?;
-    let key = key_value(ctx.secret.as_deref())?;
+    let key = Credential::header(KEY_HEADER, ctx.secret.as_deref())?;
     let url = api::endpoint(&base, &["graphql"], None)?;
-    let doc: Json = api::post_json(
-        &ctx.http,
-        url,
-        HeaderName::from_static(KEY_HEADER),
-        &key,
-        &json!({ "query": QUERY }),
-    )
-    .await?
-    .found()?;
-    answer(&doc)
+    let address = url.to_string();
+    if !CORE_ONLY.is_old(&address, Instant::now()) {
+        match ask(ctx, &url, &key, QUERY).await {
+            Err(FetchError::Status(400)) => {}
+            Ok(doc) if query_rejected(&doc) => {}
+            Ok(doc) => {
+                CORE_ONLY.forget(&address);
+                return answer(&doc);
+            }
+            Err(err) => return Err(err),
+        }
+        CORE_ONLY.mark(&address, Instant::now());
+    }
+    answer(&ask(ctx, &url, &key, CORE_QUERY).await?)
 }
 
 impl Integration for UnraidKind {

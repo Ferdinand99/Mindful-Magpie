@@ -1,18 +1,17 @@
 //! The `unraid` kind («Unraid») against a stub server on 127.0.0.1: the
 //! GraphQL answer for a healthy server, a stopped array, parity errors, a
-//! full disk, GraphQL errors (all of them and some of them), a refused key,
-//! answers that are not what was expected, and that the key goes nowhere but
-//! into the `x-api-key` header of the request.
+//! full disk, GraphQL errors (all of them and some of them), a server that
+//! rejects the full query, a refused key, answers that are not what was
+//! expected, and that the key goes nowhere but into the `x-api-key` header of
+//! the request.
 
-use std::io::Write;
-use std::sync::{Arc, Mutex, Once, OnceLock};
+mod common;
+
+use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Router;
-use axum::body::Bytes;
-use axum::extract::State;
-use axum::http::{HeaderMap, Method, StatusCode, Uri};
-use axum::response::{IntoResponse, Response};
+use common::stub::{self, Answer, Stub};
+use common::{locale, log};
 use mindful_magpie::integrations::{
     self, FetchCtx, FetchError, Integration, Level, Need, Snapshot, Status,
 };
@@ -20,130 +19,9 @@ use serde_json::{Value as Json, json};
 
 const KEY: &str = "unr-K3y-Zq81x7w4mK-0f9a";
 
-// ---------------------------------------------------------------------------
-// Capturing what is logged
-
-#[derive(Clone)]
-struct LogBuffer(Arc<Mutex<Vec<u8>>>);
-
-impl Write for LogBuffer {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn log_buffer() -> &'static LogBuffer {
-    static BUFFER: OnceLock<LogBuffer> = OnceLock::new();
-    static INSTALL: Once = Once::new();
-    let buffer = BUFFER.get_or_init(|| LogBuffer(Arc::new(Mutex::new(Vec::new()))));
-    INSTALL.call_once(|| {
-        let writer = buffer.clone();
-        // Also bridges the `log` records of reqwest and hyper.
-        tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .try_init()
-            .expect("no other subscriber in this test binary");
-    });
-    buffer
-}
-
-fn logged() -> String {
-    String::from_utf8_lossy(&log_buffer().0.lock().unwrap()).into_owned()
-}
-
-// ---------------------------------------------------------------------------
-// The stub
-
-/// What `/graphql` answers.
-#[derive(Clone)]
-enum Answer {
-    Json(Json),
-    Raw(&'static str),
-    Status(u16),
-    /// Never answers.
-    Hang,
-}
-
-/// One request the stub saw.
-#[derive(Clone, Debug)]
-struct Hit {
-    method: String,
-    path: String,
-    api_key: Option<String>,
-    authorization: Option<String>,
-    content_type: Option<String>,
-    body: String,
-}
-
-#[derive(Clone)]
-struct Stub {
-    answer: Answer,
-    hits: Arc<Mutex<Vec<Hit>>>,
-}
-
-impl Stub {
-    fn hits(&self) -> Vec<Hit> {
-        self.hits.lock().unwrap().clone()
-    }
-}
-
-async fn answer(
-    State(stub): State<Stub>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let text = |name: &str| {
-        headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string)
-    };
-    stub.hits.lock().unwrap().push(Hit {
-        method: method.to_string(),
-        path: uri.path().to_string(),
-        api_key: text("x-api-key"),
-        authorization: text("authorization"),
-        content_type: text("content-type"),
-        body: String::from_utf8_lossy(&body).into_owned(),
-    });
-    if !uri.path().ends_with("/graphql") {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    match stub.answer.clone() {
-        Answer::Json(v) => axum::Json(v).into_response(),
-        Answer::Raw(text) => (
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            text,
-        )
-            .into_response(),
-        Answer::Status(code) => StatusCode::from_u16(code).unwrap().into_response(),
-        Answer::Hang => {
-            tokio::time::sleep(Duration::from_secs(3600)).await;
-            StatusCode::OK.into_response()
-        }
-    }
-}
-
-/// Starts a stub on a free port; its address (no trailing slash) and handle.
+/// A stub whose `/graphql` answers `what`.
 async fn serve(what: Answer) -> (String, Stub) {
-    let stub = Stub {
-        answer: what,
-        hits: Arc::new(Mutex::new(Vec::new())),
-    };
-    let app = Router::new().fallback(answer).with_state(stub.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (format!("http://{addr}"), stub)
+    stub::serve_one("/graphql", what).await
 }
 
 fn kind() -> &'static dyn Integration {
@@ -263,46 +141,15 @@ fn the_kind_describes_itself() {
         "need.unraid_disk",
         "fetch_err.auth",
     ]);
-    for (lang, text) in [
-        ("en", include_str!("../locales/en.toml")),
-        ("nb", include_str!("../locales/nb.toml")),
-    ] {
-        for key in &keys {
-            let (section, name) = key.split_once('.').unwrap();
-            assert!(has_text(text, section, name), "{lang}: {key}");
-        }
+    for key in &keys {
+        locale::in_both(key).unwrap();
     }
-}
-
-/// The text of `name` in `[section]` of a locale file.
-fn locale_text(locale: &str, section: &str, name: &str) -> Option<String> {
-    let mut inside = false;
-    for line in locale.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            inside = line == format!("[{section}]");
-        } else if inside
-            && let Some(value) = line
-                .strip_prefix(name)
-                .and_then(|r| r.trim().strip_prefix('='))
-        {
-            return Some(value.trim().trim_matches('"').to_string());
-        }
-    }
-    None
-}
-
-fn has_text(locale: &str, section: &str, name: &str) -> bool {
-    locale_text(locale, section, name).is_some_and(|t| !t.is_empty())
 }
 
 #[test]
 fn the_form_help_and_the_needs_read_well_in_both_languages() {
-    for (lang, file) in [
-        ("en", include_str!("../locales/en.toml")),
-        ("nb", include_str!("../locales/nb.toml")),
-    ] {
-        let help = locale_text(file, "field", "unraid_secret_help").unwrap();
+    for (lang, file) in locale::LOCALES {
+        let help = locale::text(file, "field", "unraid_secret_help").unwrap();
         for part in [
             "Settings → Management Access → API Keys",
             "VIEWER",
@@ -313,28 +160,28 @@ fn the_form_help_and_the_needs_read_well_in_both_languages() {
         }
         // Noun, a colon, the count; the array's need has no count.
         for name in ["unraid_parity_errors", "unraid_disk"] {
-            let text = locale_text(file, "need", name).unwrap();
+            let text = locale::text(file, "need", name).unwrap();
             let noun = text.strip_suffix(": {count}").expect(&text);
             assert!(
                 !noun.is_empty() && !noun.contains(['{', '}', ':']),
                 "{text}"
             );
         }
-        let array = locale_text(file, "need", "unraid_array").unwrap();
+        let array = locale::text(file, "need", "unraid_array").unwrap();
         assert!(!array.contains('{'), "{lang}: {array}");
     }
     let nb = include_str!("../locales/nb.toml");
     assert_eq!(
-        locale_text(nb, "need", "unraid_array").as_deref(),
+        locale::text(nb, "need", "unraid_array").as_deref(),
         Some("Arrayet er ikke i drift")
     );
     assert_eq!(
-        locale_text(nb, "need", "unraid_parity_errors").as_deref(),
+        locale::text(nb, "need", "unraid_parity_errors").as_deref(),
         Some("Paritetsfeil: {count}")
     );
     let en = include_str!("../locales/en.toml");
     assert_eq!(
-        locale_text(en, "need", "unraid_array").as_deref(),
+        locale::text(en, "need", "unraid_array").as_deref(),
         Some("Array not running")
     );
 }
@@ -357,7 +204,7 @@ async fn a_healthy_server_becomes_values_and_an_ok_status() {
     assert_eq!(num(&s, "parity_last"), Some(1_793_498_400.0));
     // One call, a JSON POST to /graphql with the key in x-api-key and
     // nothing in Authorization.
-    let hits = stub.hits();
+    let hits = stub.seen();
     assert_eq!(hits.len(), 1);
     let hit = &hits[0];
     assert_eq!(hit.method, "POST");
@@ -592,6 +439,204 @@ async fn partial_data_gives_fewer_metrics_and_still_a_status() {
     assert_eq!(text(&s, "array"), Some("STOPPED"));
     assert_eq!(num(&s, "disk_used"), Some(62.0));
     assert!(need(&s, "unraid:array").is_some());
+    assert_eq!(s.error.as_deref(), Some("key refused"), "the containers");
+}
+
+#[tokio::test]
+async fn an_error_about_a_core_field_warns_and_one_about_the_extras_does_not() {
+    let denied = |path: &str| json!([{ "message": "no", "path": [path], "extensions": { "code": "FORBIDDEN" } }]);
+    // The containers could not be read: a warning with the reason.
+    let mut doc = healthy();
+    doc["data"]["docker"] = json!(null);
+    doc["errors"] = denied("docker");
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let s = fetch(&url).await;
+    assert_eq!(s.status, Status::Warn);
+    assert_eq!(s.error.as_deref(), Some("key refused"));
+    assert!(s.values.contains_key("array"));
+    assert!(!s.values.contains_key("containers_running"));
+
+    // The array, with another kind of error.
+    let mut doc = healthy();
+    doc["data"]["array"] = json!(null);
+    doc["errors"] = json!([{ "message": "boom", "path": ["array"] }]);
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let s = fetch(&url).await;
+    assert_eq!(s.status, Status::Warn);
+    assert_eq!(s.error.as_deref(), Some("unexpected answer"));
+
+    // Only the top bar's figures could not be read: nothing to say.
+    for path in ["metrics", "info"] {
+        let mut doc = healthy();
+        doc["data"][path] = json!(null);
+        doc["errors"] = denied(path);
+        let (url, _) = serve(Answer::Json(doc)).await;
+        let s = fetch(&url).await;
+        assert_eq!(s.status, Status::Ok, "{path}");
+        assert_eq!(s.error, None, "{path}");
+    }
+
+    // A warning does not hide a bad status.
+    let mut doc = with("/data/array/state", json!("STOPPED"));
+    doc["data"]["docker"] = json!(null);
+    doc["errors"] = denied("docker");
+    let (url, _) = serve(Answer::Json(doc)).await;
+    assert_eq!(fetch(&url).await.status, Status::Bad);
+}
+
+/// A server of an older Unraid: a query that asks for `metrics` gets `reject`,
+/// any other the healthy answer without the extras.
+fn older(reject: Answer) -> Answer {
+    let core = Answer::Json(with("/data/metrics", json!(null)));
+    Answer::With(Arc::new(move |hit| {
+        if hit.body.contains("metrics") {
+            reject.clone()
+        } else {
+            core.clone()
+        }
+    }))
+}
+
+fn validation_failed() -> Answer {
+    Answer::Json(json!({ "errors": [{
+        "message": "Cannot query field \"metrics\" on type \"Query\".",
+        "extensions": { "code": "GRAPHQL_VALIDATION_FAILED" },
+    }] }))
+}
+
+#[tokio::test]
+async fn a_server_that_rejects_the_full_query_is_asked_for_the_core_and_remembered() {
+    // The server answers 400 (Apollo does for a query that does not validate)
+    // or 200 with a validation error and no data.
+    for reject in [Answer::Status(400), validation_failed()] {
+        let (url, stub) = serve(older(reject)).await;
+        let s = fetch(&url).await;
+        assert_eq!(s.status, Status::Ok);
+        assert_eq!(text(&s, "array"), Some("STARTED"));
+        assert_eq!(num(&s, "containers_running"), Some(2.0));
+        assert_eq!(num(&s, "disk_used"), Some(62.0));
+        assert_eq!(s.error, None);
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 2, "the full query, then the core");
+        assert!(seen[0].body.contains("metrics") && seen[0].body.contains("hostname"));
+        assert!(!seen[1].body.contains("metrics") && !seen[1].body.contains("hostname"));
+        for hit in &seen {
+            assert_eq!(hit.api_key.as_deref(), Some(KEY));
+        }
+        // The next reading goes straight to the core query.
+        let again = fetch(&url).await;
+        assert_eq!(again.status, Status::Ok);
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 3, "one request more, not two");
+        assert!(!seen[2].body.contains("metrics"));
+    }
+}
+
+#[tokio::test]
+async fn the_core_query_still_reads_everything_the_card_shows() {
+    let (url, stub) = serve(older(Answer::Status(400))).await;
+    let s = fetch(&url).await;
+    for id in [
+        "containers_running",
+        "containers_stopped",
+        "array",
+        "disk_used",
+        "parity_errors",
+        "parity_last",
+    ] {
+        assert!(s.values.contains_key(id), "{id}");
+    }
+    let core = &stub.seen()[1].body;
+    for part in ["state", "parityCheckStatus", "fsSize", "containers"] {
+        assert!(core.contains(part), "{part}");
+    }
+    // The fields that are not read are not asked for.
+    assert!(!core.contains("status"), "{core}");
+}
+
+#[tokio::test]
+async fn a_failure_that_is_not_a_rejected_query_is_not_retried() {
+    for answer in [
+        Answer::Status(500),
+        Answer::Json(json!({ "errors": [{ "message": "boom" }] })),
+        Answer::Json(
+            json!({ "errors": [{ "message": "no", "extensions": { "code": "FORBIDDEN" } }] }),
+        ),
+        Answer::Raw("garbage"),
+    ] {
+        let (url, stub) = serve(answer).await;
+        let _ = fetch_err(&url).await;
+        assert_eq!(stub.seen().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn when_both_queries_are_rejected_there_is_no_reading() {
+    let (url, stub) = serve(Answer::Status(400)).await;
+    assert_eq!(fetch_err(&url).await, FetchError::Status(400));
+    assert_eq!(stub.seen().len(), 2);
+    let (url, _) = serve(validation_failed()).await;
+    assert_eq!(fetch_err(&url).await, FetchError::Invalid);
+}
+
+#[tokio::test]
+async fn the_array_state_is_shown_in_the_users_language_with_the_word_as_fallback() {
+    // The texts come from the kit's catalogue, which a Magpie installs.
+    let _app = common::App::new().await;
+    let (en, nb) = (locale::LOCALES[0].1, locale::LOCALES[1].1);
+    for (raw, nb_text, en_text) in [
+        ("started", "Startet", "Started"),
+        ("stopped", "Stoppet", "Stopped"),
+        ("new_array", "Ny array", "New array"),
+    ] {
+        let key = format!("unraid_array_{raw}");
+        assert_eq!(locale::text(nb, "value", &key).as_deref(), Some(nb_text));
+        assert_eq!(locale::text(en, "value", &key).as_deref(), Some(en_text));
+    }
+    // Every state the schema has a text in both languages.
+    for state in [
+        "started",
+        "stopped",
+        "new_array",
+        "recon_disk",
+        "disable_disk",
+        "swap_dsbl",
+        "invalid_expansion",
+        "parity_not_biggest",
+        "too_many_missing_disks",
+        "new_disk_too_small",
+        "no_data_disks",
+    ] {
+        locale::in_both(&format!("value.unraid_array_{state}")).unwrap();
+    }
+    // Outside a request the language is English; a word the files do not
+    // know stays as the server sent it.
+    assert_eq!(
+        integrations::value_label("unraid", "array", "STARTED"),
+        "Started"
+    );
+    for odd in ["SOMETHING_NEW", "  ", "", &"X".repeat(80)] {
+        assert_eq!(integrations::value_label("unraid", "array", odd), odd);
+    }
+    // Only text metrics are translated.
+    let mut values = std::collections::BTreeMap::from([
+        ("array".to_string(), integrations::Value::text("STOPPED")),
+        ("disk_used".to_string(), integrations::Value::num(4.0)),
+    ]);
+    integrations::localize_texts("unraid", &mut values);
+    assert_eq!(values["array"].text.as_deref(), Some("Stopped"));
+    assert_eq!(values["disk_used"].num, Some(4.0));
+}
+
+#[tokio::test]
+async fn a_count_is_never_above_the_real_figure() {
+    // 87.9 % shows as 87, the need's score keeps the exact value.
+    let doc = with("/data/array/disks/1/fsUsed", json!("3516000000"));
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let s = fetch(&url).await;
+    let n = need(&s, "unraid:disk").unwrap();
+    assert_eq!(count_param(n), Some("87"));
+    assert!((n.score - 87.9).abs() < 1e-9);
 }
 
 // ---------------------------------------------------------------------------
@@ -717,16 +762,16 @@ async fn settings_it_cannot_use_are_errors_that_name_no_value() {
         secret: Some(KEY.into()),
     };
     assert_eq!(kind().fetch(&c).await.unwrap_err(), FetchError::Config);
-    assert!(stub.hits().is_empty());
+    assert!(stub.seen().is_empty());
 }
 
 #[tokio::test]
 async fn a_path_in_the_address_is_kept() {
     // Unraid behind a proxy prefix.
-    let (url, stub) = serve(Answer::Json(healthy())).await;
+    let (url, stub) = stub::serve_one("/tower/graphql", Answer::Json(healthy())).await;
     let s = fetch(&format!("{url}/tower/")).await;
     assert_eq!(s.status, Status::Ok);
-    assert_eq!(stub.hits()[0].path, "/tower/graphql");
+    assert_eq!(stub.seen()[0].path, "/tower/graphql");
 }
 
 // ---------------------------------------------------------------------------
@@ -734,7 +779,7 @@ async fn a_path_in_the_address_is_kept() {
 
 #[tokio::test]
 async fn the_key_is_in_the_request_only() {
-    let _ = log_buffer();
+    let _ = log::buffer();
     let mut snapshots = Vec::new();
     let mut errors = Vec::new();
 
@@ -777,24 +822,12 @@ async fn the_key_is_in_the_request_only() {
     assert!(!all.contains(KEY), "a snapshot holds the key");
     assert!(!all.to_lowercase().contains("x-api-key"));
 
-    let log = logged();
+    let log = log::logged();
     assert!(
-        log.contains("hyper_util") || log.contains("reqwest"),
+        log::client_lines_seen(&log),
         "the capture sees the HTTP client's own lines"
     );
     assert!(!log.contains(KEY), "the log holds the key");
-}
-
-/// A stub on a port of its own that answers every request with `redirect`.
-async fn redirector(redirect: fn(&str) -> axum::response::Redirect, to: String) -> String {
-    let app = Router::new().fallback(move || {
-        let to = to.clone();
-        async move { redirect(&to) }
-    });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let origin = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    origin
 }
 
 #[tokio::test]
@@ -802,47 +835,43 @@ async fn a_redirect_to_another_origin_never_carries_the_key() {
     // reqwest drops `Authorization` on such a redirect, but not `x-api-key`:
     // the call is refused instead, and the other origin sees nothing. All
     // three redirects that GraphQL clients meet (POST kept or turned to GET).
-    let redirects: [fn(&str) -> axum::response::Redirect; 3] = [
-        axum::response::Redirect::temporary,
-        axum::response::Redirect::permanent,
-        axum::response::Redirect::to,
-    ];
-    for redirect in redirects {
+    for redirect in stub::redirects() {
         let (target, target_stub) = serve(Answer::Json(healthy())).await;
-        let origin = redirector(redirect, format!("{target}/graphql")).await;
+        let origin = stub::redirector(redirect, format!("{target}/graphql")).await;
         assert_eq!(fetch_err(&origin).await, FetchError::RedirectScheme);
-        assert!(target_stub.hits().is_empty(), "{:?}", target_stub.hits());
+        assert!(target_stub.seen().is_empty(), "{:?}", target_stub.seen());
     }
     // Another port on the same host is another origin too (Unraid sends
     // http to https that way).
     let (target, target_stub) = serve(Answer::Json(healthy())).await;
-    let port_of = |url: &str| url.rsplit(':').next().unwrap().to_string();
-    let origin = redirector(
+    let port_of = |url: &str| {
+        url.split('/')
+            .nth(2)
+            .unwrap()
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    let origin = stub::redirector(
         axum::response::Redirect::temporary,
         format!("http://localhost:{}/graphql", port_of(&target)),
     )
     .await;
     assert_eq!(fetch_err(&origin).await, FetchError::RedirectScheme);
-    assert!(target_stub.hits().is_empty());
+    assert!(target_stub.seen().is_empty());
 }
 
 #[tokio::test]
 async fn a_redirect_within_the_origin_keeps_the_key() {
-    let (_, stub) = serve(Answer::Json(healthy())).await;
-    let app = Router::new()
-        .route(
-            "/old/graphql",
-            axum::routing::post(|| async { axum::response::Redirect::temporary("/graphql") }),
-        )
-        .fallback(answer)
-        .with_state(stub.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let origin = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let s = fetch(&format!("{origin}/old")).await;
+    let (url, stub) = serve(Answer::Json(healthy())).await;
+    stub.route("/old/graphql", Answer::Moved("/graphql"));
+    let s = fetch(&format!("{url}/old")).await;
     assert_eq!(s.status, Status::Ok);
-    let hits = stub.hits();
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].path, "/graphql");
-    assert_eq!(hits[0].api_key.as_deref(), Some(KEY));
+    let seen = stub.seen();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].path, "/old/graphql");
+    assert_eq!(seen[1].path, "/graphql");
+    assert_eq!(seen[1].api_key.as_deref(), Some(KEY));
+    assert_eq!(seen[1].method, "POST");
 }
