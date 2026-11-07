@@ -62,6 +62,8 @@ pub const MAX_OWNERS: usize = 5;
 pub const CI_FALLBACK_MAX: usize = 10;
 /// With this few requests left in the window the optional REST calls wait.
 const LOW_REMAINING: u64 = 25;
+/// How long a service waits after a secondary rate limit (no reset is given).
+const SECONDARY_WAIT: SignedDuration = SignedDuration::from_secs(60);
 /// The longest a service waits for a rate limit to reset.
 pub const MAX_WAIT: SignedDuration = SignedDuration::from_hours(2);
 /// How long a part of the query that the token may not read is left out.
@@ -449,8 +451,9 @@ struct Answer {
     /// Whether any list of repositories came back (an empty one counts).
     repos_seen: bool,
     repos: Vec<Repo>,
-    /// The parts the answer's errors say the token may not read.
-    denied: Vec<Part>,
+    /// The parts the answer's errors name, and whether the error says the
+    /// token may not read them (lasting) or is only a failure of this answer.
+    denied: Vec<(Part, bool)>,
 }
 
 impl Session<'_> {
@@ -486,27 +489,33 @@ impl Session<'_> {
                 login
             }
         };
-        let mut denied = self.with_entry(|e| e.denied).unwrap_or_default();
+        // What is left out for good (an hour), and what is also left out of
+        // this fetch's later attempts (a part that failed for another reason).
+        let mut stored = self.with_entry(|e| e.denied).unwrap_or_default();
+        let mut denied = stored;
         let mut remaining = None;
         let mut answer = Answer::default();
         for attempt in 1..=ATTEMPTS {
             let (parsed, limits) = self.query(owners, login.as_deref(), &denied, now).await?;
             remaining = limits.remaining;
-            let new: Vec<Part> = parsed
+            let new: Vec<(Part, bool)> = parsed
                 .denied
                 .iter()
                 .copied()
-                .filter(|p| !denied.is(*p, now))
+                .filter(|(p, _)| !denied.is(*p, now))
                 .collect();
             answer = parsed;
             if new.is_empty() || attempt == ATTEMPTS {
                 break;
             }
-            for part in new {
+            for (part, lasting) in new {
                 denied.deny(part, now);
+                if lasting {
+                    stored.deny(part, now);
+                }
             }
         }
-        self.with_entry(|e| e.denied = denied);
+        self.with_entry(|e| e.denied = stored);
 
         if !answer.had_data {
             return Err(FetchError::Invalid);
@@ -625,10 +634,24 @@ impl Session<'_> {
         let code = response.status().as_u16();
         let limits = Limits::of(response.headers());
         self.note(&limits, now);
+        if matches!(code, 403 | 429) && !limits.exhausted() {
+            // A secondary limit says so in the body and gives no window: wait
+            // a minute. Anything else is a refusal (403) or a status (429).
+            let body = read_capped(response).await.unwrap_or_default();
+            if is_secondary_limit(&body) {
+                let until = now.checked_add(SECONDARY_WAIT).unwrap_or(now);
+                self.with_entry(|e| e.blocked_until = Some(until));
+                return Err(FetchError::RateLimited);
+            }
+            return Err(if code == 403 {
+                FetchError::Auth
+            } else {
+                FetchError::Status(code)
+            });
+        }
         match code {
             401 => Err(FetchError::Auth),
-            403 | 429 if limits.exhausted() => Err(FetchError::RateLimited),
-            403 => Err(FetchError::Auth),
+            403 | 429 => Err(FetchError::RateLimited),
             code if !(200..300).contains(&code) => Err(FetchError::Status(code)),
             _ => Ok((read_capped(response).await?, limits)),
         }
@@ -737,8 +760,9 @@ const REPOSITORY: &str = "fragment R on Repository {
 /// variables. A denied part is left out (its field stays, without the
 /// sub-selection that needs the permission).
 fn build_query(owners: &[String], login: Option<&str>, denied: &Denied, now: Timestamp) -> Json {
-    let repositories = "repositories(first: 100, isArchived: false, isFork: false, \
-                        orderBy: {field: PUSHED_AT, direction: DESC}) { nodes { ...R } }";
+    let repositories = "repositories(first: 100, ownerAffiliations: [OWNER], isArchived: false, \
+                        isFork: false, orderBy: {field: PUSHED_AT, direction: DESC}) \
+                        { nodes { ...R } }";
     let mut declared: Vec<String> = Vec::new();
     let mut variables = serde_json::Map::new();
     let mut selections: Vec<String> = vec!["rateLimit { cost remaining resetAt }".to_string()];
@@ -808,25 +832,44 @@ fn build_query(owners: &[String], login: Option<&str>, denied: &Denied, now: Tim
     })
 }
 
-/// The parts the errors of an answer say the token may not read: the ones
-/// whose field is in an error's path.
-fn denied_parts(root: &Json) -> Vec<Part> {
+/// Whether a refusal's body says GitHub's secondary rate limit was hit.
+fn is_secondary_limit(body: &[u8]) -> bool {
+    String::from_utf8_lossy(body)
+        .to_ascii_lowercase()
+        .contains("secondary rate limit")
+}
+
+/// The parts the errors of an answer name: the ones whose field is in an
+/// error's path. An error of type FORBIDDEN or INSUFFICIENT_SCOPES says the
+/// token may not read the part (`true`: lasting); any other error with a path
+/// is a failure of this answer only (`false`).
+fn denied_parts(root: &Json) -> Vec<(Part, bool)> {
     let Some(errors) = root.get("errors").and_then(Json::as_array) else {
         return Vec::new();
     };
     Part::ALL
         .into_iter()
-        .filter(|part| {
-            errors.iter().any(|error| {
-                error
-                    .get("path")
-                    .and_then(Json::as_array)
-                    .is_some_and(|path| {
-                        path.iter()
-                            .filter_map(Json::as_str)
-                            .any(|step| part.fields().contains(&step))
-                    })
-            })
+        .filter_map(|part| {
+            let naming: Vec<&Json> = errors
+                .iter()
+                .filter(|error| {
+                    error
+                        .get("path")
+                        .and_then(Json::as_array)
+                        .is_some_and(|path| {
+                            path.iter()
+                                .filter_map(Json::as_str)
+                                .any(|step| part.fields().contains(&step))
+                        })
+                })
+                .collect();
+            let lasting = naming.iter().any(|error| {
+                matches!(
+                    error.get("type").and_then(Json::as_str),
+                    Some("FORBIDDEN" | "INSUFFICIENT_SCOPES")
+                )
+            });
+            (!naming.is_empty()).then_some((part, lasting))
         })
         .collect()
 }

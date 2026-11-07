@@ -1368,6 +1368,197 @@ async fn the_config_need_of_a_personal_service_is_for_its_user_not_an_admin() {
 }
 
 // ---------------------------------------------------------------------------
+// The limits
+
+fn english(path: &str, form: &[(&str, &str)]) -> Request<Body> {
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(form)
+        .finish();
+    Request::post(path)
+        .header(header::ORIGIN, format!("http://{HOST}"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("accept-language", "en")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_user_may_have_ten_personal_services_and_no_more() {
+    let app = App::new().await;
+    let core = &app.magpie.core;
+    let vera = add_user(&app, "vera", "viewer").await;
+    let bob = add_user(&app, "bob", "viewer").await;
+    let mut ids = Vec::new();
+    for i in 0..10 {
+        ids.push(personal_for(&app, vera, &format!("Mine {i}")).await);
+    }
+    let err = store::create_in(core, Scope::Personal(vera), &github("One too many"))
+        .await
+        .unwrap_err();
+    match err {
+        store::StoreError::Invalid(errors) => {
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors[0].field, "name");
+            assert_eq!(errors[0].key, "err.personal_limit");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        store::list_in(core, Scope::Personal(vera))
+            .await
+            .unwrap()
+            .len(),
+        10
+    );
+    // Another user, and shared services, have their own count.
+    personal_for(&app, bob, "Bob GitHub").await;
+    shared_service(&app, "Blog").await;
+    // A slot frees when one is deleted.
+    assert!(
+        store::delete_in(core, Scope::Personal(vera), ids[0])
+            .await
+            .unwrap()
+    );
+    personal_for(&app, vera, "Eleventh").await;
+    assert!(
+        store::create_in(core, Scope::Personal(vera), &github("Twelfth"))
+            .await
+            .is_err()
+    );
+
+    // Two requests at once cannot both take the last place.
+    let cy = add_user(&app, "cy", "viewer").await;
+    for i in 0..9 {
+        personal_for(&app, cy, &format!("Cy {i}")).await;
+    }
+    let attempts: Vec<_> = (0..8)
+        .map(|i| {
+            let core = core.clone();
+            tokio::spawn(async move {
+                store::create_in(&core, Scope::Personal(cy), &github(&format!("Race {i}"))).await
+            })
+        })
+        .collect();
+    let mut made = 0;
+    for attempt in attempts {
+        if attempt.await.unwrap().is_ok() {
+            made += 1;
+        }
+    }
+    assert_eq!(made, 1);
+    assert_eq!(
+        store::list_in(core, Scope::Personal(cy))
+            .await
+            .unwrap()
+            .len(),
+        10
+    );
+}
+
+#[tokio::test]
+async fn the_form_says_so_in_both_languages_when_the_limit_is_reached() {
+    let app = App::new().await;
+    let mut vera = Web::new(&app, "vera", "viewer").await;
+    let vera_id = user_id(&app, "vera").await;
+    for i in 0..10 {
+        personal_for(&app, vera_id, &format!("Mine {i}")).await;
+    }
+    let form = [
+        ("kind", "github"),
+        ("name", "One too many"),
+        ("interval", ""),
+        ("secret", TOKEN),
+    ];
+    let res = vera
+        .send(english("/settings/integrations/new", &form))
+        .await;
+    assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", res.body);
+    assert!(
+        res.body
+            .contains("You can have up to 10 integrations of your own"),
+        "{}",
+        res.body
+    );
+    let mut req = english("/settings/integrations/new", &form);
+    req.headers_mut()
+        .insert("accept-language", HeaderValue::from_static("nb"));
+    let res = vera.send(req).await;
+    assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        res.body.contains("Du kan ha opptil 10 egne integrasjoner"),
+        "{}",
+        res.body
+    );
+    assert_eq!(app.count("SELECT COUNT(*) FROM services").await, 10);
+}
+
+#[tokio::test]
+async fn the_personal_test_is_limited_to_six_a_minute_per_user() {
+    let app = App::new().await;
+    let mut ada = Web::new(&app, "ada", "admin").await;
+    let mut vera = Web::new(&app, "vera", "viewer").await;
+    let mut bob = Web::new(&app, "bob", "viewer").await;
+    // Nothing is sent: no key.
+    let press = [("kind", "github"), ("f_owners", ""), ("secret", "")];
+    for i in 0..6 {
+        let res = vera
+            .post_with("/settings/integrations/test", &press, true)
+            .await;
+        assert_eq!(res.status, StatusCode::OK, "press {i}");
+    }
+    let res = vera
+        .post_with("/settings/integrations/test", &press, true)
+        .await;
+    assert_eq!(res.status, StatusCode::TOO_MANY_REQUESTS, "{}", res.body);
+    assert!(res.header("retry-after").parse::<u64>().unwrap() >= 1);
+    // Still limited, whatever the form says.
+    let res = vera
+        .post_with("/settings/integrations/test", &[("kind", "http")], true)
+        .await;
+    assert_eq!(res.status, StatusCode::TOO_MANY_REQUESTS);
+    // The budget is the user's own: Bob, and the admin's own page, are not
+    // held back.
+    for _ in 0..3 {
+        let res = bob
+            .post_with("/settings/integrations/test", &press, true)
+            .await;
+        assert_eq!(res.status, StatusCode::OK);
+    }
+    for _ in 0..6 {
+        let res = ada
+            .post_with("/settings/integrations/test", &press, true)
+            .await;
+        assert_eq!(res.status, StatusCode::OK);
+    }
+    // The admin's «Test» of shared services has no such budget, and viewers
+    // cannot use it.
+    let shared_press = [("kind", "http"), ("url", "http://127.0.0.1:1/")];
+    for _ in 0..8 {
+        let res = bob
+            .post_with("/settings/services/test", &shared_press, true)
+            .await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "not for viewers");
+    }
+    for _ in 0..8 {
+        let res = ada
+            .post_with("/settings/services/test", &shared_press, true)
+            .await;
+        assert_eq!(res.status, StatusCode::OK);
+    }
+    // Bob has three presses left.
+    for _ in 0..3 {
+        let res = bob
+            .post_with("/settings/integrations/test", &press, true)
+            .await;
+        assert_eq!(res.status, StatusCode::OK);
+    }
+    let res = bob
+        .post_with("/settings/integrations/test", &press, true)
+        .await;
+    assert_eq!(res.status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+// ---------------------------------------------------------------------------
 // Deleting the user
 
 #[tokio::test]
@@ -1533,12 +1724,40 @@ async fn the_poller_fetches_a_personal_service_with_its_users_token() {
         .await;
     assert_eq!(stored, 1);
 
-    // The user is deleted: the poller, told to look again, forgets the
-    // service and its reading.
-    w.app
-        .exec(format!("DELETE FROM users WHERE id = {}", w.alice))
-        .await;
-    poller.resync();
+    // An admin deletes the user through the kit's page, on an app that has
+    // this poller: the cascade removes the rows, and the page's wiring tells
+    // the poller to look again, so it forgets the service and its reading.
+    let magpie = mindful_magpie::Magpie {
+        poller: poller.clone(),
+        ..w.app.magpie.clone()
+    };
+    let router = mindful_magpie::router(magpie);
+    let ada = w.login("ada").await;
+    let mut req = Request::post(format!("/settings/users/{}/delete", w.alice))
+        .header(header::HOST, HOST)
+        .header(header::ORIGIN, format!("http://{HOST}"))
+        .header("hx-request", "true")
+        .header(header::COOKIE, ada.cookie_header())
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut().insert(ConnectInfo(
+        "127.0.0.1:40011".parse::<std::net::SocketAddr>().unwrap(),
+    ));
+    let res = router.oneshot(req).await.unwrap();
+    assert!(
+        res.status().is_redirection() || res.status() == StatusCode::OK,
+        "{}",
+        res.status()
+    );
+    assert_eq!(
+        w.app
+            .count(&*Box::leak(
+                format!("SELECT COUNT(*) FROM users WHERE id = {}", w.alice).into_boxed_str()
+            ))
+            .await,
+        0,
+        "the user is gone"
+    );
     let mut gone = false;
     for _ in 0..100 {
         if poller.snapshot(w.mine).is_none() {

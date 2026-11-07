@@ -252,6 +252,7 @@ number = "Bruk et helt tall."
 visibility = "Velg hvem som ser tjenesten."
 too_long = "Dette er for langt."
 http_expected = "Bruk en status som 200, et område som 200-399 eller en liste som 200, 301-308."
+personal_limit = "Du kan ha opptil 10 egne integrasjoner."
 github_owners = "Bruk navn på brukere eller organisasjoner (bokstaver, sifre og enkle bindestreker), atskilt med komma, høyst 5."
 
 [kind]
@@ -272,10 +273,10 @@ kk_secret = "Lesetoken"
 kk_secret_help = "Lag et token i Keen Kestrel under Innstillinger → API-tokener med tilgangen «Bare lesing», og lim det inn her. Sendes som Authorization: Bearer. Lagres kryptert."
 ww_secret = "Lesetoken"
 ww_secret_help = "Lag et token i Wise Wren under Innstillinger → API-tokener med tilgangen «Bare lesing», og lim det inn her. Sendes som Authorization: Bearer. Lagres kryptert."
-github_owners = "Brukere og organisasjoner (valgfritt)"
-github_owners_help = "Tell bare repoer som tilhører disse brukerne og organisasjonene, atskilt med komma. Tomt betyr kontoen tokenet tilhører."
+github_owners = "Kontoer og organisasjoner"
+github_owners_help = "Valgfritt. Tell bare repoer som tilhører disse kontoene og organisasjonene, atskilt med komma. Tomt betyr kontoen tokenet tilhører. For et token som tilhører en organisasjon, skriv organisasjonen her."
 github_secret = "Tilgangstoken"
-github_secret_help = "Lag et finkornet personlig tilgangstoken på github.com under Settings → Developer settings → Personal access tokens → Fine-grained tokens. Velg én eier (kontoen din eller én organisasjon), velg repoene, og gi det disse tilgangene, alle bare lesing: Metadata, Pull requests, Commit statuses, Actions, Dependabot alerts og Contents. En tilgang det mangler, utelater bare tallet sitt. Ett token dekker én eier eller organisasjon, så legg til én integrasjon for hver. Sendes som Authorization: Bearer. Lagres kryptert."
+github_secret_help = "Lag et finkornet personlig tilgangstoken på github.com under Settings → Developer settings → Personal access tokens → Fine-grained tokens. Velg én eier (kontoen din eller én organisasjon; for en organisasjon skriver du den også under «Kontoer og organisasjoner»), velg repoene, og gi det disse tilgangene, alle bare lesing: Metadata, Pull requests, Commit statuses, Actions, Dependabot alerts og Contents. En tilgang det mangler, utelater bare tallet sitt. Ett token dekker én eier eller organisasjon, så legg til én integrasjon for hver. Sendes som Authorization: Bearer. Lagres kryptert."
 
 [metric]
 http_status = "HTTP-status"

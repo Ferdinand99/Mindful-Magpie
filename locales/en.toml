@@ -252,6 +252,7 @@ number = "Use a whole number."
 visibility = "Choose who sees the service."
 too_long = "This is too long."
 http_expected = "Use a status like 200, a range like 200-399, or a list like 200, 301-308."
+personal_limit = "You can have up to 10 integrations of your own."
 github_owners = "Use user or organisation names (letters, digits and single hyphens), separated by commas, at most 5."
 
 [kind]
@@ -272,10 +273,10 @@ kk_secret = "Read token"
 kk_secret_help = "Create a token in Keen Kestrel under Settings → API tokens with the scope \"Read only\", and paste it here. Sent as Authorization: Bearer. Stored encrypted."
 ww_secret = "Read token"
 ww_secret_help = "Create a token in Wise Wren under Settings → API tokens with the scope \"Read only\", and paste it here. Sent as Authorization: Bearer. Stored encrypted."
-github_owners = "Users and organisations (optional)"
-github_owners_help = "Only count repositories of these users and organisations, separated by commas. Empty means the account the token belongs to."
+github_owners = "Accounts and organisations"
+github_owners_help = "Optional. Only count repositories of these accounts and organisations, separated by commas. Empty means the account the token belongs to. For a token whose owner is an organisation, enter the organisation here."
 github_secret = "Access token"
-github_secret_help = "Create a fine-grained personal access token at github.com under Settings → Developer settings → Personal access tokens → Fine-grained tokens. Pick one owner (your account or one organisation), choose the repositories, and give it these permissions, all read-only: Metadata, Pull requests, Commit statuses, Actions, Dependabot alerts and Contents. A permission it lacks only leaves its number out. One token covers one owner or organisation, so add one integration for each. Sent as Authorization: Bearer. Stored encrypted."
+github_secret_help = "Create a fine-grained personal access token at github.com under Settings → Developer settings → Personal access tokens → Fine-grained tokens. Pick one owner (your account or one organisation; for an organisation, also enter it under \"Accounts and organisations\"), choose the repositories, and give it these permissions, all read-only: Metadata, Pull requests, Commit statuses, Actions, Dependabot alerts and Contents. A permission it lacks only leaves its number out. One token covers one owner or organisation, so add one integration for each. Sent as Authorization: Bearer. Stored encrypted."
 
 [metric]
 http_status = "HTTP status"

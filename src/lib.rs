@@ -47,6 +47,10 @@ pub struct Magpie {
     pub core: Core,
     /// Budget of the extension's token endpoint, per client address.
     pub token_budget: Arc<TokenBuckets<IpAddr>>,
+    /// Budget of «Test» on a user's own integrations page, per user (key
+    /// `personal-test:<user id>`): a test sends a request with the user's key
+    /// to another service.
+    pub test_budget: Arc<TokenBuckets<String>>,
     /// The redirect hosts "Koble til Magpie" may send people back to: the
     /// official extension's and those of `MM_EXTENSION_IDS` (see
     /// [`connect::redirect_host`]).
@@ -137,6 +141,7 @@ pub async fn start_with(
     Ok(Magpie {
         core,
         token_budget: Arc::new(TokenBuckets::new()),
+        test_budget: Arc::new(TokenBuckets::new()),
         extension_hosts: Arc::new(connect::allowed_hosts(extension_ids)),
         backgrounds,
         service_events: tokio::sync::broadcast::channel(64).0,

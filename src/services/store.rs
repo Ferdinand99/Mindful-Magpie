@@ -15,8 +15,8 @@ use vole_kit::db::{self, DbError};
 use vole_kit::state::Core;
 
 use super::{
-    FieldError, SECRET_PURPOSE, Scope, SecretChange, Service, ServiceInput, ServiceSummary, Viewer,
-    Visibility, same_origin,
+    FieldError, MAX_PERSONAL, SECRET_PURPOSE, Scope, SecretChange, Service, ServiceInput,
+    ServiceSummary, Viewer, Visibility, same_origin,
 };
 use crate::integrations::{FetchCtx, FetchError, SERVICE_ID_KEY};
 
@@ -268,8 +268,9 @@ pub async fn create(core: &Core, input: &ServiceInput) -> Result<i64, StoreError
     create_in(core, Scope::Shared, input).await
 }
 
-/// Stores a new service of `scope`; its id. A personal service is for its
-/// user only: whatever visibility and users the input names, nobody else
+/// Stores a new service of `scope`; its id. A user may have at most
+/// [`MAX_PERSONAL`] personal services (a form error on the name). A personal
+/// service is for its user only: whatever visibility and users the input names, nobody else
 /// sees it.
 pub async fn create_in(core: &Core, scope: Scope, input: &ServiceInput) -> Result<i64, StoreError> {
     let mut errors = input.check();
@@ -288,8 +289,23 @@ pub async fn create_in(core: &Core, scope: Scope, input: &ServiceInput) -> Resul
         input.users.clear();
     }
     let owner = scope.owner();
-    Ok(db::interact(&core.db, move |c| {
-        let tx = c.transaction()?;
+    db::interact(&core.db, move |c| {
+        // Immediate: the count and the insert are one step, so two requests
+        // at once cannot both pass the cap.
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(user) = owner {
+            let have: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM services WHERE owner_user_id = ?1",
+                params![user],
+                |r| r.get(0),
+            )?;
+            if have >= MAX_PERSONAL {
+                return Ok(Err(StoreError::Invalid(vec![FieldError::new(
+                    "name",
+                    "err.personal_limit",
+                )])));
+            }
+        }
         tx.execute(
             "INSERT INTO services
                (kind, name, url, settings, secret, interval_s, visibility, owner_user_id,
@@ -310,9 +326,9 @@ pub async fn create_in(core: &Core, scope: Scope, input: &ServiceInput) -> Resul
         let id = tx.last_insert_rowid();
         write_users(&tx, id, input.visibility, &input.users)?;
         tx.commit()?;
-        Ok(id)
+        Ok(Ok(id))
     })
-    .await?)
+    .await?
 }
 
 /// Replaces a shared service's name, address, settings, interval and viewers;

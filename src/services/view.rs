@@ -37,8 +37,9 @@ pub struct ServiceView {
 /// The services `viewer` may see, by name, with their metrics. Labels come in
 /// the current request's language (English outside a request).
 ///
-/// Visibility is [`store::visible_to`]'s: admins see every service, anyone
-/// else the ones for everybody and the ones that name them.
+/// Visibility is [`store::visible_to`]'s: admins see every shared service,
+/// anyone else the ones for everybody and the ones that name them, and a
+/// personal service is only its user's.
 pub async fn services_for(
     core: &Core,
     viewer: impl Into<Viewer>,

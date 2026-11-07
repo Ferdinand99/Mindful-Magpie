@@ -31,6 +31,9 @@ use crate::integrations::{self, Integration};
 /// The purpose a service's secret is sealed for.
 pub const SECRET_PURPOSE: &str = "magpie.service.secret";
 
+/// The most personal services one user may have.
+pub const MAX_PERSONAL: i64 = 10;
+
 /// The longest interval an admin may choose (a day).
 pub const MAX_INTERVAL_S: i64 = 86_400;
 

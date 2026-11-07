@@ -22,6 +22,7 @@
 //! stored secret. A refused form is shown again with the secret field empty.
 
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 use askama::Template;
 use axum::Router;
@@ -35,6 +36,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value as Json};
 use vole_kit::auth::CurrentUser;
 use vole_kit::http::error::ApiError;
+use vole_kit::http::ratelimit::{Rate, too_many_requests};
 use vole_kit::http::{ApiResult, HtmlTemplate};
 use vole_kit::i18n::{self, Tr as _};
 use vole_kit::page::{PageCtx, flash};
@@ -49,6 +51,9 @@ use crate::Magpie;
 use crate::integrations::{
     self, FetchCtx, FetchError, FieldKind, Format, Integration, Snapshot, Status, Value,
 };
+
+/// «Test» presses one user may make on their own integrations page.
+pub const PERSONAL_TEST_RATE: Rate = Rate::per_minute(6);
 
 /// The most a service form is allowed to send.
 const MAX_FORM: usize = 64 * 1024;
@@ -1020,10 +1025,23 @@ fn describe(kind: &'static dyn Integration, outcome: Result<Snapshot, FetchError
 async fn test(
     State(core): State<Core>,
     Extension(area): Extension<Area>,
+    Extension(magpie): Extension<Magpie>,
     user: CurrentUser,
     body: Bytes,
 ) -> ApiResult<Response> {
     let mode = area.enter(&user)?;
+    // Any signed-in user may press «Test» on their own page: it sends a
+    // request with their key, so it has a budget per user.
+    if mode.personal()
+        && let Err(wait) = magpie.test_budget.take(
+            &format!("personal-test:{}", user.id),
+            PERSONAL_TEST_RATE,
+            Instant::now(),
+        )
+    {
+        tracing::warn!(user = %user.username, "personal «Test» over the budget");
+        return Ok(too_many_requests(wait));
+    }
     let raw = Raw::parse(&body);
     let Some(kind) = mode.kind(raw.get("kind")) else {
         return Ok(HtmlTemplate(unknown(i18n::t("err.kind").to_string())).into_response());

@@ -618,6 +618,12 @@ async fn the_owners_filter_goes_in_as_variables() {
     let seen = stub.mains().pop().unwrap();
     let text = query_of(&seen);
     assert!(text.contains("repositoryOwner(login: $o0)"), "{text}");
+    // Only repositories the account owns, as in the token account's own branch.
+    assert_eq!(
+        text.matches("ownerAffiliations: [OWNER]").count(),
+        2,
+        "{text}"
+    );
     assert!(!text.contains("viewer {"), "no own repositories: {text}");
     assert!(!text.contains("acme"), "names are variables only: {text}");
     assert_eq!(seen.body["variables"]["o0"], "acme");
@@ -760,6 +766,76 @@ async fn retry_after_and_the_graphql_rate_limit_error_also_make_it_wait() {
     let sent = stub.seen().len();
     assert_eq!(fetch_err(&base, id).await, FetchError::RateLimited);
     assert_eq!(stub.seen().len(), sent);
+}
+
+#[tokio::test]
+async fn a_secondary_limit_in_the_body_waits_a_minute_and_is_not_a_refused_key() {
+    for status in [403, 429] {
+        let (base, stub) = serve().await;
+        stub.script(vec![Reply::bare(
+            status,
+            "{\"message\": \"You have exceeded a secondary rate limit. Please wait.\"}",
+        )]);
+        let id = next_id();
+        assert_eq!(
+            fetch_err(&base, id).await,
+            FetchError::RateLimited,
+            "{status}"
+        );
+        let sent = stub.seen().len();
+        assert_eq!(
+            fetch_err(&base, id).await,
+            FetchError::RateLimited,
+            "{status}"
+        );
+        assert_eq!(stub.seen().len(), sent, "{status}: it waits");
+    }
+    // The same words on the REST side make the service wait too.
+    let (base, stub) = serve().await;
+    let mut plain = repo("me/a");
+    plain.rollup = None;
+    stub.script(vec![Reply::ok(&answer(&[plain], Some(1), Some(0)))]);
+    stub.rest(
+        "/repos/me/a/actions/runs",
+        Reply::bare(403, "You have exceeded a secondary rate limit"),
+    );
+    let id = next_id();
+    let snapshot = fetch(&base, id).await;
+    assert_eq!(num(&snapshot, "ci_red"), None);
+    assert_eq!(fetch_err(&base, id).await, FetchError::RateLimited);
+}
+
+#[tokio::test]
+async fn a_part_that_failed_for_another_reason_is_left_out_of_this_fetch_only() {
+    let (base, stub) = serve().await;
+    let mut no_alerts = repo("me/a");
+    no_alerts.alerts = None;
+    let mut first = answer(&[no_alerts.clone()], Some(1), Some(0));
+    first["errors"] = json!([{
+        "type": "SERVICE_UNAVAILABLE",
+        "path": ["viewer", "repositories", "nodes", 0, "vulnerabilityAlerts"],
+    }]);
+    // The first answer fails the alerts, the one after has them again.
+    let mut with_alerts = repo("me/a");
+    with_alerts.alerts = Some(2);
+    stub.script(vec![
+        Reply::ok(&first),
+        Reply::ok(&answer(&[no_alerts], Some(1), Some(0))),
+        Reply::ok(&answer(&[with_alerts], Some(1), Some(0))),
+    ]);
+    let id = next_id();
+    let snapshot = fetch(&base, id).await;
+    assert_eq!(snapshot.error, None);
+    assert_eq!(num(&snapshot, "dependabot"), None);
+    let mains = stub.mains();
+    assert_eq!(mains.len(), 2);
+    assert!(!query_of(&mains[1]).contains("vulnerabilityAlerts"));
+    // Not remembered: the next fetch asks for them again.
+    let snapshot = fetch(&base, id).await;
+    let mains = stub.mains();
+    assert_eq!(mains.len(), 3);
+    assert!(query_of(&mains[2]).contains("vulnerabilityAlerts"));
+    assert_eq!(num(&snapshot, "dependabot"), Some(2.0));
 }
 
 #[tokio::test]
