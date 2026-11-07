@@ -18,9 +18,7 @@ const SECRET: &str = "redirect-S3cret-4f2a9c";
 /// A target that answers `{"ok": true}` at `/target`, a server that
 /// redirects every request to it (in each of the three ways), and the
 /// address of that server.
-async fn redirecting(
-    redirect: fn(&str) -> axum::response::Redirect,
-) -> (String, Stub) {
+async fn redirecting(redirect: fn(&str) -> axum::response::Redirect) -> (String, Stub) {
     let (target, stub) = stub::serve_one("/target", Answer::Json(json!({ "ok": true }))).await;
     let origin = stub::redirector(redirect, format!("{target}/target")).await;
     (origin, stub)
@@ -163,10 +161,7 @@ async fn the_http_kind_without_a_secret_still_follows_a_redirect() {
         let (origin, target) = redirecting(redirect).await;
         for secret in [None, Some("")] {
             target.forget_seen();
-            let snapshot = http_kind()
-                .fetch(&http_ctx(&origin, secret))
-                .await
-                .unwrap();
+            let snapshot = http_kind().fetch(&http_ctx(&origin, secret)).await.unwrap();
             assert_eq!(snapshot.status, Status::Ok, "{:?}", snapshot.error);
             let seen = target.seen();
             assert_eq!(seen.len(), 1);

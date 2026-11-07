@@ -625,7 +625,10 @@ async fn the_token_is_in_no_error_snapshot_debug_output_or_log() {
 
     let logged = String::from_utf8_lossy(&buffer.0.lock().unwrap()).into_owned();
     // The capture does see what the HTTP library logs.
-    assert!((logged.contains("reqwest::") || logged.contains("hyper_util::client")), "nothing was captured");
+    assert!(
+        (logged.contains("reqwest::") || logged.contains("hyper_util::client")),
+        "nothing was captured"
+    );
     for (what, text) in [("results", &seen), ("log", &logged)] {
         assert!(!text.contains(TOKEN), "token in {what}");
         assert!(!text.contains("token-x"), "bad token in {what}");
