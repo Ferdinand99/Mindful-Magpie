@@ -1241,3 +1241,52 @@ async fn a_renamed_service_that_no_card_uses_is_sent_again_with_its_new_name() {
     assert!(update.get("services_visible").is_none(), "{update}");
     live.nothing().await;
 }
+
+#[tokio::test]
+async fn the_labels_of_the_app_kinds_get_their_count() {
+    let w = world().await;
+    let mut bob = w.viewer("bob").await;
+    let counted = |key: &str, level: Level, label_key: &str, count: &str| {
+        let mut n = need(key, level, 2.0, "Blog");
+        n.label_key = label_key.into();
+        n.params.insert("count".into(), count.into());
+        n
+    };
+    w.set(
+        w.blog,
+        vec![
+            counted("vv:down", Level::Bad, "need.vv_down", "2"),
+            counted("kk:regressed", Level::Bad, "need.kk_regressed", "1"),
+            counted("ww:offline", Level::Warn, "need.ww_offline", "3"),
+        ],
+    );
+    let labels = |doc: &Value| -> Vec<String> {
+        doc["needs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["label"].as_str().unwrap().to_string())
+            .collect()
+    };
+    // Red before yellow, then by key; the service's name is not in the text.
+    let en = embed_in(&mut bob, "en").await;
+    assert_eq!(
+        labels(&en),
+        ["Regressed issues: 1", "Down: 2", "Agents offline: 3"]
+    );
+    let nb = embed_in(&mut bob, "nb").await;
+    assert_eq!(
+        labels(&nb),
+        ["Feil som er tilbake: 1", "Nede: 2", "Agenter frakoblet: 3"]
+    );
+
+    // Only a plain number is filled in: nothing else reaches the page.
+    w.set(
+        w.blog,
+        vec![counted("vv:down", Level::Bad, "need.vv_down", "<b>2</b>")],
+    );
+    let list = needs_of(&mut bob).await;
+    let text = list[0].to_string();
+    assert!(!text.contains("<b>"), "{text}");
+    assert_eq!(list[0]["label"], "Down:");
+}

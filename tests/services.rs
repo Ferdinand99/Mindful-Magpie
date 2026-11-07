@@ -852,7 +852,7 @@ async fn the_http_kind_describes_itself() {
     let ids: Vec<_> = kind.metrics().iter().map(|m| m.id).collect();
     assert_eq!(ids, ["status", "latency_ms", "checked"]);
     assert!(kind.fields().iter().any(|f| f.secret));
-    assert_eq!(integrations::registry().len(), 1);
+    assert!(integrations::registry().iter().any(|k| k.kind() == "http"));
     assert!(integrations::find("nope").is_none());
 }
 
@@ -1299,7 +1299,7 @@ async fn a_refused_secret_is_said_before_the_unreadable_note() {
 async fn the_interval_input_has_the_kinds_floor_as_its_minimum() {
     let app = App::new().await;
     let mut admin = Web::new(&app, "root", "admin").await;
-    let res = admin.get("/settings/services/new").await;
+    let res = admin.get("/settings/services/new?kind=http").await;
     assert!(res.body.contains("name=\"interval\""));
     assert!(res.body.contains("min=\"15\""), "{}", res.body);
 }

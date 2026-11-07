@@ -456,3 +456,10 @@ test("focus_outside_the_row_is_never_touched_by_an_update", () => {
   }
   assert.deepEqual(t.calls, []);
 });
+
+test("a_label_with_a_count_reads_service_text_age_in_both_languages", () => {
+  const nb = draw([need({ label: "Nede: 2", since: NOW - 60 })], { lang: NB });
+  assert.equal(chips(nb.root)[0].querySelector(".mm-need-chip").textContent, "Blog · Nede: 2 · for 1 min siden");
+  const en = draw([need({ label: "Down: 1", since: NOW - 60 })]);
+  assert.equal(chips(en.root)[0].querySelector(".mm-need-chip").textContent, "Blog · Down: 1 · 1 min. ago");
+});
