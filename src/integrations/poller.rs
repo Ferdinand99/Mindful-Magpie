@@ -585,7 +585,7 @@ impl Job {
             };
             if bad_in_a_row >= DOWN_AFTER
                 && snapshot.status == Status::Bad
-                && let Some(need) = bad_need(&self.service, &snapshot)
+                && let Some(need) = bad_need(&self.service, &snapshot, failed)
             {
                 snapshot.needs.push(need);
             }
@@ -755,15 +755,20 @@ fn failure(snapshot: &Snapshot) -> Option<FetchError> {
 
 /// The need of a service that has had bad readings in a row, for this
 /// reading: «set it up again» for a failure only an admin can fix, «down» for
-/// a fetch that did not get an answer, and none for anything else (a kind's
-/// own bad reading, a 4xx answer, a rate limit). `http` is the one kind whose
-/// every bad reading says the site is down, a wrong status included.
-fn bad_need(service: &Service, snapshot: &Snapshot) -> Option<Need> {
+/// a fetch that did not get an answer (`failed`: no reading was made, or the
+/// deadline passed, or the kind panicked), and none for anything else (a
+/// kind's own bad reading, even one that carries the error of a call that
+/// failed, a 4xx answer, a rate limit): the server answered, so it is not
+/// «down». `http` is the one kind whose every bad reading says the site is
+/// down, a wrong status included.
+fn bad_need(service: &Service, snapshot: &Snapshot, failed: bool) -> Option<Need> {
     let reason = failure(snapshot);
+    let http = service.kind == "http";
     let (key, label_key) = if reason.as_ref().is_some_and(FetchError::is_config) {
         (CONFIG_KEY, CONFIG_LABEL)
-    } else if (service.kind == "http" && snapshot.error.is_some())
-        || reason.as_ref().is_some_and(FetchError::is_unreachable)
+    } else if (failed || http)
+        && ((http && snapshot.error.is_some())
+            || reason.as_ref().is_some_and(FetchError::is_unreachable))
     {
         (DOWN_KEY, down_label(&service.kind))
     } else {

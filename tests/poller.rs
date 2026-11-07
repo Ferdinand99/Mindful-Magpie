@@ -91,6 +91,15 @@ enum Mode {
     Http500,
     /// `Ok` with a bad reading that says `HTTP 404`.
     Http404,
+    /// `Err(Status(500))`: the fetch failed with a server error.
+    Err500,
+    /// `Ok` with a bad reading of the kind's own (it has a need of its own)
+    /// that also carries `Invalid`, the error of a call that failed.
+    OwnBadInvalid,
+    /// The same, carrying `Timeout`.
+    OwnBadTimeout,
+    /// `Ok` with a warning that carries `Timeout`, and a need of its own.
+    OwnWarnTimeout,
     /// `Ok` with a bad reading: the address is not allowed.
     BadForbidden,
     /// `Ok` with a bad reading: a redirect to another scheme.
@@ -184,6 +193,26 @@ fn gate(tag: &str) -> Arc<Notify> {
 static NO_FIELDS: [Field; 0] = [];
 static NO_METRICS: [MetricDef; 0] = [];
 
+/// A reading a kind makes of a server that answered: a state of its own with a
+/// need of its own, and the error of one call that failed on the way.
+fn own_reading(status: Status, error: FetchError) -> Snapshot {
+    let mut snapshot = Snapshot::new(status);
+    snapshot.error = Some(error.to_string());
+    snapshot.needs.push(Need {
+        key: "own:thing".into(),
+        level: if status == Status::Bad {
+            Level::Bad
+        } else {
+            Level::Warn
+        },
+        label_key: "need.other".into(),
+        params: Default::default(),
+        score: 2.0,
+        since: None,
+    });
+    snapshot
+}
+
 fn ok_snapshot(n: usize, marker: String) -> Snapshot {
     let mut snapshot = Snapshot::new(Status::Ok);
     snapshot.values.insert("n".into(), Value::num(n as f64));
@@ -246,6 +275,10 @@ impl Integration for Stub {
                 Mode::BadRedirectScheme => Ok(Snapshot::failed(&FetchError::RedirectScheme)),
                 Mode::Http500 => Ok(Snapshot::failed(&FetchError::Status(500))),
                 Mode::Http404 => Ok(Snapshot::failed(&FetchError::Status(404))),
+                Mode::Err500 => Err(FetchError::Status(500)),
+                Mode::OwnBadInvalid => Ok(own_reading(Status::Bad, FetchError::Invalid)),
+                Mode::OwnBadTimeout => Ok(own_reading(Status::Bad, FetchError::Timeout)),
+                Mode::OwnWarnTimeout => Ok(own_reading(Status::Warn, FetchError::Timeout)),
                 Mode::Ok => Ok(ok_snapshot(n, marker)),
             }
         })
@@ -1055,11 +1088,7 @@ async fn a_kind_other_than_http_gets_the_generic_down_need() {
     tokio::time::pause();
     // A fetch that fails the way a service that does not answer does: twice in
     // a row is the need, for every kind, with the generic text.
-    for (tag, mode) in [
-        ("t_gd_bad", Mode::Bad),
-        ("t_gd_conn", Mode::ErrConnect),
-        ("t_gd_500", Mode::Http500),
-    ] {
+    for (tag, mode) in [("t_gd_conn", Mode::ErrConnect), ("t_gd_500", Mode::Err500)] {
         set_mode(tag, mode);
         let id = add_stub(&app, tag, tag, "", 10).await;
         let poller = start_with(&app, stub_kinds, 0).await;
@@ -1100,6 +1129,45 @@ async fn a_failure_only_an_admin_can_fix_never_gives_the_down_need() {
         assert_eq!(s.needs[0].label_key, "need.service_config", "{tag}");
         drop(poller);
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_kinds_own_bad_reading_with_an_error_in_it_is_not_down() {
+    // The server answered: the reading is the kind's own state, with its own
+    // need, and the error of a call that failed on the way is not «down».
+    let app = App::new().await;
+    tokio::time::pause();
+    for (tag, mode) in [
+        ("t_own_invalid", Mode::OwnBadInvalid),
+        ("t_own_timeout", Mode::OwnBadTimeout),
+        ("t_own_warn", Mode::OwnWarnTimeout),
+    ] {
+        set_mode(tag, mode);
+        let id = add_stub(&app, tag, tag, "", 10).await;
+        let poller = start_with(&app, stub_kinds, 0).await;
+        wait_calls(tag, 3).await;
+        let s = wait_snapshot(&poller, id, |s| !s.needs.is_empty()).await;
+        let keys: Vec<_> = s.needs.iter().map(|n| n.key.as_str()).collect();
+        assert_eq!(keys, ["own:thing"], "{tag}: only its own need shows");
+        drop(poller);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_real_failed_fetch_still_gives_down_after_the_same_number_of_readings() {
+    // The same error as above (`Invalid`, `Timeout`), but now the fetch failed
+    // (no reading was made): that is «down».
+    let app = App::new().await;
+    tokio::time::pause();
+    set_mode("t_real_fail", Mode::ErrConnect);
+    let id = add_stub(&app, "Real", "t_real_fail", "", 10).await;
+    let poller = start_with(&app, stub_kinds, 0).await;
+    wait_calls("t_real_fail", 1).await;
+    let first = wait_snapshot(&poller, id, |_| true).await;
+    assert!(first.needs.is_empty());
+    wait_calls("t_real_fail", 2).await;
+    let second = wait_snapshot(&poller, id, |s| !s.needs.is_empty()).await;
+    assert_eq!(second.needs[0].key, DOWN_KEY);
 }
 
 #[tokio::test(flavor = "current_thread")]

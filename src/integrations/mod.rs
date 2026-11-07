@@ -419,19 +419,29 @@ impl FetchError {
     /// the wrong role or sees nothing, a certificate that was not accepted, a
     /// Keen Kestrel that has to be upgraded. The poller makes the «set it up
     /// again» need of these, never «not answering».
+    ///
+    /// No catch-all arm: a new error has to be placed here and in
+    /// [`FetchError::is_unreachable`] before this compiles.
     pub fn is_config(&self) -> bool {
-        matches!(
-            self,
+        match self {
             FetchError::Config
-                | FetchError::Forbidden
-                | FetchError::RedirectScheme
-                | FetchError::SecretUnreadable
-                | FetchError::Auth
-                | FetchError::KkTooOld
-                | FetchError::NotAdmin
-                | FetchError::NothingVisible
-                | FetchError::Cert
-        )
+            | FetchError::Forbidden
+            | FetchError::RedirectScheme
+            | FetchError::SecretUnreadable
+            | FetchError::Auth
+            | FetchError::KkTooOld
+            | FetchError::NotAdmin
+            | FetchError::NothingVisible
+            | FetchError::Cert => true,
+            FetchError::Timeout
+            | FetchError::Connect
+            | FetchError::Redirects
+            | FetchError::TooLarge
+            | FetchError::Invalid
+            | FetchError::RateLimited
+            | FetchError::Other
+            | FetchError::Status(_) => false,
+        }
     }
 
     /// Whether it says the service did not answer properly (it may come back
@@ -439,6 +449,8 @@ impl FetchError {
     /// is not what was expected. The poller makes the «not answering» need of
     /// these once they repeat. A 4xx status, a rate limit and every
     /// [`FetchError::is_config`] error are not.
+    ///
+    /// No catch-all arm either: a new error has to be classified.
     pub fn is_unreachable(&self) -> bool {
         match self {
             FetchError::Connect
@@ -448,7 +460,16 @@ impl FetchError {
             | FetchError::Redirects
             | FetchError::TooLarge => true,
             FetchError::Status(code) => (500..600).contains(code),
-            _ => false,
+            FetchError::Config
+            | FetchError::Forbidden
+            | FetchError::RedirectScheme
+            | FetchError::SecretUnreadable
+            | FetchError::Auth
+            | FetchError::KkTooOld
+            | FetchError::NotAdmin
+            | FetchError::NothingVisible
+            | FetchError::Cert
+            | FetchError::RateLimited => false,
         }
     }
 
