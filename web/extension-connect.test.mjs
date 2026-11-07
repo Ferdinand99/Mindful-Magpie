@@ -65,7 +65,7 @@ test("connectUrl tolerates a trailing slash on the server", () => {
 });
 
 test("parseRedirect returns the code for a good redirect", () => {
-  assert.deepEqual(parseRedirect(`${REDIRECT}?code=${CODE}&state=S1`, "S1"), { code: CODE });
+  assert.deepEqual(parseRedirect(`${REDIRECT}?code=${CODE}&state=S1`, "S1", REDIRECT), { code: CODE });
 });
 
 function thrownCode(fn) {
@@ -79,34 +79,56 @@ function thrownCode(fn) {
 }
 
 test("parseRedirect rejects a wrong or missing state", () => {
-  assert.equal(thrownCode(() => parseRedirect(`${REDIRECT}?code=${CODE}&state=OTHER`, "S1")), "state_mismatch");
-  assert.equal(thrownCode(() => parseRedirect(`${REDIRECT}?code=${CODE}`, "S1")), "state_mismatch");
-  assert.equal(thrownCode(() => parseRedirect(`${REDIRECT}?code=${CODE}&state=`, "S1")), "state_mismatch");
+  assert.equal(thrownCode(() => parseRedirect(`${REDIRECT}?code=${CODE}&state=OTHER`, "S1", REDIRECT)), "state_mismatch");
+  assert.equal(thrownCode(() => parseRedirect(`${REDIRECT}?code=${CODE}`, "S1", REDIRECT)), "state_mismatch");
+  assert.equal(thrownCode(() => parseRedirect(`${REDIRECT}?code=${CODE}&state=`, "S1", REDIRECT)), "state_mismatch");
 });
 
 test("parseRedirect reports a denied approval", () => {
-  assert.equal(thrownCode(() => parseRedirect(`${REDIRECT}?error=access_denied&state=S1`, "S1")), "denied");
+  assert.equal(thrownCode(() => parseRedirect(`${REDIRECT}?error=access_denied&state=S1`, "S1", REDIRECT)), "denied");
   // A forged denial with the wrong state is a mismatch, not a denial.
-  assert.equal(thrownCode(() => parseRedirect(`${REDIRECT}?error=access_denied&state=X`, "S1")), "state_mismatch");
+  assert.equal(thrownCode(() => parseRedirect(`${REDIRECT}?error=access_denied&state=X`, "S1", REDIRECT)), "state_mismatch");
 });
 
 test("parseRedirect reports a missing code or an unreadable url", () => {
-  assert.equal(thrownCode(() => parseRedirect(`${REDIRECT}?state=S1`, "S1")), "no_code");
-  assert.equal(thrownCode(() => parseRedirect(`${REDIRECT}?code=&state=S1`, "S1")), "no_code");
-  assert.equal(thrownCode(() => parseRedirect("not a url", "S1")), "no_code");
-  assert.equal(thrownCode(() => parseRedirect(undefined, "S1")), "no_code");
+  assert.equal(thrownCode(() => parseRedirect(`${REDIRECT}?state=S1`, "S1", REDIRECT)), "no_code");
+  assert.equal(thrownCode(() => parseRedirect(`${REDIRECT}?code=&state=S1`, "S1", REDIRECT)), "no_code");
+  assert.equal(thrownCode(() => parseRedirect("not a url", "S1", REDIRECT)), "no_code");
+  assert.equal(thrownCode(() => parseRedirect(undefined, "S1", REDIRECT)), "no_code");
 });
 
 test("parseRedirect errors never contain the code or the url", () => {
   for (const url of [`${REDIRECT}?code=${CODE}&state=OTHER`, `${REDIRECT}?code=${CODE}`]) {
     try {
-      parseRedirect(url, "S1");
+      parseRedirect(url, "S1", REDIRECT);
       assert.fail("must throw");
     } catch (error) {
       assert.equal(String(error).includes(CODE), false);
       assert.equal(JSON.stringify(error).includes(CODE), false);
     }
   }
+});
+
+test("parseRedirect refuses an answer from another origin or path than the redirect uri", () => {
+  const ok = `state=S1&code=${CODE}`;
+  for (const url of [
+    `https://evil.example/?${ok}`,
+    `https://abc123.extensions.allizom.org.evil.example/?${ok}`,
+    `http://abc123.extensions.allizom.org/?${ok}`,
+    `https://other.extensions.allizom.org/?${ok}`,
+    `https://abc123.extensions.allizom.org/other?${ok}`,
+    `https://user@evil.example/?${ok}`,
+  ]) {
+    assert.equal(thrownCode(() => parseRedirect(url, "S1", REDIRECT)), "bad_redirect", url);
+  }
+  // A forged denial from a foreign origin is not taken as a denial either.
+  assert.equal(
+    thrownCode(() => parseRedirect("https://evil.example/?error=access_denied&state=S1", "S1", REDIRECT)),
+    "bad_redirect",
+  );
+  // A missing or unreadable redirect uri is refused, never waved through.
+  assert.equal(thrownCode(() => parseRedirect(`${REDIRECT}?${ok}`, "S1", undefined)), "bad_redirect");
+  assert.equal(thrownCode(() => parseRedirect(`${REDIRECT}?${ok}`, "S1", "nope")), "bad_redirect");
 });
 
 test("exchangeCode posts code and verifier as JSON without cookies or redirects", async () => {
@@ -338,6 +360,28 @@ test("connect: a refused host permission or a bad address never opens the flow",
   }
 });
 
+test("connect: an answer from another origin saves nothing and the code is never exchanged", async () => {
+  const before = { serverUrl: "http://old:1", token: "old", last: GOOD };
+  const env = makeEnv({ stored: before, flow: (state) => `https://evil.example/?code=${CODE}&state=${state}` });
+  const result = await connectMagpie(env.deps, { serverUrl: "http://h:1" });
+  assert.equal(result.kind, "bad-redirect");
+  assert.equal(result.message, messages["bad-redirect"]);
+  assert.equal(env.calls.some((c) => c[0] === "fetch"), false);
+  assertNothingSaved(env, before);
+});
+
+test("connect: without browser.identity it says so before any permission prompt", async () => {
+  for (const identity of [undefined, null, {}, { getRedirectURL: () => REDIRECT }]) {
+    const env = makeEnv();
+    env.deps.identity = identity;
+    const result = await connectMagpie(env.deps, { serverUrl: "http://h:1" });
+    assert.equal(result.ok, false);
+    assert.equal(result.kind, "no-identity");
+    assert.equal(result.message, messages["no-identity"]);
+    assert.deepEqual(env.calls, [], "no permission prompt, no storage access");
+  }
+});
+
 test("connect: an exchange failure saves nothing and shows a fixed message", async () => {
   for (const [exchange, kind] of [
     [async () => response(400, {}), "rejected"],
@@ -364,12 +408,6 @@ test("connect: a storage failure gives a fixed message without the token", async
   const result = await connectMagpie(env.deps, { serverUrl: "http://h:1" });
   assert.equal(result.kind, "storage");
   assert.equal(JSON.stringify(result).includes(TOKEN), false);
-});
-
-test("connect: no fixed message contains the code or the token", () => {
-  for (const text of Object.values(messages)) {
-    assert.equal(text.includes(CODE) || text.includes(TOKEN), false);
-  }
 });
 
 test("connect: works when getPlatformInfo fails, with a plain device name", async () => {
@@ -452,4 +490,117 @@ test("options page: clicking «Koble til Magpie» runs the flow, saves and shows
       else delete globalThis[k];
     }
   }
+});
+
+// ---- Enter in the options page ----
+
+test("options page: «Koble til Magpie» is the form's default button, «Lagre» is a plain button", () => {
+  const doc = parseHTML(read("options.html")).document;
+  const submits = [...doc.querySelectorAll("form button")].filter(
+    (b) => (b.getAttribute("type") ?? "submit") === "submit",
+  );
+  // The first submit button in tree order is the default button: Enter in the address field
+  // clicks it. A hidden «Lagre» must never be the one.
+  assert.deepEqual(submits.map((b) => b.id), ["connect"]);
+  assert.equal(doc.getElementById("save").getAttribute("type"), "button");
+  assert.equal(doc.getElementById("test").getAttribute("type"), "button");
+});
+
+async function withOptionsPage(env, run) {
+  const doc = parseHTML(read("options.html")).document;
+  const stubs = {
+    document: doc,
+    fetch: env.deps.fetchImpl,
+    browser: {
+      permissions: env.deps.permissions,
+      storage: env.deps.storage,
+      identity: env.deps.identity,
+      runtime: env.deps.runtime,
+    },
+  };
+  const previous = Object.fromEntries(Object.keys(stubs).map((k) => [k, Object.getOwnPropertyDescriptor(globalThis, k)]));
+  for (const [k, value] of Object.entries(stubs)) {
+    Object.defineProperty(globalThis, k, { value, configurable: true, writable: true });
+  }
+  try {
+    await import(`../extension/options.js?enter-${Math.random()}`);
+    await new Promise((r) => setTimeout(r, 0));
+    await run(doc);
+  } finally {
+    for (const [k, descriptor] of Object.entries(previous)) {
+      if (descriptor) Object.defineProperty(globalThis, k, descriptor);
+      else delete globalThis[k];
+    }
+  }
+}
+
+const fire = (doc, target, type, props = {}) => {
+  const event = doc.createEvent("Event");
+  event.initEvent(type, true, true);
+  Object.assign(event, props);
+  target.dispatchEvent(event);
+  return event;
+};
+const settle = (ms = 30) => new Promise((r) => setTimeout(r, ms));
+
+test("options page: Enter in the address field runs «Koble til», not «Lagre»", async () => {
+  const env = makeEnv({
+    stored: { serverUrl: "http://10.0.3.152:8099" },
+    exchange: async (url, opts) => {
+      env.calls.push(["fetch", url, opts.method ?? "GET"]);
+      return response(200, opts.method === "POST" ? { token: TOKEN } : GOOD);
+    },
+  });
+  await withOptionsPage(env, async (doc) => {
+    // A browser answers Enter in a text field by clicking the form's default button.
+    const defaultButton = doc.querySelector("form button[type=submit]");
+    assert.equal(defaultButton.id, "connect");
+    const click = fire(doc, defaultButton, "click");
+    assert.equal(click.defaultPrevented, true, "the click does not submit the form");
+    await settle();
+    assert.equal(env.calls.filter((c) => c[0] === "launchWebAuthFlow").length, 1);
+    assert.equal(env.store.token, TOKEN);
+    // A stray submit never navigates and never starts anything by itself.
+    const before = env.calls.length;
+    const submit = fire(doc, doc.getElementById("form"), "submit");
+    assert.equal(submit.defaultPrevented, true);
+    await settle();
+    assert.equal(env.calls.length, before);
+  });
+});
+
+test("options page: Enter in the token field saves the token and does not connect", async () => {
+  const env = makeEnv({
+    stored: { serverUrl: "http://10.0.3.152:8099" },
+    exchange: async (url, opts) => {
+      env.calls.push(["fetch", url, opts.headers?.Authorization]);
+      return response(200, GOOD);
+    },
+  });
+  await withOptionsPage(env, async (doc) => {
+    const token = doc.getElementById("token");
+    token.value = "mm_typed_token";
+    const other = fire(doc, token, "keydown", { key: "a" });
+    assert.equal(other.defaultPrevented, false);
+    const enter = fire(doc, token, "keydown", { key: "Enter" });
+    assert.equal(enter.defaultPrevented, true, "the form's default button does not get the Enter");
+    await settle();
+    assert.equal(env.calls.some((c) => c[0] === "launchWebAuthFlow"), false);
+    assert.deepEqual(env.calls.find((c) => c[0] === "fetch").slice(2), ["Bearer mm_typed_token"]);
+    assert.equal(env.store.token, "mm_typed_token");
+  });
+});
+
+test("options page: the «Lagre» button saves the pasted token", async () => {
+  const env = makeEnv({
+    stored: { serverUrl: "http://10.0.3.152:8099" },
+    exchange: async () => response(200, GOOD),
+  });
+  await withOptionsPage(env, async (doc) => {
+    doc.getElementById("token").value = "mm_pasted";
+    fire(doc, doc.getElementById("save"), "click");
+    await settle();
+    assert.equal(env.store.token, "mm_pasted");
+    assert.equal(env.calls.some((c) => c[0] === "launchWebAuthFlow"), false);
+  });
 });

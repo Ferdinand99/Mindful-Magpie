@@ -52,14 +52,26 @@ export class ConnectError extends Error {
 }
 
 // Returns { code } for a good redirect, or throws a ConnectError with one of the fixed codes
-// "state_mismatch", "denied" or "no_code".
-export function parseRedirect(url, expectedState) {
-  let params;
+// "bad_redirect", "state_mismatch", "denied" or "no_code". redirectUri is the address that was
+// given to the server (identity.getRedirectURL()): the answer must come from that origin and path,
+// or it is refused before the state or the code is looked at.
+export function parseRedirect(url, expectedState, redirectUri) {
+  let parsed;
   try {
-    params = new URL(url).searchParams;
+    parsed = new URL(url);
   } catch {
     throw new ConnectError("no_code");
   }
+  let expected;
+  try {
+    expected = new URL(redirectUri);
+  } catch {
+    throw new ConnectError("bad_redirect");
+  }
+  if (parsed.origin !== expected.origin || parsed.pathname !== expected.pathname) {
+    throw new ConnectError("bad_redirect");
+  }
+  const params = parsed.searchParams;
   const state = params.get("state");
   if (state !== null && state !== expectedState) throw new ConnectError("state_mismatch");
   if (params.get("error") === "access_denied") throw new ConnectError("denied");

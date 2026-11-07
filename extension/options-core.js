@@ -31,6 +31,8 @@ export const messages = {
   declined: "Du avslo tilgangen i Magpie.",
   "state-mismatch": "Svaret fra Magpie hørte ikke til denne tilkoblingen. Prøv igjen.",
   "no-code": "Magpie ga ikke noen tilgangskode. Prøv igjen.",
+  "bad-redirect": "Svaret kom fra en uventet adresse. Prøv igjen.",
+  "no-identity": "Denne nettleseren kan ikke koble til automatisk. Bruk Avansert og lim inn et token.",
   rejected: "Magpie avviste tilgangskoden. Den kan ha utløpt. Prøv igjen.",
   server: "Magpie svarte med en feil. Prøv igjen senere.",
   storage: "Kunne ikke lagre innstillingene.",
@@ -105,13 +107,23 @@ export async function saveConnection(deps, input) {
 // it with the saved address). The code, verifier and token never leave this function except as
 // the request body and the stored token.
 export function connectMagpie(deps, { serverUrl }) {
+  // Firefox for Android has no identity API. Say so before the permission prompt, not after it.
+  const identity = deps.identity;
+  if (typeof identity?.launchWebAuthFlow !== "function" || typeof identity?.getRedirectURL !== "function") {
+    return Promise.resolve(fail("no-identity"));
+  }
   const parsed = parseServerUrl(serverUrl);
   if (!parsed.ok) return Promise.resolve(fail("invalid-url"));
   const request = deps.permissions.request({ origins: [parsed.pattern] });
   return finishConnect(request, deps, parsed);
 }
 
-const redirectKinds = { state_mismatch: "state-mismatch", denied: "declined", no_code: "no-code" };
+const redirectKinds = {
+  state_mismatch: "state-mismatch",
+  denied: "declined",
+  no_code: "no-code",
+  bad_redirect: "bad-redirect",
+};
 
 async function finishConnect(request, { storage, fetchImpl, identity, runtime }, parsed) {
   let granted = false;
@@ -130,9 +142,10 @@ async function finishConnect(request, { storage, fetchImpl, identity, runtime },
   }
   const verifier = makeVerifier();
   const state = makeState();
+  const redirectUri = identity.getRedirectURL();
   const url = connectUrl(
     parsed.serverUrl,
-    identity.getRedirectURL(),
+    redirectUri,
     state,
     await challengeS256(verifier),
     deviceName(platformInfo),
@@ -146,7 +159,7 @@ async function finishConnect(request, { storage, fetchImpl, identity, runtime },
   }
   let code;
   try {
-    ({ code } = parseRedirect(redirected, state));
+    ({ code } = parseRedirect(redirected, state, redirectUri));
   } catch (error) {
     return fail(error instanceof ConnectError ? redirectKinds[error.code] : "no-code");
   }
