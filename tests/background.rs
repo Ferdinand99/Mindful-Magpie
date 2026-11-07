@@ -1,7 +1,9 @@
 //! Background images: `POST /start/background` (magic bytes, size limit, CSRF,
 //! replacement), `GET /start/background/{id}` (own image only, by cookie or
-//! API token), `DELETE /start/background`, the layout's check of the image id
-//! and the removal of the file with its user.
+//! API token), `DELETE /start/background?id=` (scoped: it never touches the
+//! layout), the layout's check of the image id, the layout shown without a
+//! picture that is not the user's any more, and the removal of the file with
+//! its user.
 
 mod common;
 
@@ -173,8 +175,26 @@ async fn save_layout(web: &mut Web<'_>, layout: &Value) -> Res {
     web.send(req).await
 }
 
-async fn delete_background(web: &mut Web<'_>) -> Res {
-    web.delete("/start/background").await
+async fn delete_background(web: &mut Web<'_>, id: &str) -> Res {
+    web.delete(&format!("/start/background?id={id}")).await
+}
+
+/// The layout block of the start page, as the page embeds it.
+async fn embedded_layout(web: &mut Web<'_>) -> Value {
+    let res = web.get("/").await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let open = r#"<script type="application/json" id="mm-layout">"#;
+    let start = res.body.find(open).expect("no layout block") + open.len();
+    let end = start + res.body[start..].find("</script").unwrap();
+    serde_json::from_str(&res.body[start..end]).unwrap()
+}
+
+/// The version column of the stored layout.
+async fn stored_version(app: &App, uid: i64) -> i64 {
+    app.count(Box::leak(
+        format!("SELECT version FROM layouts WHERE user_id = {uid}").into_boxed_str(),
+    ))
+    .await
 }
 
 async fn stored_layout(app: &App, uid: i64) -> Value {
@@ -699,11 +719,75 @@ async fn a_restart_sweeps_files_of_users_that_are_gone() {
 }
 
 #[tokio::test]
-async fn delete_removes_the_image_and_resets_the_background() {
+async fn delete_removes_the_current_unused_picture_and_never_touches_the_layout() {
     let app = App::new().await;
     let mut web = Web::new(&app, "ada", "admin").await;
     let uid = user_id(&app, "ada").await;
     let id = upload_ok(&mut web, &png(b"bye")).await;
+    let res = save_layout(
+        &mut web,
+        &layout_with(0, json!({ "kind": "preset", "name": "hav" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let before = stored_layout(&app, uid).await;
+
+    let res = delete_background(&mut web, &id).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    assert!(res.body.is_empty());
+    assert_eq!(app.count("SELECT COUNT(*) FROM backgrounds").await, 0);
+    assert!(files_of(&app, uid).is_empty());
+    assert_eq!(
+        image_as(&app, &web, &id).await.status,
+        StatusCode::NOT_FOUND
+    );
+    // The layout and its version are exactly as they were.
+    assert_eq!(stored_layout(&app, uid).await, before);
+    assert_eq!(stored_version(&app, uid).await, 1);
+    // Asking again is the same answer and changes nothing.
+    let res = delete_background(&mut web, &id).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    assert_eq!(stored_version(&app, uid).await, 1);
+}
+
+#[tokio::test]
+async fn delete_does_nothing_when_the_picture_is_not_the_current_one() {
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    let uid = user_id(&app, "ada").await;
+    let first = upload_ok(&mut web, &png(b"first")).await;
+    let second = upload_ok(&mut web, &png(b"second")).await;
+
+    // The replaced picture, and an id that never existed: 204, and the
+    // current picture stays (a stale tab cannot take it away).
+    for id in [first.as_str(), &"f".repeat(32), "short"] {
+        let res = delete_background(&mut web, id).await;
+        assert_eq!(res.status, StatusCode::NO_CONTENT, "{id}: {}", res.body);
+    }
+    assert_eq!(app.count("SELECT COUNT(*) FROM backgrounds").await, 1);
+    assert_eq!(files_of(&app, uid), vec![format!("{second}.png")]);
+    assert_eq!(image_as(&app, &web, &second).await.status, StatusCode::OK);
+    assert_eq!(app.count("SELECT COUNT(*) FROM layouts").await, 0);
+}
+
+#[tokio::test]
+async fn delete_does_nothing_to_another_users_picture() {
+    let app = App::new().await;
+    let mut ada = Web::new(&app, "ada", "admin").await;
+    let mut bob = Web::new(&app, "bob", "editor").await;
+    let a = upload_ok(&mut ada, &png(b"ada's")).await;
+    let res = delete_background(&mut bob, &a).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    assert_eq!(image_as(&app, &ada, &a).await.status, StatusCode::OK);
+    assert_eq!(app.count("SELECT COUNT(*) FROM backgrounds").await, 1);
+}
+
+#[tokio::test]
+async fn delete_does_nothing_while_the_stored_layout_uses_the_picture() {
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    let uid = user_id(&app, "ada").await;
+    let id = upload_ok(&mut web, &png(b"in use")).await;
     let res = save_layout(
         &mut web,
         &layout_with(0, json!({ "kind": "image", "id": id })),
@@ -711,58 +795,151 @@ async fn delete_removes_the_image_and_resets_the_background() {
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
-    let res = delete_background(&mut web).await;
-    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    // The layout moved on a version, so another tab's old copy is a conflict.
-    assert_eq!(res.json(), json!({ "version": 2 }));
-    let layout = stored_layout(&app, uid).await;
+    let res = delete_background(&mut web, &id).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    assert_eq!(app.count("SELECT COUNT(*) FROM backgrounds").await, 1);
+    assert_eq!(files_of(&app, uid), vec![format!("{id}.png")]);
+    assert_eq!(image_as(&app, &web, &id).await.status, StatusCode::OK);
     assert_eq!(
-        layout["background"],
-        json!({ "kind": "preset", "name": "hedgerow" })
+        stored_layout(&app, uid).await["background"],
+        json!({ "kind": "image", "id": id })
     );
-    assert_eq!(app.count("SELECT COUNT(*) FROM backgrounds").await, 0);
-    assert!(files_of(&app, uid).is_empty());
-    assert_eq!(
-        image_as(&app, &web, &id).await.status,
-        StatusCode::NOT_FOUND
-    );
-    // The old copy of the layout (version 1, with the image) is refused.
+    assert_eq!(stored_version(&app, uid).await, 1);
+
+    // Once a layout that does not use it is saved, it can go.
     let res = save_layout(
         &mut web,
-        &layout_with(1, json!({ "kind": "image", "id": id })),
+        &layout_with(1, json!({ "kind": "preset", "name": "natt" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = delete_background(&mut web, &id).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    assert_eq!(app.count("SELECT COUNT(*) FROM backgrounds").await, 0);
+    assert_eq!(stored_version(&app, uid).await, 2);
+}
+
+#[tokio::test]
+async fn delete_needs_a_well_formed_id() {
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    let id = upload_ok(&mut web, &png(b"keep")).await;
+    for path in [
+        "/start/background".to_string(),
+        "/start/background?id=".to_string(),
+        "/start/background?other=1".to_string(),
+        "/start/background?id=a%20b".to_string(),
+        "/start/background?id=..%2Fx".to_string(),
+        "/start/background?id=%ff".to_string(),
+        format!("/start/background?id={}", "a".repeat(65)),
+    ] {
+        let res = web.delete(&path).await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{path}: {}", res.body);
+        assert_eq!(res.json(), json!({ "error": "bad_request" }), "{path}");
+    }
+    // Nothing was removed by any of them.
+    assert_eq!(image_as(&app, &web, &id).await.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_picture_that_is_not_the_users_any_more_is_shown_as_hedgerow() {
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    let uid = user_id(&app, "ada").await;
+    let old = upload_ok(&mut web, &png(b"old")).await;
+    let res = save_layout(
+        &mut web,
+        &layout_with(0, json!({ "kind": "image", "id": old })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // The picture in use is shown as it is.
+    let shown = embedded_layout(&mut web).await;
+    assert_eq!(shown["background"], json!({ "kind": "image", "id": old }));
+
+    // A new upload replaces it: the stored layout still names the old id.
+    let new = upload_ok(&mut web, &png(b"new")).await;
+    assert_ne!(old, new);
+    let stored = stored_layout(&app, uid).await;
+    assert_eq!(stored["background"], json!({ "kind": "image", "id": old }));
+
+    // The page shows Hedgerow, at the stored version, for the whole layout.
+    let shown = embedded_layout(&mut web).await;
+    assert_eq!(
+        shown["background"],
+        json!({ "kind": "preset", "name": "hedgerow" })
+    );
+    assert_eq!(shown["version"], json!(1));
+    // So does the extension's read, with a token.
+    let token = make_token(&app, uid, TokenScope::Read, "ext").await;
+    let res = bearer_get(&app, "/api/v1/me/start", &token).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(
+        res.json()["background"],
+        json!({ "kind": "preset", "name": "hedgerow" })
+    );
+    assert_eq!(res.json()["version"], json!(1));
+    // The stored document is untouched, and what a page saves over it carries
+    // the version it was loaded at: the shown layout is saved without a 422.
+    assert_eq!(stored_layout(&app, uid).await, stored);
+    assert_eq!(stored_version(&app, uid).await, 1);
+    let res = save_layout(&mut web, &shown).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // The old stale copy (the dead picture) is still refused.
+    let res = save_layout(
+        &mut web,
+        &layout_with(2, json!({ "kind": "image", "id": old })),
     )
     .await;
     assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", res.body);
 }
 
 #[tokio::test]
-async fn delete_leaves_a_chosen_preset_and_works_without_an_image() {
+async fn two_tabs_a_removed_picture_cannot_cost_the_other_tab_its_save() {
+    // Tab A loaded the layout with picture X. Tab B saved a preset and so
+    // moved the version on. A "removes" the picture (a draft change only) and
+    // cleans up with the scoped DELETE: the layout stays as B saved it, and
+    // A's save with the old version is a conflict.
     let app = App::new().await;
     let mut web = Web::new(&app, "ada", "admin").await;
     let uid = user_id(&app, "ada").await;
-
-    // Nothing stored at all: fine, and nothing is made up.
-    let res = delete_background(&mut web).await;
-    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    assert_eq!(res.json(), json!({ "version": 0 }));
-    assert_eq!(app.count("SELECT COUNT(*) FROM layouts").await, 0);
-
-    // An image that is stored but not in use: the chosen preset stays.
-    upload_ok(&mut web, &png(b"unused")).await;
+    let x = upload_ok(&mut web, &png(b"x")).await;
     let res = save_layout(
         &mut web,
-        &layout_with(0, json!({ "kind": "preset", "name": "hav" })),
+        &layout_with(0, json!({ "kind": "image", "id": x })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    let res = delete_background(&mut web).await;
-    assert_eq!(res.json(), json!({ "version": 1 }));
+
+    // B saves a preset (version 1 -> 2).
+    let res = save_layout(
+        &mut web,
+        &layout_with(1, json!({ "kind": "preset", "name": "hav" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    // A's scoped DELETE finds the layout not using X any more and removes it.
+    let res = delete_background(&mut web, &x).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    // B's layout and version are as B saved them.
     assert_eq!(
         stored_layout(&app, uid).await["background"],
         json!({ "kind": "preset", "name": "hav" })
     );
-    assert_eq!(app.count("SELECT COUNT(*) FROM backgrounds").await, 0);
-    assert!(files_of(&app, uid).is_empty());
+    assert_eq!(stored_version(&app, uid).await, 2);
+    // A saves what it has, at version 1: a conflict, not an overwrite.
+    let res = save_layout(
+        &mut web,
+        &layout_with(1, json!({ "kind": "preset", "name": "hedgerow" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    assert_eq!(
+        stored_layout(&app, uid).await["background"],
+        json!({ "kind": "preset", "name": "hav" })
+    );
 }
 
 #[tokio::test]
@@ -847,4 +1024,28 @@ async fn a_bad_image_id_is_reported_with_the_other_problems() {
         .collect();
     assert!(codes.contains(&("background.id".into(), "bad_image".into())));
     assert!(codes.contains(&("bookmarks[0].title".into(), "required".into())));
+}
+
+#[tokio::test]
+async fn another_users_picture_id_in_a_stored_layout_is_shown_as_hedgerow() {
+    // A document written outside the save route (or an id that was valid once)
+    // names ada's picture inside bob's layout: bob's page must not show it.
+    let app = App::new().await;
+    let mut ada = Web::new(&app, "ada", "admin").await;
+    let mut bob = Web::new(&app, "bob", "editor").await;
+    let a = upload_ok(&mut ada, &png(b"ada's")).await;
+    let bob_id = user_id(&app, "bob").await;
+    let doc = layout_with(4, json!({ "kind": "image", "id": a })).to_string();
+    app.exec(format!(
+        "INSERT INTO layouts (user_id, version, doc, updated_at) VALUES ({bob_id}, 4, '{doc}', 'now')"
+    ))
+    .await;
+    let shown = embedded_layout(&mut bob).await;
+    assert_eq!(
+        shown["background"],
+        json!({ "kind": "preset", "name": "hedgerow" })
+    );
+    assert_eq!(shown["version"], json!(4));
+    // Ada's own page is not affected.
+    assert_eq!(image_as(&app, &ada, &a).await.status, StatusCode::OK);
 }

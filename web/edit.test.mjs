@@ -1260,7 +1260,7 @@ test("without_a_user_number_on_the_page_nothing_is_kept_or_offered", async () =>
 
 /** The two background calls, recording what they were asked. */
 function fakeBackground(overrides = {}) {
-  const calls = { upload: [], remove: 0 };
+  const calls = { upload: [], remove: [] };
   return {
     calls,
     upload:
@@ -1271,9 +1271,9 @@ function fakeBackground(overrides = {}) {
       }),
     remove:
       overrides.remove ??
-      (async () => {
-        calls.remove += 1;
-        return { status: 200, body: { version: 4 } };
+      (async (id) => {
+        calls.remove.push(id);
+        return { status: 204, body: null };
       }),
   };
 }
@@ -1458,7 +1458,7 @@ test("a_finished_upload_sets_the_image_background_and_redraws", async () => {
   click(act(bar(t.document), "done"));
   await tick();
   assert.deepEqual(t.saved[0].background, { kind: "image", id: "up1" });
-  assert.equal(bg.calls.remove, 0, "a used picture stays");
+  assert.deepEqual(bg.calls.remove, [], "a used picture stays");
 });
 
 test("an_upload_shows_a_busy_state_and_blocks_the_other_controls", async () => {
@@ -1468,18 +1468,52 @@ test("an_upload_shows_a_busy_state_and_blocks_the_other_controls", async () => {
   });
   const bg = fakeBackground({ upload: () => gate });
   const t = setup({ background: bg });
-  t.start();
+  const ed = t.start();
   const dialog = openPicker(t);
+  const input = dialog.querySelector('input[type="file"]');
+  input.focus();
   choosePicture(dialog, picture());
   await tick();
   assert.equal(dialog.querySelector(".sheet-body").getAttribute("aria-busy"), "true");
   assert.match(dialog.querySelector(".mm-bg-status").textContent, /Uploading…/);
-  for (const radio of dialog.querySelectorAll('input[name="preset"]')) assert.equal(radio.hasAttribute("disabled"), true);
-  assert.equal(dialog.querySelector('input[type="file"]').hasAttribute("disabled"), true);
+  // Blocked with aria-disabled, never `disabled`: a disabled control that has
+  // focus drops it to the page, and Escape would stop working.
+  for (const control of [...dialog.querySelectorAll('input[name="preset"]'), input]) {
+    assert.equal(control.getAttribute("aria-disabled"), "true");
+    assert.equal(control.hasAttribute("disabled"), false);
+  }
+  // Choosing a preset while busy changes nothing.
+  choosePreset(dialog, "natt");
+  assert.deepEqual(ed.draft().background, { kind: "preset", name: "hedgerow" });
+  // The file input keeps focus, and Escape still closes the sheet.
+  assert.ok(t.focus.last === input);
+  press(dialog, "Escape");
+  await tick();
+  assert.equal(sheet(t.document), null);
   release({ status: 200, body: { id: "up2" } });
   await tick();
-  assert.equal(dialog.querySelector(".sheet-body").getAttribute("aria-busy"), "false");
-  assert.equal(dialog.querySelector('input[type="file"]').hasAttribute("disabled"), false);
+  // The upload finished after the sheet closed: it still counts.
+  assert.deepEqual(ed.draft().background, { kind: "image", id: "up2" });
+});
+
+test("focus_stays_in_the_sheet_while_it_is_busy_and_after", async () => {
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const t = setup({ background: fakeBackground({ upload: () => gate }) });
+  t.start();
+  const dialog = openPicker(t);
+  const input = dialog.querySelector('input[type="file"]');
+  input.focus();
+  choosePicture(dialog, picture());
+  await tick();
+  assert.ok(t.focus.last === input, "nothing took focus away while busy");
+  assert.equal(input.hasAttribute("disabled"), false);
+  release({ status: 200, body: { id: "up2" } });
+  await tick();
+  assert.equal(input.getAttribute("aria-disabled"), null);
+  assert.ok(t.focus.last === input);
 });
 
 test("server_refusals_and_network_errors_show_a_message_and_change_nothing", async () => {
@@ -1506,54 +1540,95 @@ test("server_refusals_and_network_errors_show_a_message_and_change_nothing", asy
   }
 });
 
-test("remove_picture_adopts_the_returned_version_and_the_next_save_is_not_a_conflict", async () => {
+test("remove_picture_is_a_change_of_the_draft_only", async () => {
   const bg = fakeBackground();
-  const t = setup({ layout: withImage(), background: bg });
+  const t = setup({ layout: withImage("old1"), background: bg });
   const ed = t.start();
   const dialog = openPicker(t);
   click(dialog.querySelector('[data-act="remove-picture"]'));
   await tick();
-  assert.equal(bg.calls.remove, 1);
+  assert.deepEqual(bg.calls.remove, [], "nothing is sent to the server");
   assert.deepEqual(ed.draft().background, { kind: "preset", name: "hedgerow" });
-  assert.equal(ed.draft().version, 4, "the version the server moved to");
+  assert.equal(ed.draft().version, 3, "the version is never changed by the picker");
   assert.equal(dataBg(t), "hedgerow");
-  assert.equal(ed.isDirty(), false, "the server made this change already");
+  assert.equal(ed.isDirty(), true, "it is a change like the others");
   assert.equal(dialog.querySelector('[data-act="remove-picture"]').hasAttribute("hidden"), true);
   // Focus goes to a control that is still there.
   assert.equal(t.focus.last.getAttribute("name"), "preset");
+});
 
-  // A change after that is saved at version 4.
+test("cancel_after_remove_picture_brings_the_picture_back_and_asks_nothing_of_the_server", async () => {
+  const bg = fakeBackground();
+  const t = setup({ layout: withImage("old1"), background: bg });
+  t.start();
+  const dialog = openPicker(t);
+  click(dialog.querySelector('[data-act="remove-picture"]'));
   press(dialog, "Escape");
   await tick();
+  click(act(bar(t.document), "cancel"));
+  click(sheet(t.document).querySelector('[data-answer="yes"]'));
+  await tick();
+  assert.deepEqual(bg.calls.remove, []);
+  assert.equal(dataBg(t), "image", "the stored picture is on the page again");
+});
+
+test("done_after_remove_picture_saves_hedgerow_and_then_removes_the_old_picture_by_id", async () => {
+  const bg = fakeBackground();
+  const t = setup({ layout: withImage("old1"), background: bg });
+  t.start();
+  const dialog = openPicker(t);
+  click(dialog.querySelector('[data-act="remove-picture"]'));
+  press(dialog, "Escape");
+  await tick();
+  click(act(bar(t.document), "done"));
+  await tick();
+  assert.equal(t.saved[0].version, 3, "saved at the version it was loaded at");
+  assert.deepEqual(t.saved[0].background, { kind: "preset", name: "hedgerow" });
+  assert.deepEqual(bg.calls.remove, ["old1"]);
+});
+
+test("a_saved_picture_that_the_layout_still_uses_is_not_removed", async () => {
+  const bg = fakeBackground();
+  const t = setup({ layout: withImage("old1"), background: bg });
+  t.start();
   click(act(item(t.root, "card", "c1"), "delete"));
   click(act(bar(t.document), "done"));
   await tick();
-  assert.equal(t.saved[0].version, 4);
-  assert.deepEqual(t.saved[0].background, { kind: "preset", name: "hedgerow" });
+  assert.deepEqual(t.saved[0].background, { kind: "image", id: "old1" });
+  assert.deepEqual(bg.calls.remove, []);
 });
 
-test("remove_picture_keeps_the_version_when_somebody_else_saved", async () => {
-  const bg = fakeBackground({ remove: async () => ({ status: 200, body: { version: 9 } }) });
-  const t = setup({ layout: withImage(), background: bg });
+test("two_tabs_a_remove_in_a_stale_tab_ends_in_a_conflict_not_in_a_lost_update", async () => {
+  // Tab B saved a preset after tab A loaded the page with picture old1. A
+  // removes the picture in its draft and presses Done: the version A sends is
+  // the one it loaded, so the save is a conflict, and nothing the picker did
+  // has changed any layout or version.
+  const bg = fakeBackground();
+  const t = setup({
+    layout: withImage("old1"),
+    background: bg,
+    saveResult: { status: 409, body: { error: "conflict", current: 4 } },
+  });
   const ed = t.start();
   const dialog = openPicker(t);
   click(dialog.querySelector('[data-act="remove-picture"]'));
+  press(dialog, "Escape");
   await tick();
-  assert.equal(ed.draft().version, 3, "not adopted: the next save meets the conflict");
+  click(act(bar(t.document), "done"));
+  await tick();
+  assert.equal(t.saved[0].version, 3);
+  assert.match(alertText(t.document), /changed in another tab/);
+  assert.ok(t.root.hasAttribute("data-editing"));
+  assert.equal(ed.draft().version, 3);
+  // The stored layout block is written only from a successful save.
+  assert.equal(JSON.parse(t.document.getElementById("mm-layout").textContent).version, 3);
+  assert.deepEqual(bg.calls.remove, [], "no clean-up after a refused save");
+  // Reload gives the draft up; the old picture is not touched either.
+  click(act(t.document.querySelector(".mm-edit-alert"), "reload"));
+  assert.deepEqual(bg.calls.remove, []);
 });
 
-test("a_failed_remove_says_so_and_keeps_the_picture", async () => {
-  const bg = fakeBackground({ remove: async () => ({ status: 500, body: null }) });
-  const t = setup({ layout: withImage(), background: bg });
-  const ed = t.start();
-  const dialog = openPicker(t);
-  click(dialog.querySelector('[data-act="remove-picture"]'));
-  await tick();
-  assert.match(dialog.querySelector('.field-error[data-for="image"]').textContent, /Could not remove/);
-  assert.deepEqual(ed.draft().background, { kind: "image", id: "old1" });
-});
-
-test("cancel_after_an_upload_takes_the_unused_picture_off_the_server", async () => {
+test("cancel_after_an_upload_takes_the_unused_picture_off_the_server_by_id", async () => {
   const bg = fakeBackground();
   const t = setup({ background: bg });
   t.start();
@@ -1565,24 +1640,60 @@ test("cancel_after_an_upload_takes_the_unused_picture_off_the_server", async () 
   click(act(bar(t.document), "cancel"));
   click(sheet(t.document).querySelector('[data-answer="yes"]'));
   await tick();
-  assert.equal(bg.calls.remove, 1, "the new file is deleted");
+  assert.deepEqual(bg.calls.remove, ["up1"], "the new file, by its id");
   assert.equal(t.root.hasAttribute("data-editing"), false);
   assert.equal(dataBg(t), "hedgerow", "the old (preset) background stays");
 });
 
-test("cancel_after_an_upload_that_replaced_a_stored_picture_falls_back_to_hedgerow", async () => {
-  // The upload replaced the stored layout's picture on the server: that picture
-  // is gone. The server puts the stored layout on Hedgerow when it removes the
-  // new one, and the page is drawn from the layout block again.
+test("the_clean_up_after_cancel_names_only_this_sessions_upload", async () => {
+  // Another tab saved a layout with its own picture meanwhile. This tab never
+  // asks for that picture to go: it names the id it uploaded, nothing else.
+  const bg = fakeBackground();
+  const t = setup({ layout: withImage("old1"), background: bg });
+  t.start();
+  const dialog = openPicker(t);
+  choosePicture(dialog, picture());
+  await tick();
+  press(dialog, "Escape");
+  await tick();
+  click(act(bar(t.document), "cancel"));
+  click(sheet(t.document).querySelector('[data-answer="yes"]'));
+  await tick();
+  assert.deepEqual(bg.calls.remove, ["up1"]);
+  assert.ok(!bg.calls.remove.includes("old1"));
+});
+
+test("an_upload_that_finishes_after_cancel_is_taken_off_the_server_by_id", async () => {
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const bg = fakeBackground({ upload: () => gate });
+  const t = setup({ background: bg });
+  const ed = t.start();
+  const dialog = openPicker(t);
+  choosePicture(dialog, picture());
+  await tick();
+  press(dialog, "Escape");
+  await tick();
+  click(act(bar(t.document), "cancel"));
+  await tick();
+  assert.equal(ed.isActive(), false, "the editor has ended");
+  assert.deepEqual(bg.calls.remove, [], "nothing to remove yet");
+  release({ status: 200, body: { id: "late1" } });
+  await tick();
+  assert.deepEqual(bg.calls.remove, ["late1"]);
+  assert.equal(t.root.hasAttribute("data-editing"), false);
+});
+
+test("cancel_after_an_upload_that_replaced_a_stored_picture_shows_hedgerow_and_says_so", async () => {
+  // The upload replaced the stored layout's picture on the server: that
+  // picture is gone. The page is not left with a dead background (a reload
+  // shows the same, the server serves the layout that way).
   const toasts = [];
   const t = setup({ layout: withImage("old1") });
   t.window.VV = { toast: (message, kind) => toasts.push([message, kind]) };
-  const bg = fakeBackground({
-    remove: async () => {
-      t.current.layout = { ...t.current.layout, version: 4, background: { kind: "preset", name: "hedgerow" } };
-      return { status: 200, body: { version: 4 } };
-    },
-  });
+  const bg = fakeBackground();
   const ed = startEditing(t.root, () => t.current.layout, async () => ({ status: 200, body: { version: 5 } }), {
     labels: LABELS,
     lang: "en",
@@ -1602,6 +1713,9 @@ test("cancel_after_an_upload_that_replaced_a_stored_picture_falls_back_to_hedger
   assert.equal(dataBg(t), "hedgerow", "no dead background");
   assert.equal(toasts.length, 1);
   assert.match(toasts[0][0], /back on Hedgerow/);
+  assert.deepEqual(bg.calls.remove, ["up1"]);
+  // The layout block was not touched: only a save writes it.
+  assert.equal(JSON.parse(t.document.getElementById("mm-layout").textContent).background.id, "old1");
 });
 
 test("saving_with_another_background_than_the_upload_takes_the_upload_off_the_server", async () => {
@@ -1617,7 +1731,24 @@ test("saving_with_another_background_than_the_upload_takes_the_upload_off_the_se
   click(act(bar(t.document), "done"));
   await tick();
   assert.deepEqual(t.saved[0].background, { kind: "preset", name: "hav" });
-  assert.equal(bg.calls.remove, 1);
+  assert.deepEqual(bg.calls.remove, ["up1"]);
+});
+
+test("saving_a_new_picture_over_a_stored_one_removes_the_old_one_by_id", async () => {
+  const bg = fakeBackground();
+  const t = setup({ layout: withImage("old1"), background: bg });
+  t.start();
+  const dialog = openPicker(t);
+  choosePicture(dialog, picture());
+  await tick();
+  press(dialog, "Escape");
+  await tick();
+  click(act(bar(t.document), "done"));
+  await tick();
+  assert.deepEqual(t.saved[0].background, { kind: "image", id: "up1" });
+  // The new picture is used and stays; the old one is asked to go (the server
+  // has replaced it already, so this is usually a no-op there).
+  assert.deepEqual(bg.calls.remove, ["old1"]);
 });
 
 test("a_draft_that_is_kept_for_Back_keeps_its_picture_on_the_server", async () => {
@@ -1631,7 +1762,7 @@ test("a_draft_that_is_kept_for_Back_keeps_its_picture_on_the_server", async () =
   await tick();
   ed.stop({ focus: false });
   await tick();
-  assert.equal(bg.calls.remove, 0);
+  assert.deepEqual(bg.calls.remove, []);
 });
 
 test("a_save_refused_for_a_dead_picture_falls_back_to_hedgerow_with_a_message", async () => {
@@ -1664,12 +1795,14 @@ test("without_background_calls_the_picker_offers_only_the_presets", () => {
   assert.equal(dialog.querySelector('input[type="file"]'), null);
 });
 
-test("makeBackground_posts_the_file_and_deletes_with_the_csrf_header", async () => {
+test("makeBackground_posts_the_file_and_deletes_one_picture_by_id_with_the_csrf_header", async () => {
   const t = setup();
   const calls = [];
   const fetchFn = async (url, init) => {
     calls.push({ url, init });
-    return { status: 200, json: async () => (init.method === "POST" ? { id: "abc" } : { version: 4 }) };
+    return init.method === "POST"
+      ? { status: 200, json: async () => ({ id: "abc" }) }
+      : { status: 204, json: async () => { throw new Error("no body"); } };
   };
   const background = makeBackground(t.document, fetchFn);
   const file = picture();
@@ -1681,18 +1814,31 @@ test("makeBackground_posts_the_file_and_deletes_with_the_csrf_header", async () 
   assert.equal(calls[0].init.credentials, "same-origin");
   assert.equal(calls[0].init.body.get("image").name, "bg.png");
 
-  // The layout block: a stored picture is replaced by the default preset, at the new version.
+  // The layout block is left alone: only a save writes it.
   const block = t.document.getElementById("mm-layout");
   block.textContent = JSON.stringify(withImage("old1"));
-  assert.deepEqual(await background.remove(), { status: 200, body: { version: 4 } });
+  const before = block.textContent;
+  assert.deepEqual(await background.remove("old1"), { status: 204, body: null });
+  assert.equal(calls[1].url, "/start/background?id=old1");
   assert.equal(calls[1].init.method, "DELETE");
   assert.equal(calls[1].init.headers["HX-Request"], "true");
-  const stored = JSON.parse(block.textContent);
-  assert.equal(stored.version, 4);
-  assert.deepEqual(stored.background, { kind: "preset", name: "hedgerow" });
+  assert.equal(calls[1].init.credentials, "same-origin");
+  assert.equal(block.textContent, before);
+  // An id is written into the query safely.
+  await background.remove("a b&c");
+  assert.equal(calls[2].url, "/start/background?id=a%20b%26c");
+});
 
-  // A stored preset is kept.
-  block.textContent = JSON.stringify({ ...layoutFixture(), background: { kind: "preset", name: "hav" } });
-  await background.remove();
-  assert.deepEqual(JSON.parse(block.textContent).background, { kind: "preset", name: "hav" });
+test("a_422_with_fields_of_an_unexpected_shape_does_not_break_the_editor", async () => {
+  const t = setup({
+    background: fakeBackground(),
+    saveResult: { status: 422, body: { error: "invalid", fields: [null, { code: "bad_image" }, { path: 7, code: "bad_image" }, {}] } },
+  });
+  const ed = t.start();
+  click(act(item(t.root, "card", "c1"), "delete"));
+  click(act(bar(t.document), "done"));
+  await tick();
+  assert.ok(t.root.hasAttribute("data-editing"), "still open, no exception");
+  assert.equal(ed.isActive(), true);
+  assert.ok(alertText(t.document).length > 0);
 });

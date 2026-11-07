@@ -54,7 +54,7 @@ pub const ROUTES: &[RouteDoc] = &[
         "/api/v1/me/start",
         "viewer",
         "Start page",
-        "The start page layout of the token's owner, as the page shows it: `version`, `background`, `groups` of cards and `bookmarks`. Any API token opens it (read access is enough); a session cookie never does. If the stored layout is unreadable, the answer is the empty layout at the stored version, as the page shows it. Never cached (`Cache-Control: no-store`).",
+        "The start page layout of the token's owner, as the page shows it: `version`, `background`, `groups` of cards and `bookmarks`. Any API token opens it (read access is enough); a session cookie never does. If the stored layout is unreadable, the answer is the empty layout at the stored version, as the page shows it. A picture background that is no longer the user's picture is shown as the `hedgerow` preset, with the stored version. Never cached (`Cache-Control: no-store`).",
     )
     .res(ME_START_EXAMPLE),
     r(

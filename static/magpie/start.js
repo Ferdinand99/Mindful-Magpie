@@ -207,9 +207,11 @@ export function reloadIfDataLost(doc, deps = {}) {
  *
  * - `upload(file)`: `POST /start/background`; the picture is on the server at
  *   once, the layout points at it only when the layout is saved;
- * - `remove()`: `DELETE /start/background`; the server puts a stored layout that
- *   used the picture back on the default preset and moves its version on by one,
- *   and the layout block of the page is changed the same way.
+ * - `remove(id)`: `DELETE /start/background?id=`; the server removes that
+ *   picture only when it is still the user's current one and the stored layout
+ *   does not use it, and answers 204 either way. It never changes a layout, so
+ *   nothing on the page changes with it, and the layout block is written only
+ *   from a save.
  */
 export function makeBackground(doc, fetchFn = (...args) => fetch(...args)) {
   const headers = { "HX-Request": "true" };
@@ -218,7 +220,7 @@ export function makeBackground(doc, fetchFn = (...args) => fetch(...args)) {
     try {
       body = await response.json();
     } catch {
-      // Not JSON: the status says enough.
+      // Not JSON (a 204 has no body): the status says enough.
     }
     return { status: response.status, body };
   };
@@ -229,20 +231,16 @@ export function makeBackground(doc, fetchFn = (...args) => fetch(...args)) {
       // No Content-Type: the browser writes it, with the boundary.
       return answer(await fetchFn("/start/background", { method: "POST", credentials: "same-origin", headers, body: form }));
     },
-    async remove() {
+    async remove(id) {
       // keepalive: it may be sent as the page is left.
-      const result = await answer(
-        await fetchFn("/start/background", { method: "DELETE", credentials: "same-origin", headers, keepalive: true }),
+      return answer(
+        await fetchFn(`/start/background?id=${encodeURIComponent(id)}`, {
+          method: "DELETE",
+          credentials: "same-origin",
+          headers,
+          keepalive: true,
+        }),
       );
-      if (result.status === 200 && Number.isFinite(result.body?.version)) {
-        const layout = readJson(doc, "mm-layout");
-        if (layout) {
-          const next = { ...layout, version: result.body.version };
-          if (layout.background?.kind === "image") next.background = { kind: "preset", name: "hedgerow" };
-          writeLayoutBlock(doc, next);
-        }
-      }
-      return result;
     },
   };
 }

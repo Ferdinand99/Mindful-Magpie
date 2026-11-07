@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 use askama::Template;
 use axum::body::Bytes;
 use axum::extract::multipart::MultipartRejection;
-use axum::extract::{DefaultBodyLimit, Extension, Multipart, Path, Request, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{DefaultBodyLimit, Extension, Multipart, Path, Query, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
@@ -172,12 +173,10 @@ fn labels() -> BTreeMap<&'static str, &'static str> {
         "bg_upload_help",
         "bg_uploading",
         "bg_remove",
-        "bg_removing",
         "bg_image_set",
         "bg_err_size",
         "bg_err_type",
         "bg_err_failed",
-        "bg_err_remove",
         "bg_gone",
         "bg_gone_toast",
         "restore_notice",
@@ -408,20 +407,46 @@ fn multipart_failure(err: &axum::extract::multipart::MultipartError) -> Response
     }
 }
 
-/// `DELETE /start/background`: removes the user's picture, and puts the
-/// layout back on the default preset when it used the picture. The answer is
-/// the layout's version (the layout changed when it used the picture).
+/// The query of `DELETE /start/background`.
+#[derive(serde::Deserialize)]
+struct PictureQuery {
+    id: Option<String>,
+}
+
+/// Whether `id` has the shape of a picture id (the shape `validate` and the
+/// renderer accept).
+fn picture_id_shape(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// `DELETE /start/background?id=<id>`: takes the picture `id` off the server
+/// when it is still the signed-in user's current picture and the stored layout
+/// does not use it; in every other case it does nothing. It never changes the
+/// layout or its version. The answer is 204 whether or not anything was
+/// removed, so it says nothing the caller could not know; a missing or
+/// malformed `id` is a 400.
 async fn delete_background(
     State(core): State<Core>,
     Extension(magpie): Extension<Magpie>,
     user: CurrentUser,
+    query: Result<Query<PictureQuery>, QueryRejection>,
 ) -> ApiResult<Response> {
-    let version = magpie
+    let id = query
+        .ok()
+        .and_then(|Query(q)| q.id)
+        .filter(|id| picture_id_shape(id));
+    let Some(id) = id else {
+        return Ok(error_json(StatusCode::BAD_REQUEST, "bad_request"));
+    };
+    magpie
         .backgrounds
-        .remove(&core, user.id)
+        .remove(&core, user.id, &id)
         .await
         .map_err(ApiError::internal)?;
-    Ok(Json(json!({ "version": version })).into_response())
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// No sign-in, or a token that does not work: 401, never a redirect.

@@ -11,8 +11,9 @@
 //! - an upload writes the file (a temporary file, then a rename), commits the
 //!   row, and only then deletes everything else in the user's directory (the
 //!   previous picture, leftovers of a crash);
-//! - a delete commits the row (and the layout change) first, then removes the
-//!   directory;
+//! - a delete commits the row first, then removes the directory; it never
+//!   touches the layout (a layout that still names a removed picture is shown
+//!   on the default preset, see `store::load_or_default`);
 //! - [`Backgrounds::reconcile`] removes what no row accounts for. It runs at
 //!   start-up and after an admin deletes a user: the row goes with the user by
 //!   `ON DELETE CASCADE`, the vole-kit has no hook that tells us about the
@@ -182,18 +183,25 @@ impl Backgrounds {
         }
     }
 
-    /// Removes the user's picture. When the user's layout uses it, the layout
-    /// goes back to the default preset (and its version moves on, so a tab
-    /// with the old copy gets a conflict). Returns the layout's stored version
-    /// (0 when none is stored).
+    /// Removes the user's picture `id`, when it is still the user's current
+    /// picture and the stored layout does not use it. Anything else is a no-op
+    /// (the picture was replaced, or a layout saved since points at it), so a
+    /// stale tab can never take away a picture another tab has put to use.
+    /// The layout and its version are never changed. Returns whether a picture
+    /// was removed.
     ///
     /// Like [`Backgrounds::store`], it finishes in a task of its own.
-    pub async fn remove(&self, core: &Core, user_id: i64) -> Result<u64, BackgroundError> {
+    pub async fn remove(
+        &self,
+        core: &Core,
+        user_id: i64,
+        id: &str,
+    ) -> Result<bool, BackgroundError> {
         let guard = Arc::clone(&self.lock).lock_owned().await;
-        let (core, dir) = (core.clone(), self.user_dir(user_id));
+        let (core, dir, id) = (core.clone(), self.user_dir(user_id), id.to_string());
         let task = tokio::spawn(async move {
             let _guard = guard;
-            remove_locked(&core, &dir, user_id).await
+            remove_locked(&core, &dir, user_id, id).await
         });
         task.await?
     }
@@ -298,53 +306,57 @@ async fn store_locked(
     Ok(id)
 }
 
-/// The body of [`Backgrounds::remove`], with the lock held.
-async fn remove_locked(core: &Core, dir: &Path, user_id: i64) -> Result<u64, BackgroundError> {
-    let version = db::interact(&core.db, move |c| {
+/// The body of [`Backgrounds::remove`], with the lock held. The row, the stored
+/// layout and the delete are one transaction, so that a layout saved at the
+/// same moment either sees the picture gone (and is refused as `bad_image`) or
+/// is seen here (and keeps its picture).
+async fn remove_locked(
+    core: &Core,
+    dir: &Path,
+    user_id: i64,
+    id: String,
+) -> Result<bool, BackgroundError> {
+    let removed = db::interact(&core.db, move |c| {
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT id FROM backgrounds WHERE user_id = ?1",
+                params![user_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if current.as_deref() != Some(id.as_str()) {
+            return Ok(false);
+        }
+        let doc: Option<String> = tx
+            .query_row(
+                "SELECT doc FROM layouts WHERE user_id = ?1",
+                params![user_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let used = doc.is_some_and(|doc| match serde_json::from_str::<Layout>(&doc) {
+            Ok(layout) => {
+                matches!(&layout.background, Background::Image { id: used } if *used == id)
+            }
+            // A document that cannot be read may still name the picture: keep it.
+            Err(_) => doc.contains(&id),
+        });
+        if used {
+            return Ok(false);
+        }
         tx.execute(
             "DELETE FROM backgrounds WHERE user_id = ?1",
             params![user_id],
         )?;
-        let row: Option<(i64, String)> = tx
-            .query_row(
-                "SELECT version, doc FROM layouts WHERE user_id = ?1",
-                params![user_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let Some((version, doc)) = row else {
-            tx.commit()?;
-            return Ok(0);
-        };
-        let mut version = u64::try_from(version).unwrap_or_default();
-        // A layout that cannot be read is left as it is (the page offers
-        // to start over); one on a preset keeps the preset.
-        if let Ok(mut layout) = serde_json::from_str::<Layout>(&doc)
-            && matches!(layout.background, Background::Image { .. })
-        {
-            version += 1;
-            layout.version = version;
-            layout.background = Layout::default().background;
-            let doc = serde_json::to_string(&layout)
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-            tx.execute(
-                "UPDATE layouts SET version = ?2, doc = ?3, updated_at = ?4
-                     WHERE user_id = ?1",
-                params![
-                    user_id,
-                    i64::try_from(version).unwrap_or(i64::MAX),
-                    doc,
-                    jiff::Timestamp::now().to_string()
-                ],
-            )?;
-        }
         tx.commit()?;
-        Ok(version)
+        Ok(true)
     })
     .await?;
-    remove_dir(dir).await;
-    Ok(version)
+    if removed {
+        remove_dir(dir).await;
+    }
+    Ok(removed)
 }
 
 /// The file the user's row names: `Ok(None)` when there is no row (or it names

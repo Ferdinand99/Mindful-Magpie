@@ -66,7 +66,33 @@ pub async fn load(core: &Core, user_id: i64) -> Result<Layout, StoreError> {
 /// The user's layout for showing: when the stored document cannot be read,
 /// the empty default at the stored version (so a save over the broken
 /// document is accepted), and `true` for "it was unreadable".
+///
+/// A picture background that is not the user's current picture (it was
+/// replaced by an upload, or removed) is shown as the default preset: nobody
+/// who reads the layout (the page, the extension) sees a dead picture. The
+/// stored document and the version are left as they are, so what is saved over
+/// it carries the version it was loaded at, as always.
 pub async fn load_or_default(core: &Core, user_id: i64) -> Result<(Layout, bool), DbError> {
+    let (mut layout, unreadable) = load_unchecked(core, user_id).await?;
+    if let Background::Image { id } = &layout.background {
+        let id = id.clone();
+        let own: bool = db::interact(&core.db, move |c| {
+            c.query_row(
+                "SELECT EXISTS (SELECT 1 FROM backgrounds WHERE user_id = ?1 AND id = ?2)",
+                params![user_id, id],
+                |r| r.get(0),
+            )
+        })
+        .await?;
+        if !own {
+            layout.background = Layout::default().background;
+        }
+    }
+    Ok((layout, unreadable))
+}
+
+/// [`load_or_default`] before the picture check.
+async fn load_unchecked(core: &Core, user_id: i64) -> Result<(Layout, bool), DbError> {
     match load(core, user_id).await {
         Ok(layout) => Ok((layout, false)),
         Err(StoreError::Corrupt { version, source }) => {

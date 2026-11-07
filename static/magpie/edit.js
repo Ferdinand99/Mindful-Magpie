@@ -19,7 +19,7 @@
 // `reload` (called by «Reload» after a conflict), `draft` (a layout to start from
 // instead of the stored one: an unsaved draft that was kept, see start.js) and
 // `onDiscard` (called when the person gives the changes up) and `background`
-// (`{ upload(file), remove() }`, the two calls of the background picture; each
+// (`{ upload(file), remove(id) }`, the two calls of the background picture; each
 // resolves to `{ status, body }` like `save`. Without it the picker offers the
 // four presets only).
 import {
@@ -107,12 +107,10 @@ export const LABEL_KEYS = [
   "bg_upload_help",
   "bg_uploading",
   "bg_remove",
-  "bg_removing",
   "bg_image_set",
   "bg_err_size",
   "bg_err_type",
   "bg_err_failed",
-  "bg_err_remove",
   "bg_gone",
   "bg_gone_toast",
   // The next three are used by start.js (the notice for a kept draft), not by
@@ -311,12 +309,12 @@ export function startEditing(root, getLayout, save, opts = {}) {
   const stored = getLayout();
   let draft = structuredClone(opts.draft ?? stored);
   // What "unsaved" is measured against: the stored layout (a kept draft is unsaved by definition).
-  // The version is left out: it moves on without the person changing anything
-  // (removing the picture bumps it on the server).
-  const plain = (layout) => JSON.stringify({ ...layout, version: 0 });
-  let baseline = plain(opts.draft ? stored : draft);
+  const baseline = JSON.stringify(opts.draft ? stored : draft);
   const background = opts.background ?? null;
-  // The id of the picture uploaded in this session that no saved layout uses yet.
+  // The picture the stored layout uses, if any, and the one uploaded in this
+  // session. The server keeps one picture per user, and is asked to remove one
+  // (by id, see cleanupPictures) only when this editor is done with it.
+  const storedPictureId = stored.background?.kind === "image" ? stored.background.id : null;
   let uploadedId = null;
   const onDiscard = opts.onDiscard ?? (() => {});
   let active = true;
@@ -327,7 +325,7 @@ export function startEditing(root, getLayout, save, opts = {}) {
   let marked = null;
   const listeners = [];
 
-  const dirty = () => plain(draft) !== baseline;
+  const dirty = () => JSON.stringify(draft) !== baseline;
 
   function on(target, type, handler, options) {
     target.addEventListener(type, handler, options);
@@ -912,13 +910,18 @@ export function startEditing(root, getLayout, save, opts = {}) {
 
   /**
    * The picker sheet: the four presets, an upload and, with a picture set,
-   * "remove". A preset or a finished upload changes the draft and the page at
-   * once; nothing is saved before «Done», except that the picture itself is on
-   * the server as soon as it is uploaded (and goes when it is removed).
+   * "remove". A preset, a finished upload and "remove" change the draft and the
+   * page at once and nothing else: the layout is saved with «Done» like the
+   * rest, and "remove" is undone by «Cancel». Only the upload itself reaches the
+   * server on the spot (the picture is stored then); what happens to the
+   * pictures when the editor ends is in `cleanupPictures`.
    */
   function backgroundSheet(trigger) {
     const sheet = openSheet({ title: L("bg_title"), trigger });
     const body = sheet.body;
+    let busy = false;
+    // Set while `refresh` writes the radios, so that its own writes are not read as a choice.
+    let syncing = false;
 
     const labelId = uid("mm-f-bg");
     const group = h(doc, "div", { class: "field", role: "radiogroup", "aria-labelledby": labelId });
@@ -931,8 +934,15 @@ export function startEditing(root, getLayout, save, opts = {}) {
       const text = h(doc, "span", { class: "mm-bg-name", text: L(`bg_preset_${name}`) });
       presets.appendChild(h(doc, "label", { class: "mm-bg-preset" }, [radio, dot, text]));
       radio.addEventListener("change", () => {
-        if (busy || saving || !(radio.checked ?? radio.hasAttribute("checked"))) return;
+        if (syncing) return;
+        if (busy || saving) return refresh();
+        if (!(radio.checked ?? radio.hasAttribute("checked"))) return;
         choose({ kind: "preset", name });
+      });
+      // Busy controls are aria-disabled, not disabled: a disabled control that has
+      // focus drops it to the page, and Escape would stop working.
+      radio.addEventListener("click", (event) => {
+        if (busy || saving) event.preventDefault();
       });
       radios.push(radio);
     }
@@ -943,7 +953,6 @@ export function startEditing(root, getLayout, save, opts = {}) {
     let input = null;
     let status = null;
     let problem = null;
-    let busy = false;
     if (background) {
       const id = uid("mm-f-image");
       const upload = h(doc, "div", { class: "field", "data-field": "image" });
@@ -960,7 +969,10 @@ export function startEditing(root, getLayout, save, opts = {}) {
       remove = h(doc, "button", { type: "button", class: "btn btn-danger", "data-act": "remove-picture", text: L("bg_remove") });
       body.appendChild(remove);
       input.addEventListener("change", () => void onFile());
-      remove.addEventListener("click", () => void onRemove());
+      input.addEventListener("click", (event) => {
+        if (busy || saving) event.preventDefault();
+      });
+      remove.addEventListener("click", onRemove);
     }
 
     const close = h(doc, "button", { type: "button", class: "btn btn-primary", text: L("dialog_close") });
@@ -981,26 +993,28 @@ export function startEditing(root, getLayout, save, opts = {}) {
       }
     }
 
+    const markBusy = (el) => {
+      if (busy) el.setAttribute("aria-disabled", "true");
+      else el.removeAttribute("aria-disabled");
+    };
+
     /** Brings the controls in line with the draft (and with a busy state). */
     function refresh() {
       const current = draft.background.kind === "preset" ? draft.background.name : null;
+      syncing = true;
       for (const radio of radios) {
         radio.checked = radio.value === current;
         if (radio.checked) radio.setAttribute("checked", "");
         else radio.removeAttribute("checked");
-        if (busy) radio.setAttribute("disabled", "");
-        else radio.removeAttribute("disabled");
+        markBusy(radio);
       }
+      syncing = false;
       if (remove) {
         if (isImage()) remove.removeAttribute("hidden");
         else remove.setAttribute("hidden", "");
-        if (busy) remove.setAttribute("disabled", "");
-        else remove.removeAttribute("disabled");
+        markBusy(remove);
       }
-      if (input) {
-        if (busy) input.setAttribute("disabled", "");
-        else input.removeAttribute("disabled");
-      }
+      if (input) markBusy(input);
       body.setAttribute("aria-busy", busy ? "true" : "false");
     }
 
@@ -1043,8 +1057,21 @@ export function startEditing(root, getLayout, save, opts = {}) {
       }
       input.value = "";
       const id = result?.body?.id;
-      if (result?.status === 200 && typeof id === "string" && active) {
+      if (result?.status === 200 && typeof id === "string") {
+        if (!active) {
+          // The editor ended while the file was on its way (Cancel, Back, a
+          // link): the server now has a picture that nothing uses. The server
+          // removes it only if the stored layout does not use it.
+          background.remove(id).catch(() => {});
+          return;
+        }
         uploadedId = id;
+        // During a save the draft is what was sent: the picture is kept for
+        // the clean-up after it (the saved layout does not use it).
+        if (saving) {
+          setBusy(false);
+          return;
+        }
         choose({ kind: "image", id });
         setBusy(false, L("bg_image_set"));
       } else {
@@ -1054,37 +1081,17 @@ export function startEditing(root, getLayout, save, opts = {}) {
       if (input.isConnected) input.focus();
     }
 
-    async function onRemove() {
+    // "Remove picture" is a change of the draft, like choosing a preset.
+    function onRemove() {
       if (busy || saving) return;
       showProblem(null);
-      setBusy(true, L("bg_removing"));
-      let result = null;
-      try {
-        result = await background.remove();
-      } catch {
-        result = null;
-      }
-      const version = result?.body?.version;
-      if (result?.status === 200 && Number.isFinite(version) && active) {
-        const storedIsImage = JSON.parse(baseline).background?.kind === "image";
-        // The server put a stored layout that used the picture back on the
-        // default preset, and its version moved on by one. Take that in, so
-        // that the next save does not meet a conflict. (Any other version
-        // means somebody else saved: that is left to the conflict.)
-        if (version === draft.version + (storedIsImage ? 1 : 0)) draft = { ...draft, version };
-        if (storedIsImage) baseline = plain({ ...JSON.parse(baseline), background: DEFAULT_PRESET });
-        uploadedId = null;
-        draft = setBackground(draft, DEFAULT_PRESET);
-        notice = null;
-        redraw();
-        renderNotice();
-        setBusy(false, "");
-        radios.find((r) => r.checked)?.focus();
-      } else {
-        setBusy(false);
-        showProblem("bg_err_remove");
-        remove.focus();
-      }
+      draft = setBackground(draft, DEFAULT_PRESET);
+      notice = null;
+      redraw();
+      renderNotice();
+      refresh();
+      setStatus("");
+      radios.find((r) => r.checked)?.focus();
     }
 
     sheet.open();
@@ -1094,29 +1101,41 @@ export function startEditing(root, getLayout, save, opts = {}) {
   }
 
   /**
-   * The picture uploaded in this session is on the server whether or not a
-   * saved layout points at it. When the layout now on the page (`shown`) does
-   * not use it, take it off the server again: nothing is left that nobody uses,
-   * and a stored layout that pointed at the picture it replaced (which is gone)
-   * is put back on the default preset by the server, so that the page has no
-   * dead background and the next save is not refused (`bad_image`).
+   * What happens to the pictures on the server when this editor ends with
+   * `layout` on the page. The server keeps one picture per user and removes one
+   * (`background.remove(id)`) only if it is still the current picture and the
+   * stored layout does not use it, so these calls are safe whatever another tab
+   * did meanwhile; none of them changes any layout.
+   *
+   * - The picture uploaded in this session goes unless `layout` uses it.
+   * - After a save (`saved`), the picture the stored layout had goes too, unless
+   *   the saved layout still uses it (it was removed in the draft).
+   * - A cancelled edit does not touch the picture the stored layout uses.
    */
-  function settleUpload(shown) {
-    if (uploadedId === null || !background) return;
-    const keep = shown?.background?.kind === "image" && shown.background.id === uploadedId;
+  function cleanupPictures(layout, saved) {
+    if (!background) return;
+    const used = layout?.background?.kind === "image" ? layout.background.id : null;
+    const ids = new Set();
+    if (uploadedId !== null) ids.add(uploadedId);
+    if (saved && storedPictureId !== null) ids.add(storedPictureId);
     uploadedId = null;
-    if (keep) return;
-    background
-      .remove()
-      .then((result) => {
-        if (result?.status !== 200) return;
-        // The page may show a picture that is gone now: draw what is stored.
-        if (!active && root.isConnected && !root.hasAttribute("data-editing")) {
-          render(root, getLayout(), { lang, labels: ui.labels });
-        }
-        if (shown?.background?.kind === "image") win.VV?.toast?.(L("bg_gone_toast"), "info");
-      })
-      .catch(() => {});
+    for (const id of ids) {
+      if (id !== used) background.remove(id).catch(() => {});
+    }
+  }
+
+  /**
+   * The layout to draw when edit mode ends without a save. An upload replaced
+   * the stored layout's picture on the server, so that picture is gone: draw the
+   * default preset (a reload does the same, the server shows it so), not a dead
+   * background.
+   */
+  function shownAfterCancel(layout) {
+    const wanted = layout?.background;
+    if (uploadedId !== null && wanted?.kind === "image" && wanted.id !== uploadedId) {
+      return { ...layout, background: DEFAULT_PRESET };
+    }
+    return layout;
   }
 
   // -- actions --
@@ -1297,18 +1316,20 @@ export function startEditing(root, getLayout, save, opts = {}) {
     setBusy(false);
     const version = result?.body?.version;
     if (result?.status === 200 && Number.isFinite(version)) {
-      finish({ ...sent, version });
+      finish({ ...sent, version }, { saved: true });
     } else if (result?.status === 409) {
       setNotice({ type: "conflict" });
       focusControl({ toolbar: "done" });
     } else if (result?.status === 422 && Array.isArray(result.body?.fields)) {
-      let fields = result.body.fields;
+      // A shape the server does not send is read as an empty path and code.
+      let fields = result.body.fields.map((f) => ({ path: String(f?.path ?? ""), code: String(f?.code ?? "") }));
       // A background picture that is no longer the user's (it was replaced
       // from another tab, or after a cancelled upload): back on the default
       // preset, and one more press on «Done» saves.
-      const gone = fields.some((f) => f.path.startsWith("background") && f.code === "bad_image");
+      const deadPicture = (f) => String(f?.path ?? "").startsWith("background") && f?.code === "bad_image";
+      const gone = fields.some(deadPicture);
       if (gone) {
-        fields = fields.filter((f) => !(f.path.startsWith("background") && f.code === "bad_image"));
+        fields = fields.filter((f) => !deadPicture(f));
         draft = setBackground(draft, DEFAULT_PRESET);
         redraw();
       }
@@ -1349,14 +1370,17 @@ export function startEditing(root, getLayout, save, opts = {}) {
   }
 
   /**
-   * Leaves edit mode and draws `layout` as a plain page. `settle: false` is for
-   * a draft that is kept (Back and Forward): its picture must stay.
+   * Leaves edit mode and draws `layout` as a plain page (`saved`: it is what
+   * was just saved). `settle: false` is for a draft that is kept (Back and
+   * Forward): its picture must stay.
    */
-  function finish(layout, { focus = true, settle = true } = {}) {
+  function finish(layout, { focus = true, settle = true, saved = false } = {}) {
     if (!active) return;
     teardown();
-    render(root, layout, { lang, labels: ui.labels });
-    if (settle) settleUpload(layout);
+    const shown = settle && !saved ? shownAfterCancel(layout) : layout;
+    render(root, shown, { lang, labels: ui.labels });
+    if (shown !== layout) win.VV?.toast?.(L("bg_gone_toast"), "info");
+    if (settle) cleanupPictures(layout, saved);
     if (focus && editButton) editButton.focus();
   }
 
