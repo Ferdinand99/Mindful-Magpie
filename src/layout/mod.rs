@@ -1,0 +1,10 @@
+//! The start page layout: the document a user builds (groups of cards,
+//! bookmarks, a background), its validation and its per-user storage.
+
+pub mod model;
+pub mod store;
+
+pub use model::{
+    Background, Bookmark, Card, FieldError, Group, Icon, Layout, PALETTE, PRESETS, validate,
+};
+pub use store::{SaveError, StoreError, load, save};

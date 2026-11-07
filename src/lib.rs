@@ -9,6 +9,7 @@
 
 pub mod config;
 pub mod db;
+pub mod layout;
 pub mod pages;
 pub mod product;
 pub mod server;
