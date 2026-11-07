@@ -6,7 +6,7 @@ use rusqlite::{OptionalExtension as _, TransactionBehavior, params};
 use vole_kit::db::{self, DbError};
 use vole_kit::state::Core;
 
-use super::model::{FieldError, Layout, validate};
+use super::model::{Background, FieldError, Layout, validate};
 
 /// Why a layout could not be read.
 #[derive(Debug, thiserror::Error)]
@@ -83,9 +83,23 @@ pub async fn load_or_default(core: &Core, user_id: i64) -> Result<(Layout, bool)
     }
 }
 
+/// How a save ended inside its transaction.
+enum Outcome {
+    Saved(u64),
+    /// The stored version, which is not the one the document carried.
+    Conflict(u64),
+    /// The document uses an image that is not the user's.
+    BadImage,
+}
+
 /// Stores `layout` as the user's layout when `layout.version` is the stored
 /// version (0 when nothing is stored), and returns the new version. The read,
 /// the comparison and the write happen in one transaction.
+///
+/// An image background must be the picture the user has uploaded: [`validate`]
+/// checks the shape of the id, and the transaction checks it against the
+/// user's row, so a picture removed or replaced in between is never saved.
+/// That is a `bad_image` on `background.id`, before the version is looked at.
 pub async fn save(core: &Core, user_id: i64, layout: &Layout) -> Result<u64, SaveError> {
     validate(layout).map_err(SaveError::Invalid)?;
     let expected = layout.version;
@@ -94,8 +108,22 @@ pub async fn save(core: &Core, user_id: i64, layout: &Layout) -> Result<u64, Sav
     let doc = serde_json::to_string(&next).map_err(SaveError::Encode)?;
     let now = jiff::Timestamp::now().to_string();
 
-    let outcome: Result<u64, u64> = db::interact(&core.db, move |c| {
+    let image = match &next.background {
+        Background::Image { id } => Some(id.clone()),
+        Background::Preset { .. } => None,
+    };
+    let outcome = db::interact(&core.db, move |c| {
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(id) = image {
+            let own: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM backgrounds WHERE user_id = ?1 AND id = ?2)",
+                params![user_id, id],
+                |r| r.get(0),
+            )?;
+            if !own {
+                return Ok(Outcome::BadImage);
+            }
+        }
         let stored: u64 = tx
             .query_row(
                 "SELECT version FROM layouts WHERE user_id = ?1",
@@ -105,7 +133,7 @@ pub async fn save(core: &Core, user_id: i64, layout: &Layout) -> Result<u64, Sav
             .optional()?
             .map_or(0, |v| u64::try_from(v).unwrap_or_default());
         if stored != expected {
-            return Ok(Err(stored));
+            return Ok(Outcome::Conflict(stored));
         }
         // Version 0 means "nothing stored", so the first stored version is 1.
         let new = i64::try_from(stored + 1).unwrap_or(i64::MAX);
@@ -116,8 +144,15 @@ pub async fn save(core: &Core, user_id: i64, layout: &Layout) -> Result<u64, Sav
             params![user_id, new, doc, now],
         )?;
         tx.commit()?;
-        Ok(Ok(stored + 1))
+        Ok(Outcome::Saved(stored + 1))
     })
     .await?;
-    outcome.map_err(|current| SaveError::Conflict { current })
+    match outcome {
+        Outcome::Saved(version) => Ok(version),
+        Outcome::Conflict(current) => Err(SaveError::Conflict { current }),
+        Outcome::BadImage => Err(SaveError::Invalid(vec![FieldError {
+            path: "background.id".into(),
+            code: "bad_image",
+        }])),
+    }
 }
