@@ -14,6 +14,8 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use jiff::{SignedDuration, Timestamp};
+use mindful_magpie::integrations::block::{self, Block};
 use mindful_magpie::integrations::{
     self, FetchCtx, FetchError, Integration, Level, Snapshot, Status,
 };
@@ -26,6 +28,8 @@ const TOKEN: &str = "kk-read-token-8f3a91c2d7";
 
 /// What the stub saw and what it answers.
 struct Stub {
+    /// The path the stub lives under (`/stub-N`), taken off every request.
+    prefix: String,
     status: StatusCode,
     body: String,
     hits: AtomicUsize,
@@ -38,7 +42,10 @@ type Shared = Arc<Stub>;
 async fn answer(State(stub): State<Shared>, uri: Uri, headers: HeaderMap) -> Response {
     stub.hits.fetch_add(1, Ordering::SeqCst);
     stub.seen.lock().unwrap().push((
-        uri.path().to_string(),
+        uri.path()
+            .strip_prefix(&stub.prefix)
+            .unwrap_or_else(|| uri.path())
+            .to_string(),
         uri.query().unwrap_or("").to_string(),
     ));
     stub.auth.lock().unwrap().push(
@@ -56,10 +63,15 @@ async fn answer(State(stub): State<Shared>, uri: Uri, headers: HeaderMap) -> Res
         .into_response()
 }
 
+// Each stub lives under a path of its own (`/stub-N`), so no address is ever
+// the same as an earlier test's: the kinds remember a 404 and the like per
+// address, and the operating system hands a freed port to a later stub.
 /// Serves `body` with `status` for any path. Returns the base address and the
 /// stub's record.
 async fn serve(status: u16, body: impl Into<String>) -> (String, Shared) {
+    static N: AtomicUsize = AtomicUsize::new(0);
     let stub = Arc::new(Stub {
+        prefix: format!("/stub-{}", N.fetch_add(1, Ordering::Relaxed)),
         status: StatusCode::from_u16(status).unwrap(),
         body: body.into(),
         hits: AtomicUsize::new(0),
@@ -75,7 +87,7 @@ async fn serve(status: u16, body: impl Into<String>) -> (String, Shared) {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (format!("http://{addr}"), stub)
+    (format!("http://{addr}{}", stub.prefix), stub)
 }
 
 fn ctx(url: &str, secret: Option<&str>) -> FetchCtx {
@@ -773,4 +785,164 @@ fn every_text_the_kind_uses_exists_in_english_and_norwegian() {
         locale_text(nb, "fetch_err.auth").as_deref(),
         Some("Nøkkelen ble avvist")
     );
+}
+
+// ---------------------------------------------------------------------------
+// Details
+
+/// `minutes` ago as Keen Kestrel writes a time (UTC, no zone).
+fn minutes_ago(minutes: i64) -> String {
+    Timestamp::now()
+        .checked_sub(SignedDuration::from_mins(minutes))
+        .unwrap()
+        .strftime("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
+fn issue_at(id: i64, title: &str, level: &str, minutes: i64) -> Json {
+    json!({
+        "id": id, "title": title, "level": level, "substatus": "new",
+        "first_seen": minutes_ago(minutes), "last_seen": minutes_ago(minutes), "events": 3,
+    })
+}
+
+fn named(id: i64, name: &str, newest: Json) -> Json {
+    let mut p = project(id, newest);
+    p["name"] = json!(name);
+    p
+}
+
+/// What the poller stores: the details cut down, and every key known.
+fn stored(mut snapshot: Snapshot) -> Vec<Block> {
+    // The locale lookup needs the kit's configuration.
+    static KIT: std::sync::Once = std::sync::Once::new();
+    KIT.call_once(mindful_magpie::install);
+    snapshot.bound_details();
+    for block in &snapshot.details {
+        for key in block.keys() {
+            assert!(block::key_known(key), "no text for detail.{key}");
+        }
+    }
+    snapshot.details
+}
+
+fn list<'a>(blocks: &'a [Block], title: &str) -> Option<&'a [block::ListItem]> {
+    blocks.iter().find_map(|b| match b {
+        Block::List { title_key, items } if title_key == title => Some(items.as_slice()),
+        _ => None,
+    })
+}
+
+#[tokio::test]
+async fn the_newest_issues_are_listed_newest_first_with_project_level_and_age() {
+    let body = summary(
+        totals(2, 0, 9),
+        vec![
+            named(1, "sylo-web", issue_at(5, "Old failure", "warning", 300)),
+            named(
+                2,
+                "hedgerow-ios",
+                issue_at(9, "Newest failure", "fatal", 14),
+            ),
+            named(3, "sylo-bot", issue_at(7, "Middle one", "info", 120)),
+            named(4, "quiet", Json::Null),
+        ],
+    );
+    let (url, _) = serve(200, body).await;
+    let blocks = stored(fetch(&url, Some(TOKEN)).await.unwrap());
+    let items = list(&blocks, "kk_newest_issues").expect("the list");
+    let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+    assert_eq!(texts, ["Newest failure", "Middle one", "Old failure"]);
+    assert_eq!(items[0].sub.as_deref(), Some("hedgerow-ios"));
+    assert_eq!(items[0].status, Some(Status::Bad));
+    assert_eq!(items[0].right.as_deref(), Some("14 min"));
+    assert_eq!(items[1].status, None);
+    assert_eq!(items[1].right.as_deref(), Some("2 h"));
+    assert_eq!(items[2].status, Some(Status::Warn));
+    // The app has no public address here: no link.
+    assert!(items.iter().all(|i| i.href.is_none()));
+}
+
+#[tokio::test]
+async fn the_numbers_of_the_summary_are_not_repeated_in_a_block() {
+    // The totals are the card's metrics; with no issue anywhere there is
+    // nothing for a block to say.
+    let (url, _) = serve(200, summary(totals(0, 0, 4), vec![])).await;
+    let snapshot = fetch(&url, Some(TOKEN)).await.unwrap();
+    assert_eq!(num(&snapshot, "visitors_today"), Some(120.0));
+    assert!(stored(snapshot).is_empty());
+}
+
+#[tokio::test]
+async fn issues_are_ordered_by_their_time_and_not_their_text() {
+    // Written as text, "2026-11-09 …" sorts before "2026-11-1…" only by luck;
+    // an RFC 3339 time with an offset shows the order is the time's.
+    let body = summary(
+        totals(2, 0, 2),
+        vec![
+            named(1, "later", {
+                let mut i = issue_at(2, "Later in UTC", "error", 10);
+                i["first_seen"] = json!("2026-11-07T23:00:00-05:00");
+                i
+            }),
+            named(2, "earlier", {
+                let mut i = issue_at(3, "Earlier in UTC", "error", 10);
+                i["first_seen"] = json!("2026-11-08T01:00:00Z");
+                i
+            }),
+            named(3, "unreadable", {
+                let mut i = issue_at(4, "No time", "error", 10);
+                i["first_seen"] = json!("sometime");
+                i
+            }),
+        ],
+    );
+    let (url, _) = serve(200, body).await;
+    let blocks = stored(fetch(&url, Some(TOKEN)).await.unwrap());
+    let items = list(&blocks, "kk_newest_issues").expect("the list");
+    let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+    // 23:00 at -05:00 is 04:00 UTC the next day: after 01:00 UTC.
+    assert_eq!(texts, ["Later in UTC", "Earlier in UTC", "No time"]);
+    assert_eq!(items[2].right, None);
+}
+
+#[tokio::test]
+async fn the_newest_issues_are_bounded_at_eight() {
+    let projects = (0..20)
+        .map(|i| {
+            named(
+                i,
+                &format!("p{i}"),
+                issue_at(i, &format!("t{i}"), "error", i + 1),
+            )
+        })
+        .collect();
+    let (url, _) = serve(200, summary(totals(1, 0, 1), projects)).await;
+    let blocks = stored(fetch(&url, Some(TOKEN)).await.unwrap());
+    let items = list(&blocks, "kk_newest_issues").expect("the list");
+    assert_eq!(items.len(), block::MAX_ITEMS);
+    assert_eq!(items[0].text, "t0");
+}
+
+#[tokio::test]
+async fn hostile_titles_and_project_names_stay_text_in_the_blocks() {
+    let evil = format!(
+        "<script>alert(1)</script>\u{202E}evil\u{0}{}",
+        "q".repeat(500)
+    );
+    let body = summary(
+        totals(1, 1, 3),
+        vec![named(1, &evil, issue_at(1, &evil, "error", 1))],
+    );
+    let (url, _) = serve(200, body).await;
+    let snapshot = fetch(&url, Some(TOKEN)).await.unwrap();
+    let outside = serde_json::to_string(&(&snapshot.needs, &snapshot.error)).unwrap();
+    assert!(!outside.contains("script"), "{outside}");
+    let blocks = stored(snapshot);
+    let items = list(&blocks, "kk_newest_issues").expect("the list");
+    for text in [&items[0].text, items[0].sub.as_ref().unwrap()] {
+        assert!(text.starts_with("<script>alert(1)</script>"), "{text}");
+        assert!(!text.contains(['\u{202E}', '\u{0}']), "{text}");
+        assert!(text.chars().count() <= block::TEXT_CHARS);
+    }
 }

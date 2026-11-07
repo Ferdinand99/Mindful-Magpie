@@ -9,16 +9,27 @@
 //! testing the service makes it ask again at once.
 //!
 //! The service's secret is a read token, sent as `Authorization: Bearer`.
-//! Monitor names come from outside: they are shown only as the text value
-//! `first_down`, never in a need. A field that is missing or odd costs only
-//! its own metric.
+//! Monitor names and messages come from outside: they go only into the text
+//! value `first_down` and the detail blocks (cut down by `Block::bounded`),
+//! never into a need. A field that is missing or odd costs only its own
+//! metric.
+//!
+//! **Details.** A summary that lists `down` gives the list «Down now» (name,
+//! message, how long). The kind also remembers, in memory per address, which
+//! monitors were down at the last fetch: one that has left the list since is
+//! «Recently recovered» for 24 hours. Saving or testing the service forgets
+//! that memory (see [`api::on_forget`]). An older server whose summary has no
+//! `down` list gets neither block.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use jiff::Timestamp;
 use serde_json::Value as Json;
 
 use super::api::{self, OldAddresses, Reply};
+use super::block::{Block, ListItem, MAX_ITEMS, TEXT_CHARS};
 use super::{
     BoxFuture, FetchCtx, FetchError, Field, FieldKind, Format, Integration, Level, MetricDef, Need,
     Snapshot, Status, Value,
@@ -40,6 +51,18 @@ pub const DOWN_NEED: &str = "vv:down";
 
 /// The addresses whose `/summary` answered 404.
 static OLD: OldAddresses = OldAddresses::new();
+
+/// What is remembered per address (the key is [`api::service_prefix`]).
+static MEMORY: Mutex<VecDeque<(String, Memory)>> = Mutex::new(VecDeque::new());
+
+/// Most addresses the kind remembers; past that the one used longest ago goes.
+pub const MEMORY_MAX: usize = 64;
+/// How long a monitor that came back is listed.
+const RECOVERED_FOR: Duration = Duration::from_secs(24 * 60 * 60);
+/// Most recovered monitors remembered per address.
+const RECOVERED_MAX: usize = 16;
+/// Most monitors remembered as down per address (the summary lists 25 at most).
+const DOWN_MAX: usize = 100;
 
 static FIELDS: [Field; 1] = [Field {
     key: "secret",
@@ -97,6 +120,18 @@ struct Reading {
     uptime_30d: Option<f64>,
     uptime_24h: Option<f64>,
     first_down: Option<String>,
+    /// The monitors that are down, as a summary lists them; `None` when the
+    /// answer has no list (an older server, or `down` is null).
+    down_list: Option<Vec<Down>>,
+}
+
+/// A monitor in the summary's `down` list. The texts are cleaned lines.
+#[derive(Debug, Clone, PartialEq)]
+struct Down {
+    id: i64,
+    name: String,
+    message: Option<String>,
+    since: Option<Timestamp>,
 }
 
 /// The counts in `monitors`, each as `count` reads it.
@@ -128,7 +163,34 @@ fn summary(doc: &Json) -> Result<Reading, FetchError> {
             .and_then(|list| list.iter().find_map(|d| d.get("name")?.as_str()))
             .map(|name| api::clean_text(name, NAME_CHARS))
             .filter(|name| !name.is_empty()),
+        down_list: doc
+            .get("down")
+            .and_then(Json::as_array)
+            .map(|list| list.iter().filter_map(down_entry).collect()),
         ..counts(monitors, api::count)
+    })
+}
+
+/// One entry of `down`: it needs a number and a name; its message and time
+/// are optional.
+fn down_entry(entry: &Json) -> Option<Down> {
+    let id = entry.get("id")?.as_i64()?;
+    let name = api::clean_text(entry.get("name")?.as_str()?, TEXT_CHARS);
+    if name.is_empty() {
+        return None;
+    }
+    Some(Down {
+        id,
+        name,
+        message: entry
+            .get("message")
+            .and_then(Json::as_str)
+            .map(|m| api::clean_text(m, TEXT_CHARS))
+            .filter(|m| !m.is_empty()),
+        since: entry
+            .get("since")
+            .and_then(Json::as_str)
+            .and_then(api::parse_time),
     })
 }
 
@@ -187,6 +249,141 @@ fn down_need(down: f64) -> Need {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Details
+
+/// What is remembered of an address between fetches.
+#[derive(Debug, Clone, Default)]
+struct Memory {
+    /// The monitors that were down at the last fetch.
+    down: Vec<(i64, String)>,
+    /// The monitors that left the list since, newest first.
+    recovered: Vec<Recovered>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Recovered {
+    id: i64,
+    name: String,
+    at: Timestamp,
+}
+
+impl Memory {
+    /// Takes in a fetch at `now` that listed `down`. A monitor that was down
+    /// at the last fetch and is not now is recovered; one that is down again is
+    /// not; one older than [`RECOVERED_FOR`] is forgotten. When the list was
+    /// cut short (more monitors are down than it names) a missing one may only
+    /// be cut off, so nothing counts as recovered then.
+    fn track(&mut self, now: Timestamp, down: &[Down], cut_short: bool) {
+        let still = |id: i64| down.iter().any(|d| d.id == id);
+        self.recovered.retain(|r| {
+            !still(r.id)
+                && now
+                    .as_second()
+                    .saturating_sub(r.at.as_second())
+                    .unsigned_abs()
+                    < RECOVERED_FOR.as_secs()
+        });
+        if !cut_short {
+            for (id, name) in &self.down {
+                if !still(*id) {
+                    self.recovered.retain(|r| r.id != *id);
+                    self.recovered.insert(
+                        0,
+                        Recovered {
+                            id: *id,
+                            name: name.clone(),
+                            at: now,
+                        },
+                    );
+                }
+            }
+            self.down.clear();
+        }
+        for d in down {
+            if !self.down.iter().any(|(id, _)| *id == d.id) {
+                self.down.push((d.id, d.name.clone()));
+            }
+        }
+        self.down.truncate(DOWN_MAX);
+        self.recovered.truncate(RECOVERED_MAX);
+    }
+}
+
+/// Runs `f` on the memory of `key` (made if it is not there), which then
+/// counts as the most recently used.
+fn remember<R>(key: &str, f: impl FnOnce(&mut Memory) -> R) -> R {
+    // Saving or testing the service forgets what is remembered of it.
+    api::on_forget(forget);
+    // A panic elsewhere cannot leave the list in a state that matters.
+    let mut list = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut entry = match list.iter().position(|(k, _)| k == key) {
+        Some(at) => list.remove(at).expect("the position is in the list"),
+        None => {
+            while list.len() >= MEMORY_MAX {
+                list.pop_front();
+            }
+            (key.to_string(), Memory::default())
+        }
+    };
+    let out = f(&mut entry.1);
+    list.push_back(entry);
+    out
+}
+
+/// Forgets the memory of the service at `prefix` (see [`api::service_prefix`]).
+fn forget(prefix: &str) {
+    MEMORY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(key, _)| key != prefix);
+}
+
+/// The blocks of a summary: «Down now» and «Recently recovered». None without
+/// a `down` list in the answer.
+fn details(key: &str, reading: &Reading, now: Timestamp) -> Vec<Block> {
+    let Some(down) = &reading.down_list else {
+        return Vec::new();
+    };
+    let cut_short = reading.down.is_some_and(|n| n > down.len() as f64);
+    let recovered = remember(key, |memory| {
+        memory.track(now, down, cut_short);
+        memory.recovered.clone()
+    });
+    vec![
+        Block::List {
+            title_key: "vv_down_now".to_string(),
+            items: down
+                .iter()
+                .take(MAX_ITEMS)
+                .map(|d| ListItem {
+                    text: d.name.clone(),
+                    sub: d.message.clone(),
+                    status: Some(Status::Bad),
+                    right: d.since.map(|since| api::age_text(since, now)),
+                    href: None,
+                    ..Default::default()
+                })
+                .collect(),
+        },
+        Block::List {
+            title_key: "vv_recovered".to_string(),
+            items: recovered
+                .iter()
+                .take(MAX_ITEMS)
+                .map(|r| ListItem {
+                    text: r.name.clone(),
+                    sub: None,
+                    status: Some(Status::Ok),
+                    right: Some(api::age_text(r.at, now)),
+                    href: None,
+                    ..Default::default()
+                })
+                .collect(),
+        },
+    ]
+}
+
 async fn read(ctx: &FetchCtx) -> Result<Snapshot, FetchError> {
     let base = api::base_url(&ctx.settings)?;
     let auth = api::Credential::bearer(ctx.secret.as_deref())?;
@@ -197,7 +394,9 @@ async fn read(ctx: &FetchCtx) -> Result<Snapshot, FetchError> {
         match api::get_json::<Json>(&ctx.http, url, &auth).await? {
             Reply::Found(doc) => {
                 OLD.forget(&key);
-                return summary(&doc).map(snapshot);
+                let reading = summary(&doc)?;
+                let blocks = details(&api::service_prefix(&base), &reading, Timestamp::now());
+                return Ok(snapshot(reading).with_details(blocks));
             }
             Reply::NotFound => OLD.mark(&key, Instant::now()),
         }
@@ -275,6 +474,80 @@ mod tests {
         assert_eq!(reading.uptime_30d, Some(100.0));
         assert_eq!(reading.uptime_24h, Some(0.0));
         assert_eq!(reading.first_down.as_deref(), Some("ab c"));
+    }
+
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_second(1_800_000_000 + secs).unwrap()
+    }
+
+    fn down(id: i64, name: &str) -> Down {
+        Down {
+            id,
+            name: name.to_string(),
+            message: None,
+            since: None,
+        }
+    }
+
+    #[test]
+    fn a_monitor_that_leaves_the_list_is_recovered_for_a_day() {
+        let mut memory = Memory::default();
+        memory.track(at(0), &[down(1, "a"), down(2, "b")], false);
+        assert!(memory.recovered.is_empty());
+        memory.track(at(60), &[down(2, "b")], false);
+        assert_eq!(memory.recovered.len(), 1);
+        assert_eq!(memory.recovered[0].name, "a");
+        assert_eq!(memory.recovered[0].at, at(60));
+        // Still there at the next fetch, with its first time.
+        memory.track(at(120), &[down(2, "b")], false);
+        assert_eq!(memory.recovered[0].at, at(60));
+        // Gone after a day.
+        let later = 60 + RECOVERED_FOR.as_secs() as i64;
+        memory.track(at(later), &[down(2, "b")], false);
+        assert!(memory.recovered.is_empty());
+    }
+
+    #[test]
+    fn a_monitor_that_is_down_again_is_not_recovered() {
+        let mut memory = Memory::default();
+        memory.track(at(0), &[down(1, "a")], false);
+        memory.track(at(60), &[], false);
+        assert_eq!(memory.recovered.len(), 1);
+        memory.track(at(120), &[down(1, "a")], false);
+        assert!(memory.recovered.is_empty());
+        // And going away again starts over with a new time.
+        memory.track(at(180), &[], false);
+        assert_eq!(memory.recovered[0].at, at(180));
+    }
+
+    #[test]
+    fn a_cut_short_list_recovers_nothing_and_forgets_nothing() {
+        let mut memory = Memory::default();
+        memory.track(at(0), &[down(1, "a"), down(2, "b")], false);
+        memory.track(at(60), &[down(2, "b")], true);
+        assert!(memory.recovered.is_empty());
+        // `a` is still remembered as down, so it is recovered when the list
+        // is whole again and does not have it.
+        memory.track(at(120), &[down(2, "b")], false);
+        assert_eq!(memory.recovered[0].name, "a");
+    }
+
+    #[test]
+    fn what_is_remembered_is_bounded() {
+        let mut memory = Memory::default();
+        let many: Vec<Down> = (0..500).map(|i| down(i, "m")).collect();
+        memory.track(at(0), &many, false);
+        assert_eq!(memory.down.len(), DOWN_MAX);
+        memory.track(at(60), &[], false);
+        assert_eq!(memory.recovered.len(), RECOVERED_MAX);
+        for n in 0..(MEMORY_MAX + 10) {
+            remember(&format!("http://bounded-{n}.test/"), |m| {
+                m.down.push((1, "x".into()))
+            });
+        }
+        let held = MEMORY.lock().unwrap().len();
+        assert!(held <= MEMORY_MAX, "{held}");
+        forget("http://bounded-80.test/");
     }
 
     #[test]

@@ -14,13 +14,22 @@
 //! response text into an error. The only text taken from the answer is the
 //! newest issue's title, and it goes into a `text` metric only: needs carry
 //! a count. A field that is missing or odd costs only its own metric.
+//!
+//! **Details.** The newest issue of each project becomes the list «Newest
+//! issues» (newest first; project name below the title, the level as the
+//! status dot, how long ago it was first seen at the right; no link, since
+//! this kind has no public address of the app). The numbers of the summary
+//! are the card's metrics, so no block repeats them. Titles and project names
+//! come from outside and go only into the blocks.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+use jiff::Timestamp;
 use serde_json::Value as Json;
 
 use super::api::{self, OldAddresses, Reply};
+use super::block::{Block, ListItem, MAX_ITEMS, TEXT_CHARS};
 use super::{
     BoxFuture, FetchCtx, FetchError, Field, FieldKind, Format, Integration, Level, MetricDef, Need,
     Snapshot, Status, Value,
@@ -108,6 +117,64 @@ fn newest_title(doc: &Json) -> Option<String> {
         .filter(|title| !title.is_empty())
 }
 
+/// The issue level as a status dot: errors are bad, warnings warn, anything
+/// else shows none.
+fn level_status(level: &str) -> Option<Status> {
+    match level {
+        "error" | "fatal" => Some(Status::Bad),
+        "warning" => Some(Status::Warn),
+        _ => None,
+    }
+}
+
+/// The list of each project's newest issue, newest first (the later
+/// `first_seen` by its time, not its text, then the higher id; one whose time
+/// can't be read goes last). `None` when no project has one.
+fn newest_issues(doc: &Json, now: Timestamp) -> Option<Block> {
+    let projects = doc.get("projects")?.as_array()?;
+    let mut issues: Vec<(Option<Timestamp>, i64, ListItem)> = projects
+        .iter()
+        .filter_map(|p| {
+            let issue = p.get("newest_issue")?;
+            let first_seen = issue.get("first_seen")?.as_str()?;
+            let id = issue.get("id")?.as_i64()?;
+            let title = api::clean_text(issue.get("title")?.as_str()?, TEXT_CHARS);
+            if title.is_empty() {
+                return None;
+            }
+            let first_seen = api::parse_time(first_seen);
+            Some((
+                first_seen,
+                id,
+                ListItem {
+                    text: title,
+                    sub: p
+                        .get("name")
+                        .and_then(Json::as_str)
+                        .map(|name| api::clean_text(name, TEXT_CHARS))
+                        .filter(|name| !name.is_empty()),
+                    status: issue
+                        .get("level")
+                        .and_then(Json::as_str)
+                        .and_then(level_status),
+                    right: first_seen.map(|at| api::age_text(at, now)),
+                    href: None,
+                    ..Default::default()
+                },
+            ))
+        })
+        .collect();
+    issues.sort_by_key(|(at, id, _)| std::cmp::Reverse((*at, *id)));
+    (!issues.is_empty()).then(|| Block::List {
+        title_key: "kk_newest_issues".to_string(),
+        items: issues
+            .into_iter()
+            .take(MAX_ITEMS)
+            .map(|(_, _, item)| item)
+            .collect(),
+    })
+}
+
 /// A need with a count: the key and the label are fixed, and the score is the
 /// count, so an acknowledgement is undone only when it grows. The page adds
 /// the service's name, so there is no `name` param.
@@ -174,6 +241,9 @@ fn read_summary(doc: &Json) -> Result<Snapshot, FetchError> {
     };
 
     let mut snapshot = Snapshot::new(status);
+    snapshot.details = newest_issues(doc, snapshot.fetched_at)
+        .into_iter()
+        .collect();
     snapshot.values = values;
     snapshot.needs = needs;
     Ok(snapshot)

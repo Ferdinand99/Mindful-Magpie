@@ -13,6 +13,7 @@ use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use jiff::{SignedDuration, Timestamp};
+use mindful_magpie::integrations::block::{self, Block};
 use mindful_magpie::integrations::{
     self, FetchCtx, FetchError, Format, Level, Snapshot, Status, error_text_key,
 };
@@ -705,9 +706,11 @@ async fn names_from_wise_wren_never_reach_the_needs_or_the_error() {
     );
     let s = fetch(&base).await;
     assert_eq!(s.needs.len(), 2);
-    let stored = serde_json::to_string(&s).unwrap();
-    assert!(!stored.contains("script"), "{stored}");
-    assert!(!stored.contains("Tower"), "{stored}");
+    // The names go into the detail blocks only (as text, cut down by the
+    // poller): not into the numbers, the needs or the error.
+    let outside = serde_json::to_string(&(&s.values, &s.needs, &s.error)).unwrap();
+    assert!(!outside.contains("script"), "{outside}");
+    assert!(!outside.contains("Tower"), "{outside}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1011,4 +1014,206 @@ async fn a_redirect_to_another_origin_is_refused_and_never_carries_the_token() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     assert_eq!(fetch_err(&redirecting).await, FetchError::RedirectScheme);
     assert!(other_stub.seen().is_empty(), "{:?}", other_stub.seen());
+}
+
+// ---------------------------------------------------------------------------
+// Details
+
+/// What the poller stores: the details cut down, and every key known.
+fn stored(mut snapshot: Snapshot) -> Vec<Block> {
+    // The locale lookup needs the kit's configuration.
+    static KIT: std::sync::Once = std::sync::Once::new();
+    KIT.call_once(mindful_magpie::install);
+    snapshot.bound_details();
+    for block in &snapshot.details {
+        for key in block.keys() {
+            assert!(block::key_known(key), "no text for detail.{key}");
+        }
+    }
+    snapshot.details
+}
+
+fn list<'a>(blocks: &'a [Block], title: &str) -> Option<&'a [block::ListItem]> {
+    blocks.iter().find_map(|b| match b {
+        Block::List { title_key, items } if title_key == title => Some(items.as_slice()),
+        _ => None,
+    })
+}
+
+fn facts<'a>(blocks: &'a [Block], title: &str) -> Option<Vec<(&'a str, &'a str)>> {
+    blocks.iter().find_map(|b| match b {
+        Block::Facts { title_key, rows } if title_key == title => Some(
+            rows.iter()
+                .map(|r| (r.label_key.as_deref().unwrap_or_default(), r.value.as_str()))
+                .collect(),
+        ),
+        _ => None,
+    })
+}
+
+#[tokio::test]
+async fn the_ready_updates_list_the_target_versions_and_server() {
+    let (base, stub) = serve().await;
+    quiet(&stub);
+    stub.ok(
+        UPDATES,
+        &json!({ "targets": [
+            { "id": 1, "name": "sonarr", "image": "lscr.io/sonarr:latest", "status": "update",
+              "server": { "id": 1, "name": "Tower" },
+              "installed_version": "4.0.10", "latest_version": "4.0.11" },
+            { "id": 2, "name": "postiz", "image": "ghcr.io/postiz:latest", "status": "update",
+              "server": { "id": 2, "name": "LANBox" },
+              "installed_version": "", "latest_version": "",
+              "release_notes": { "url": "https://x.example/", "title": "v2.1.0" } },
+            { "id": 3, "name": "traefik", "image": "traefik:3", "status": "update",
+              "server": { "id": 1, "name": "Tower" } },
+            { "id": 4, "name": "done", "status": "current", "server": { "id": 1, "name": "Tower" } },
+        ] }),
+    );
+    let blocks = stored(fetch(&base).await);
+    let items = list(&blocks, "ww_ready_updates").expect("the list");
+    let lines: Vec<(&str, Option<&str>, Option<&str>)> = items
+        .iter()
+        .map(|i| (i.text.as_str(), i.sub.as_deref(), i.right.as_deref()))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            ("sonarr", Some("4.0.10 → 4.0.11"), Some("Tower")),
+            ("postiz", Some("v2.1.0"), Some("LANBox")),
+            ("traefik", Some("traefik:3"), Some("Tower")),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_ready_updates_are_bounded_at_eight_and_none_gives_no_list() {
+    let (base, stub) = serve().await;
+    quiet(&stub);
+    stub.ok(UPDATES, &updates(30));
+    let blocks = stored(fetch(&base).await);
+    assert_eq!(
+        list(&blocks, "ww_ready_updates").unwrap().len(),
+        block::MAX_ITEMS
+    );
+
+    stub.ok(UPDATES, &updates(0));
+    assert!(list(&stored(fetch(&base).await), "ww_ready_updates").is_none());
+}
+
+#[tokio::test]
+async fn the_last_run_is_a_fact_with_its_result_and_the_day_is_counted() {
+    let (base, stub) = serve().await;
+    quiet(&stub);
+    stub.ok(
+        RUNS,
+        &runs(&[
+            (7, 1, "failed", Some(ago(1))),
+            (6, 2, "succeeded", Some(ago(3))),
+            (5, 3, "succeeded", Some(ago(30))),
+            (4, 4, "succeeded", Some(ago(5))),
+        ]),
+    );
+    let blocks = stored(fetch(&base).await);
+    assert_eq!(
+        facts(&blocks, "ww_last_run").expect("the facts"),
+        [
+            ("ww_run_failed", "target-1 · Server-1 · 1 h"),
+            ("ww_runs_updated_24h", "2"),
+            ("ww_runs_failed_24h", "1"),
+        ]
+    );
+
+    // A status the kind does not know still gets a label; no runs, no block.
+    stub.ok(RUNS, &runs(&[(8, 1, "teleporting", Some(ago(1)))]));
+    let blocks = stored(fetch(&base).await);
+    let rows = facts(&blocks, "ww_last_run").unwrap();
+    assert_eq!(rows[0].0, "ww_run_other");
+    stub.ok(RUNS, &runs(&[]));
+    assert!(facts(&stored(fetch(&base).await), "ww_last_run").is_none());
+}
+
+#[tokio::test]
+async fn the_agents_are_a_list_with_a_dot_each() {
+    let (base, stub) = serve().await;
+    quiet(&stub);
+    stub.ok(
+        SERVERS,
+        &servers(&["online", "offline", "waiting", "no_token"]),
+    );
+    let blocks = stored(fetch(&base).await);
+    let items = list(&blocks, "ww_agents").expect("the list");
+    let dots: Vec<Option<Status>> = items.iter().map(|i| i.status).collect();
+    assert_eq!(
+        dots,
+        [
+            Some(Status::Ok),
+            Some(Status::Bad),
+            Some(Status::Unknown),
+            Some(Status::Unknown)
+        ]
+    );
+    assert_eq!(items[0].text, "Server-1");
+    // Only an agent that is not online says when it was last seen.
+    assert_eq!(items[0].right, None);
+    assert!(items[1].right.as_deref().unwrap().ends_with(" d"));
+}
+
+#[tokio::test]
+async fn names_from_wise_wren_are_text_in_the_blocks_and_cut_down() {
+    let (base, stub) = serve().await;
+    let hostile = format!(
+        "<script>alert(1)</script>\u{202E}evil\u{7}{}",
+        "w".repeat(300)
+    );
+    stub.ok(
+        SERVERS,
+        &json!({ "servers": [{ "id": 1, "name": hostile, "status": "offline" }] }),
+    );
+    stub.ok(
+        UPDATES,
+        &json!({ "targets": [{ "id": 1, "name": hostile, "image": hostile, "status": "update",
+            "server": { "id": 1, "name": hostile },
+            "installed_version": hostile, "latest_version": hostile }] }),
+    );
+    stub.ok(
+        RUNS,
+        &json!({ "runs": [{ "id": 1, "status": "failed", "created_at": ago(1), "finished_at": ago(1),
+            "server": { "id": 1, "name": hostile },
+            "target": { "id": 1, "kind": "container", "name": hostile } }] }),
+    );
+    let blocks = stored(fetch(&base).await);
+    let mut texts: Vec<String> = Vec::new();
+    for block in &blocks {
+        match block {
+            Block::List { items, .. } => {
+                for i in items {
+                    texts.push(i.text.clone());
+                    texts.extend(i.sub.clone());
+                    texts.extend(i.right.clone());
+                }
+            }
+            Block::Facts { rows, .. } => texts.extend(rows.iter().map(|r| r.value.clone())),
+            _ => {}
+        }
+    }
+    assert!(texts.len() >= 6, "{texts:?}");
+    for text in texts {
+        assert!(text.chars().count() <= block::TEXT_CHARS, "{text}");
+        assert!(!text.contains(['\u{202E}', '\u{7}']), "{text}");
+    }
+    let ready = list(&blocks, "ww_ready_updates").unwrap();
+    assert!(ready[0].text.starts_with("<script>alert(1)</script>"));
+}
+
+#[tokio::test]
+async fn a_failing_call_leaves_only_its_own_blocks_out() {
+    let (base, stub) = serve().await;
+    stub.ok(SERVERS, &servers(&["online"]));
+    stub.reply(UPDATES, 500, "");
+    stub.ok(RUNS, &runs(&[(5, 1, "succeeded", Some(ago(2)))]));
+    let blocks = stored(fetch(&base).await);
+    assert!(list(&blocks, "ww_ready_updates").is_none());
+    assert!(list(&blocks, "ww_agents").is_some());
+    assert!(facts(&blocks, "ww_last_run").is_some());
 }

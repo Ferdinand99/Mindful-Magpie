@@ -1611,3 +1611,66 @@ async fn a_site_that_never_answers_is_bad_with_a_timeout_and_the_others_go_on() 
         calls("t_real_other").len()
     );
 }
+
+/// The prefixes the kinds' memory was told to forget (see
+/// `integrations::api::on_forget`).
+static FORGOTTEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn note_forgotten(prefix: &str) {
+    FORGOTTEN.lock().unwrap().push(prefix.to_string());
+}
+
+fn forgotten(prefix: &str) -> usize {
+    FORGOTTEN
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|p| p.as_str() == prefix)
+        .count()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_removed_service_makes_the_kinds_forget_its_address_unless_another_still_uses_it() {
+    integrations::api::on_forget(note_forgotten);
+    let app = App::new().await;
+    tokio::time::pause();
+    let poller = start_with(&app, stub_kinds, 1000).await;
+    let shared = "http://forget-shared.example/app/";
+    let alone = "http://forget-alone.example/";
+    let add = |name: &'static str, tag: &'static str, url: &'static str| {
+        add_service(
+            &app,
+            "stub",
+            name,
+            Some(url.to_string()),
+            json!({ "tag": tag, "marker": "" }),
+            600,
+        )
+    };
+    let (a, b) = (
+        add("A", "t_fg_a", shared).await,
+        add("B", "t_fg_b", shared).await,
+    );
+    let c = add("C", "t_fg_c", alone).await;
+    for id in [a, b, c] {
+        poller.reload(id);
+        wait_snapshot(&poller, id, |_| true).await;
+    }
+    let (shared_before, alone_before) = (forgotten(shared), forgotten(alone));
+    let mut rx = poller.subscribe();
+
+    // Two services share an address: the first one to go leaves the memory.
+    poller.remove_for_tests(a);
+    wait_removed(&mut rx, a).await;
+    assert_eq!(forgotten(shared), shared_before, "B still polls it");
+
+    // The last one takes it with it.
+    poller.remove_for_tests(b);
+    wait_removed(&mut rx, b).await;
+    assert_eq!(forgotten(shared), shared_before + 1);
+    assert_eq!(forgotten(alone), alone_before, "C is untouched");
+
+    poller.remove_for_tests(c);
+    wait_removed(&mut rx, c).await;
+    assert_eq!(forgotten(alone), alone_before + 1);
+}

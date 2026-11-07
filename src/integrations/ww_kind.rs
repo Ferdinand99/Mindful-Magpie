@@ -7,8 +7,16 @@
 //! the newest runs, never followed on). A call that fails costs only its own
 //! numbers: the reading turns bad, says why, and keeps what the other calls
 //! gave (when none of them gave anything the fetch is an `Err`). Wise Wren's
-//! own names (servers, targets, images) are never kept: the
-//! reading holds numbers only.
+//! own names (servers, targets, images, versions) go only into the detail
+//! blocks, which `Block::bounded` cuts down; the metrics and needs hold
+//! numbers only.
+//!
+//! **Details.** «Ready updates» lists the targets with a new version (name,
+//! the versions or release title or image below it, the server at the right),
+//! «Last run» is the newest run (its result as the label, target, server and
+//! age as the value) with how many updates went through and failed in the last
+//! 24 hours, and «Agents» lists the servers with a status dot (online,
+//! offline, anything else unknown).
 //!
 //! The token is sent as `Authorization: Bearer`, marked sensitive so it stays
 //! out of debug output.
@@ -16,13 +24,13 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use jiff::tz::TimeZone;
-use jiff::{SignedDuration, Timestamp, civil};
+use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use url::Url;
 
 use super::api;
+use super::block::{Block, Fact, ListItem, MAX_ITEMS, TEXT_CHARS};
 use super::{
     BoxFuture, FetchCtx, FetchError, Field, FieldKind, Format, Integration, Level, MetricDef, Need,
     Snapshot, Status, Value,
@@ -141,7 +149,18 @@ struct ServerList {
 #[derive(Deserialize)]
 struct Server {
     #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
     status: Option<String>,
+    #[serde(default)]
+    last_seen_at: Option<String>,
+}
+
+/// A server as another record names it.
+#[derive(Deserialize)]
+struct ServerRef {
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -153,6 +172,24 @@ struct TargetList {
 struct Target {
     #[serde(default)]
     status: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    image: Option<String>,
+    #[serde(default)]
+    server: Option<ServerRef>,
+    #[serde(default)]
+    installed_version: Option<String>,
+    #[serde(default)]
+    latest_version: Option<String>,
+    #[serde(default)]
+    release_notes: Option<ReleaseNotes>,
+}
+
+#[derive(Deserialize)]
+struct ReleaseNotes {
+    #[serde(default)]
+    title: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -167,6 +204,8 @@ struct Run {
     #[serde(default)]
     target: Option<RunTarget>,
     #[serde(default)]
+    server: Option<ServerRef>,
+    #[serde(default)]
     status: Option<String>,
     #[serde(default)]
     created_at: Option<String>,
@@ -180,6 +219,8 @@ struct Run {
 struct RunTarget {
     #[serde(default)]
     id: Option<i64>,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 impl Run {
@@ -188,18 +229,8 @@ impl Run {
         [&self.finished_at, &self.started_at, &self.created_at]
             .into_iter()
             .flatten()
-            .find_map(|text| parse_time(text))
+            .find_map(|text| api::parse_time(text))
     }
-}
-
-/// A time as Wise Wren writes it (`2026-10-23 10:00:00`, UTC) or as RFC 3339.
-fn parse_time(text: &str) -> Option<Timestamp> {
-    let text = text.trim();
-    if let Ok(at) = text.parse::<Timestamp>() {
-        return Some(at);
-    }
-    let at: civil::DateTime = text.parse().ok()?;
-    Some(at.to_zoned(TimeZone::UTC).ok()?.timestamp())
 }
 
 /// One call to `/api/v1/<last>`. A 404 is an error too: there is nothing to
@@ -263,6 +294,7 @@ fn reading(
     let mut snapshot = Snapshot::new(Status::Ok);
     let mut error = None;
     let (mut offline, mut failed) = (0, 0);
+    let (mut ready_block, mut run_block, mut agents_block) = (None, None, None);
 
     match servers {
         Ok(servers) => {
@@ -273,6 +305,7 @@ fn reading(
                     .count()
             };
             offline = count("offline");
+            agents_block = agents_list(&servers, now);
             snapshot
                 .values
                 .insert("agents_online".into(), Value::num(count("online") as f64));
@@ -292,6 +325,7 @@ fn reading(
             snapshot
                 .values
                 .insert("updates_ready".into(), Value::num(ready as f64));
+            ready_block = ready_list(&targets);
         }
         Err(err) => error = Some(worse(error, err)),
     }
@@ -301,6 +335,7 @@ fn reading(
             snapshot
                 .values
                 .insert("failed_targets".into(), Value::num(failed as f64));
+            run_block = last_run_facts(&runs, now);
             let newest = runs.iter().max_by_key(|run| run.id);
             if let Some(at) = newest.and_then(Run::time) {
                 snapshot
@@ -317,6 +352,10 @@ fn reading(
         // Nothing could be read at all.
         return Err(err);
     }
+    snapshot.details = [ready_block, run_block, agents_block]
+        .into_iter()
+        .flatten()
+        .collect();
     if failed > 0 {
         snapshot
             .needs
@@ -342,6 +381,139 @@ fn reading(
         Status::Ok
     };
     Ok(snapshot)
+}
+
+/// A name or text from Wise Wren for a block (cut down again by `bounded`).
+fn text(text: Option<&str>) -> Option<String> {
+    text.map(|t| api::clean_text(t, TEXT_CHARS))
+        .filter(|t| !t.is_empty())
+}
+
+/// The list of targets with a new version: the name, `installed → latest`
+/// when Wise Wren knows both versions (else the release's title, else the
+/// image), and the server.
+fn ready_list(targets: &[Target]) -> Option<Block> {
+    let items: Vec<ListItem> = targets
+        .iter()
+        .filter(|t| t.status.as_deref().is_none_or(|s| s == "update"))
+        .filter_map(|t| {
+            let versions = match (
+                text(t.installed_version.as_deref()),
+                text(t.latest_version.as_deref()),
+            ) {
+                (Some(from), Some(to)) => Some(format!("{from} → {to}")),
+                _ => None,
+            };
+            Some(ListItem {
+                text: text(t.name.as_deref())?,
+                sub: versions
+                    .or_else(|| text(t.release_notes.as_ref()?.title.as_deref()))
+                    .or_else(|| text(t.image.as_deref())),
+                status: None,
+                right: t.server.as_ref().and_then(|s| text(s.name.as_deref())),
+                href: None,
+                ..Default::default()
+            })
+        })
+        .take(MAX_ITEMS)
+        .collect();
+    (!items.is_empty()).then(|| Block::List {
+        title_key: "ww_ready_updates".to_string(),
+        items,
+    })
+}
+
+/// The newest run (the highest id) as a fact whose label is its result, and
+/// how many updates went through and failed in the last 24 hours. `None`
+/// without a run.
+fn last_run_facts(runs: &[Run], now: Timestamp) -> Option<Block> {
+    let newest = runs.iter().max_by_key(|run| run.id)?;
+    let status = newest.status.as_deref().unwrap_or_default();
+    let label_key = match status {
+        "queued" | "running" | "succeeded" | "rolled_back" | "failed" | "rollback_failed"
+        | "refused" | "cancelled" | "lapsed" => format!("ww_run_{status}"),
+        _ => "ww_run_other".to_string(),
+    };
+    let value = [
+        text(newest.target.as_ref().and_then(|t| t.name.as_deref())),
+        text(newest.server.as_ref().and_then(|s| s.name.as_deref())),
+        newest.time().map(|at| api::age_text(at, now)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ");
+    let mut rows = vec![Fact {
+        label_key: Some(label_key),
+        label: None,
+        value: if value.is_empty() {
+            "-".to_string()
+        } else {
+            value
+        },
+        ..Default::default()
+    }];
+    let (mut updated, mut failed) = (0, 0);
+    for run in runs {
+        let status = run.status.as_deref().unwrap_or_default();
+        let recent = run
+            .time()
+            .is_some_and(|at| now.duration_since(at) <= SignedDuration::from_hours(24));
+        if recent && status == "succeeded" {
+            updated += 1;
+        } else if recent && FAILED.contains(&status) {
+            failed += 1;
+        }
+    }
+    for (count, label_key) in [
+        (updated, "ww_runs_updated_24h"),
+        (failed, "ww_runs_failed_24h"),
+    ] {
+        if count > 0 {
+            rows.push(Fact {
+                label_key: Some(label_key.to_string()),
+                label: None,
+                value: count.to_string(),
+                ..Default::default()
+            });
+        }
+    }
+    Some(Block::Facts {
+        title_key: "ww_last_run".to_string(),
+        rows,
+    })
+}
+
+/// The agents, one line each with a status dot: online is ok, offline is bad,
+/// waiting and without a token are unknown. An agent that is not online says
+/// how long ago it was last seen.
+fn agents_list(servers: &[Server], now: Timestamp) -> Option<Block> {
+    let items: Vec<ListItem> = servers
+        .iter()
+        .filter_map(|s| {
+            let status = match s.status.as_deref() {
+                Some("online") => Status::Ok,
+                Some("offline") => Status::Bad,
+                _ => Status::Unknown,
+            };
+            let seen = s.last_seen_at.as_deref().and_then(api::parse_time);
+            Some(ListItem {
+                text: text(s.name.as_deref())?,
+                sub: None,
+                status: Some(status),
+                right: seen
+                    .filter(|_| status != Status::Ok)
+                    .map(|at| api::age_text(at, now)),
+                href: None,
+                ..Default::default()
+            })
+        })
+        .take(MAX_ITEMS)
+        .collect();
+    (!items.is_empty()).then(|| Block::List {
+        title_key: "ww_agents".to_string(),
+        items,
+    })
 }
 
 /// A need whose only parameter is how many: the chip shows the service's name
