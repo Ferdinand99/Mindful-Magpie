@@ -1,0 +1,37 @@
+# Mindful Magpie's own interface strings (English, the source). Core strings
+# (sign-in, setup, users, tokens, Security, General, the layout) come from
+# vole-kit; a key may live in only one of the two.
+
+[start]
+title = "Start"
+
+# Texts the kit's pages take from the product
+# (vole_kit::i18n::catalog::PRODUCT_KEYS).
+
+[login]
+subtitle = "Welcome back. Log in to open your start page."
+
+[setup]
+site_name_placeholder = "Home start page…"
+tz_after = ". You can change this in Settings."
+
+[users]
+roles_help = "Viewers can look but not change anything. Editors can change the start page. Admins can do everything, including users."
+
+[tokens]
+sub = "Let scripts and AI assistants read your start page."
+scope_read_sub = "Links and services on the start page"
+
+[auth]
+all_set = "You’re all set. Your start page is ready."
+setup_token_required = "This instance needs a setup token. Open /setup?token=… with the value of MM_SETUP_TOKEN from the server’s configuration."
+
+[error]
+back = "Back to the start page"
+
+# Texts of the kit's General page
+# (vole_kit::i18n::catalog::GENERAL_PRODUCT_KEYS).
+
+[general]
+sub = "How this instance names itself, where it is reached and how it tells time."
+base_url_help = "Where people reach this instance: used in links. If MM_PUBLIC_URL is set on the server, it replaces this at every start."

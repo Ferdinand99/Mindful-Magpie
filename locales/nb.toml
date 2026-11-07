@@ -1,0 +1,37 @@
+# Mindful Magpies egne grensesnitttekster (norsk bokmål). Kjernetekstene
+# (innlogging, oppsett, brukere, tokens, Sikkerhet, Generelt, layouten) kommer
+# fra vole-kit; en nøkkel kan bare finnes ett av stedene.
+
+[start]
+title = "Start"
+
+# Tekster kitets sider henter fra produktet
+# (vole_kit::i18n::catalog::PRODUCT_KEYS).
+
+[login]
+subtitle = "Velkommen tilbake. Logg inn for å åpne startsiden din."
+
+[setup]
+site_name_placeholder = "Startside hjemme…"
+tz_after = ". Dette kan endres i Innstillinger."
+
+[users]
+roles_help = "Lesere kan se, men ikke endre noe. Redaktører kan endre startsiden. Administratorer kan gjøre alt, også brukere."
+
+[tokens]
+sub = "La skript og KI-assistenter lese startsiden din."
+scope_read_sub = "Lenker og tjenester på startsiden"
+
+[auth]
+all_set = "Alt er klart. Startsiden din er klar."
+setup_token_required = "Denne instansen krever en oppsettsnøkkel. Åpne /setup?token=… med verdien av MM_SETUP_TOKEN fra serverens konfigurasjon."
+
+[error]
+back = "Tilbake til startsiden"
+
+# Tekster på kitets Generelt-side
+# (vole_kit::i18n::catalog::GENERAL_PRODUCT_KEYS).
+
+[general]
+sub = "Hva instansen heter, hvor den nås, og hvilken tidssone den viser tider i."
+base_url_help = "Adressen folk når instansen på: brukes i lenker. Er MM_PUBLIC_URL satt på serveren, erstatter den verdien ved hver oppstart."

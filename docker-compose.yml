@@ -1,0 +1,30 @@
+services:
+  mindful-magpie:
+    image: ghcr.io/ferdinand99/mindful-magpie:latest
+    # build: .  # build from this checkout instead of pulling the image
+    container_name: mindful-magpie
+    restart: unless-stopped
+    ports:
+      - "3010:3010"
+    volumes:
+      # Database (magpie.sqlite), session key and pre-migration backups. The
+      # container hands this folder to its `magpie` user (uid 1000) on start;
+      # with `user:` set, it must already be writable by that user.
+      - ./data:/data
+    environment:
+      - MM_DATA_DIR=/data
+      # - MM_PUBLIC_URL=https://start.example.com  # the address people use; without it, each request's own
+      # - MM_TRUST_PROXY=1               # behind a reverse proxy (Caddy/Traefik/nginx) that sets X-Forwarded-*
+      # - MM_SETUP_TOKEN=change-me       # /setup only opens with ?token=change-me (unset: a random one is logged at the first start)
+      # - MM_SETUP_OPEN=1                # scripted installs: /setup needs no token
+      # - TZ=Europe/Oslo                 # log timestamps
+      # - RUST_LOG=info,mindful_magpie=debug
+      # Run the app as another uid:gid, e.g. Unraid's nobody:users.
+      # - PUID=99
+      # - PGID=100
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3010/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
