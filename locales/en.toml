@@ -14,6 +14,7 @@ corrupt_reset = "Start over"
 invalid_link = "invalid link"
 group_label = "Group: {title}"
 bookmarks_label = "Bookmarks"
+noscript = "The start page needs JavaScript to show your groups and bookmarks."
 
 [connect]
 title = "Connect the browser extension"

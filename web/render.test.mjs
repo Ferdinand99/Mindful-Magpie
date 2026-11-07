@@ -315,10 +315,7 @@ test("background_preset_and_image", () => {
     ...OPTS,
     imageBase: "https://magpie.example",
   });
-  assert.equal(
-    bgImage(html),
-    'url("https://magpie.example/start/background/abc")',
-  );
+  assert.equal(bgImage(html), 'url("https://magpie.example/start/background/abc")');
 });
 
 test("odd_input_does_not_throw", () => {
@@ -340,4 +337,32 @@ test("odd_input_does_not_throw", () => {
     { lang: "en", labels: {} },
   );
   assert.ok(!root.textContent.includes("undefined"));
+});
+
+test("image_base_is_an_origin_or_nothing", () => {
+  const { document, root } = page();
+  const html = document.documentElement;
+  const image = { background: { kind: "image", id: "abc" } };
+  const cases = [
+    // [imageBase, expected url]
+    ['x");a:b;("', 'url("/start/background/abc")'],
+    ["javascript:x", 'url("/start/background/abc")'],
+    ['https://a.example");a:b;("', 'url("/start/background/abc")'],
+    ["data:text/html,x", 'url("/start/background/abc")'],
+    ["", 'url("/start/background/abc")'],
+    [42, 'url("/start/background/abc")'],
+    ["https://magpie.example/", 'url("https://magpie.example/start/background/abc")'],
+    ["https://magpie.example:8443/some/path?q=1", 'url("https://magpie.example:8443/start/background/abc")'],
+    ["http://10.0.3.152:3010", 'url("http://10.0.3.152:3010/start/background/abc")'],
+  ];
+  for (const [imageBase, expected] of cases) {
+    render(root, layout(image), { ...OPTS, imageBase });
+    assert.equal(bgImage(html), expected, String(imageBase));
+  }
+});
+
+test("the_root_gets_the_hook_class", () => {
+  const { root } = page();
+  render(root, layout(), OPTS);
+  assert.ok(root.classList.contains("mm-root"));
 });

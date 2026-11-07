@@ -10,7 +10,8 @@
 //   - every string it shows comes from `labels` or from the layout;
 //   - text is only ever set with textContent and setAttribute, never as HTML;
 //   - the only things it touches outside `root` are the `data-bg` attribute on
-//     <html> and the `--mm-bg-image` custom property on <html>.
+//     <html> and the `--mm-bg-image` custom property on <html>; on `root`
+//     itself it adds the class `mm-root`.
 //
 // The matching styles are in render.css (copy that file with this one).
 
@@ -185,6 +186,21 @@ function drawEmpty(doc, opts) {
   return card;
 }
 
+/**
+ * `value` as an origin (`https://host:port`, no trailing slash) if it is an
+ * http or https address, else "" (a relative path). Written into url("..."),
+ * so nothing but a parsed origin may get in.
+ */
+function originOf(value) {
+  if (typeof value !== "string") return "";
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.origin : "";
+  } catch {
+    return "";
+  }
+}
+
 /** Sets `data-bg` and `--mm-bg-image` on <html> for the layout's background. */
 function applyBackground(doc, background, opts) {
   const html = doc.documentElement;
@@ -198,7 +214,7 @@ function applyBackground(doc, background, opts) {
     IMAGE_ID.test(background.id)
   ) {
     name = "image";
-    const base = typeof opts.imageBase === "string" ? opts.imageBase.replace(/\/+$/, "") : "";
+    const base = originOf(opts.imageBase);
     image = `url("${base}/start/background/${background.id}")`;
   }
   html.setAttribute("data-bg", name);
@@ -212,8 +228,9 @@ function applyBackground(doc, background, opts) {
  *
  * `opts.lang` is the interface language (it picks casing rules), `opts.labels`
  * the interface strings: `empty`, `invalid_link`, `group_label` (with
- * `{title}`) and `bookmarks_label`. `opts.imageBase` (optional) is put before
- * the path of a background image, for a page on another origin.
+ * `{title}`) and `bookmarks_label`. `opts.imageBase` (optional, an http or https
+ * address; only its origin is used, anything else is ignored) is put before the
+ * path of a background image, for a page on another origin.
  */
 export function render(root, layout, opts = {}) {
   const doc = root.ownerDocument;
@@ -235,6 +252,8 @@ export function render(root, layout, opts = {}) {
     for (const group of groups) fragment.appendChild(drawGroup(doc, group, settings));
     if (bookmarks.length > 0) fragment.appendChild(drawBookmarks(doc, bookmarks, settings));
   }
+  // The hook the styles hang the background on (see render.css).
+  root.classList.add("mm-root");
   while (root.firstChild) root.removeChild(root.firstChild);
   root.appendChild(fragment);
 }

@@ -39,12 +39,15 @@
    runs), natt, skumring, hav or image. They are painted on <html>, fixed to the
    viewport, so <body> must be transparent. Everything but hedgerow is dark
    whatever the theme, so those force the dark colours. `html:root` outranks the
-   kit's `:root[data-theme]` rules. */
-html[data-bg] > body {
+   kit's `:root[data-theme]` rules.
+   Every rule needs `.mm-root` (the element render() fills) somewhere in the
+   page. htmx swaps only the body, so <html> outlives a boosted visit to another
+   page: when the root goes, the background and the dark colour scheme go too. */
+html:has(.mm-root) > body {
   background: transparent;
 }
-html:root:not([data-bg]),
-html:root[data-bg="hedgerow"] {
+html:root:has(.mm-root):not([data-bg]),
+html:root:has(.mm-root)[data-bg="hedgerow"] {
   background:
     radial-gradient(60vw 50vh at 12% 8%, light-dark(rgba(139, 125, 255, 0.28), rgba(139, 125, 255, 0.35)), transparent 60%),
     radial-gradient(55vw 55vh at 88% 18%, light-dark(rgba(255, 100, 130, 0.2), rgba(255, 100, 130, 0.22)), transparent 60%),
@@ -52,11 +55,11 @@ html:root[data-bg="hedgerow"] {
     var(--bg);
   background-attachment: fixed;
 }
-html:root[data-bg="natt"] {
+html:root:has(.mm-root)[data-bg="natt"] {
   color-scheme: dark;
   background: #0b0b0d;
 }
-html:root[data-bg="skumring"] {
+html:root:has(.mm-root)[data-bg="skumring"] {
   color-scheme: dark;
   background:
     radial-gradient(60vw 50vh at 15% 10%, rgba(139, 92, 246, 0.45), transparent 60%),
@@ -65,7 +68,7 @@ html:root[data-bg="skumring"] {
     #12081c;
   background-attachment: fixed;
 }
-html:root[data-bg="hav"] {
+html:root:has(.mm-root)[data-bg="hav"] {
   color-scheme: dark;
   background:
     radial-gradient(60vw 50vh at 12% 8%, rgba(20, 184, 166, 0.4), transparent 60%),
@@ -76,7 +79,7 @@ html:root[data-bg="hav"] {
 }
 /* An uploaded image (render() sets --mm-bg-image) under a dark scrim, so that
    text stays readable on a light photo. */
-html:root[data-bg="image"] {
+html:root:has(.mm-root)[data-bg="image"] {
   color-scheme: dark;
   background:
     linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0.5)),
@@ -160,7 +163,13 @@ a.mm-card {
   font-style: italic;
 }
 
-/* The tile: a letter or one emoji on a palette colour. */
+/* The tile: a letter or one emoji on a palette colour. The letter is near-black
+   (#101012) on every colour but indigo, which takes white. Contrast ratios
+   (light theme / dark theme): near-black on red 5.4/5.6, orange 8.6/9.2, yellow
+   12.6/13.5, green 8.6/9.4, mint 9.0/12.6, teal 7.4/9.6, cyan 7.5/11.0, blue
+   4.7/5.2, purple 4.6/5.4, pink 5.2/5.4, brown 5.4/6.2, gray 5.8/6.6; white on
+   indigo 5.6/5.1. Every colour reaches at least 4.5:1 in both themes (white
+   would give only 1.4 to 4.1 on the others, near-black only 3.4/3.8 on indigo). */
 .mm-tile {
   display: grid;
   place-items: center;
@@ -169,7 +178,7 @@ a.mm-card {
   height: 34px;
   border-radius: 9px;
   background: var(--pal-gray);
-  color: #fff;
+  color: #101012;
   font-size: 0.875rem;
   font-weight: 700;
   line-height: 1;
@@ -183,23 +192,14 @@ a.mm-card {
 .mm-tile[data-colour="teal"] { background: var(--pal-teal); }
 .mm-tile[data-colour="cyan"] { background: var(--pal-cyan); }
 .mm-tile[data-colour="blue"] { background: var(--pal-blue); }
-.mm-tile[data-colour="indigo"] { background: var(--pal-indigo); }
+.mm-tile[data-colour="indigo"] {
+  background: var(--pal-indigo);
+  color: #fff;
+}
 .mm-tile[data-colour="purple"] { background: var(--pal-purple); }
 .mm-tile[data-colour="pink"] { background: var(--pal-pink); }
 .mm-tile[data-colour="brown"] { background: var(--pal-brown); }
 .mm-tile[data-colour="gray"] { background: var(--pal-gray); }
-/* The light colours need dark letters to be readable. */
-.mm-tile[data-colour="orange"],
-.mm-tile[data-colour="yellow"],
-.mm-tile[data-colour="green"],
-.mm-tile[data-colour="mint"],
-.mm-tile[data-colour="teal"],
-.mm-tile[data-colour="cyan"],
-.mm-tile[data-colour="brown"],
-.mm-tile[data-colour="gray"] {
-  color: #101012;
-}
-
 /* Bookmark pills ---------------------------------------------------------------- */
 .mm-bookmarks {
   display: flex;
@@ -220,7 +220,24 @@ a.mm-card {
   }
 }
 
-/* The empty state ---------------------------------------------------------------- */
+/* The empty state ---------------------------------------------------------------
+   Self-contained: the same look as the kit's .empty and .empty-title, so that a
+   page without the kit's rules (the extension) draws it the same. */
 .mm-empty {
-  border-style: solid;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+}
+.mm-empty .empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 3rem var(--sp-6);
+  text-align: center;
+}
+.mm-empty .empty-title {
+  margin: 0;
+  font-size: 1.0625rem;
+  font-weight: 600;
+  letter-spacing: -0.013em;
 }

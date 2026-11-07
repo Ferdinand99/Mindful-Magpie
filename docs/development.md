@@ -45,7 +45,7 @@ Builds and tests run in Docker on a build host (a shared Docker daemon), not on 
 cargo commands that run inside a Rust 1.99 container with clippy and rustfmt installed.
 
 ```bash
-cargo test --locked                                  # 104 tests: boot, auth and users, start page, layout, extension API and connect flow
+cargo test --locked                                  # 105 tests: boot, auth and users, start page, layout, extension API and connect flow
 cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --all --check
 cd web && npm ci && node --test                     # the renderer's tests (node:22 container; linkedom stands in for the DOM)

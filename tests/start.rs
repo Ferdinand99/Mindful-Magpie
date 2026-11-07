@@ -33,6 +33,18 @@ async fn start_page_renders_for_signed_in_user() {
     );
     // The renderer draws the empty state (the text is in the labels block).
     assert!(!res.body.contains("empty-card"), "{}", res.body);
+    // The root the renderer fills carries the hook the background styles need.
+    assert!(
+        res.body.contains(r#"<section id="groups" class="mm-root""#),
+        "{}",
+        res.body
+    );
+    // Without scripts the page says why it is bare.
+    assert!(
+        res.body.contains("<noscript>") && res.body.contains("Startsiden trenger JavaScript"),
+        "{}",
+        res.body
+    );
     assert!(
         res.body
             .contains("Startsiden er tom. Rediger den for å legge til tjenester og bokmerker."),
@@ -47,6 +59,54 @@ async fn start_page_renders_for_signed_in_user() {
         "{}",
         res.body
     );
+    assert!(
+        res.body.contains("The start page needs JavaScript"),
+        "{}",
+        res.body
+    );
+}
+
+#[tokio::test]
+async fn background_rules_only_apply_where_the_root_is() {
+    // htmx swaps only the body, so `<html>` outlives a boosted visit to another
+    // page. Every rule that paints <html> or forces its colour scheme must
+    // need the renderer's root (`.mm-root`) to be in the page.
+    let app = App::new().await;
+    let res = app.get("/static/magpie/render.css").await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    // Comments out first: they talk about these selectors too.
+    let mut css = res.body;
+    while let Some(start) = css.find("/*") {
+        let end = css[start..].find("*/").expect("comment never closes") + start + 2;
+        css.replace_range(start..end, "");
+    }
+    let mut selector_start = 0;
+    let mut checked = 0;
+    for (at, c) in css.char_indices() {
+        match c {
+            '{' => {
+                let selector = css[selector_start..at].trim();
+                let body = &css[at..css[at..].find('}').map_or(css.len(), |end| at + end)];
+                if selector.contains("data-bg") || selector.starts_with("html") {
+                    assert!(
+                        selector.contains(":has(.mm-root)"),
+                        "this rule outlives the start page: {selector}"
+                    );
+                    checked += 1;
+                }
+                if selector.contains("data-bg") {
+                    assert!(
+                        body.contains("background") || body.contains("color-scheme"),
+                        "{selector}"
+                    );
+                }
+                selector_start = at + 1;
+            }
+            '}' => selector_start = at + 1,
+            _ => {}
+        }
+    }
+    assert!(checked >= 6, "only {checked} html rules found");
 }
 
 #[tokio::test]
