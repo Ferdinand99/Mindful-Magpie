@@ -3,16 +3,17 @@
 //! a site that has no integration of its own, and it is the kind the engine is
 //! tested with.
 //!
-//! The service's secret, when it has one, is sent as `Authorization: Bearer`.
+//! The service's secret, when it has one, is sent as `Authorization: Bearer`,
+//! and then a redirect to another origin is refused.
 
 use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
 
-use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde_json::Value as Json;
 use url::Url;
 use vole_kit::net::check_host;
 
+use super::api;
 use super::{
     BoxFuture, FetchCtx, FetchError, Field, FieldKind, Format, Integration, MetricDef,
     SettingError, Snapshot, Status, Value, classify, read_capped,
@@ -162,21 +163,21 @@ impl Integration for HttpKind {
         Box::pin(async move {
             let url = target(&ctx.settings)?;
             let expected = expected(&ctx.settings)?;
-            let mut request = ctx.http.get(url);
-            if let Some(secret) = ctx.secret.as_deref().filter(|s| !s.is_empty()) {
-                let mut value = HeaderValue::from_str(&format!("Bearer {secret}"))
-                    .map_err(|_| FetchError::Config)?;
-                // Kept out of debug output, and stripped on a redirect to
-                // another host.
-                value.set_sensitive(true);
-                request = request.header(AUTHORIZATION, value);
-            }
+            let request = ctx.http.get(url);
             let started = Instant::now();
-            let response = match request.send().await {
+            let sent = match ctx.secret.as_deref().filter(|s| !s.is_empty()) {
+                // With a secret, a redirect to another origin is refused.
+                Some(secret) => {
+                    let credential = api::Credential::bearer(Some(secret))?;
+                    api::send_credentialed(credential.apply(request)).await
+                }
+                None => request.send().await.map_err(|err| classify(&err)),
+            };
+            let response = match sent {
                 Ok(response) => response,
                 // The site not answering is the reading, not a failure of ours,
                 // and it was checked: «Last checked» says when.
-                Err(err) => return Ok(checked(Snapshot::failed(&classify(&err)))),
+                Err(err) => return Ok(checked(Snapshot::failed(&err))),
             };
             let code = response.status().as_u16();
             let body = read_capped(response).await;

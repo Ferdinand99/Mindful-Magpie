@@ -731,15 +731,19 @@ fn need_marks(snapshot: &Snapshot) -> Vec<(&str, Level, u64)> {
 
 /// The failures that an admin has to fix, not the site: settings that can't
 /// be used, an address that is not allowed, a redirect that is not allowed,
-/// a secret that can't be opened, a key the service refused and a Keen
+/// a secret that can't be opened, a key the service refused, a key with the
+/// wrong role or no rights, a certificate that was not accepted, and a Keen
 /// Kestrel that has to be upgraded.
-const CONFIG_ERRORS: [FetchError; 6] = [
+const CONFIG_ERRORS: [FetchError; 9] = [
     FetchError::Config,
     FetchError::Forbidden,
     FetchError::RedirectScheme,
     FetchError::SecretUnreadable,
     FetchError::Auth,
     FetchError::KkTooOld,
+    FetchError::NotAdmin,
+    FetchError::NothingVisible,
+    FetchError::Cert,
 ];
 
 /// Whether the reading failed because of one of [`CONFIG_ERRORS`].

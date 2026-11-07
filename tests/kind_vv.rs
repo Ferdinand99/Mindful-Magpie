@@ -702,7 +702,7 @@ async fn the_token_is_in_the_request_only() {
 
     let log = logged();
     assert!(
-        log.contains("hyper_util") || log.contains("reqwest"),
+        log.contains("reqwest::") || log.contains("hyper_util::client"),
         "the capture sees the HTTP client's own lines"
     );
     assert!(!log.contains(TOKEN), "the log holds the token");
@@ -710,9 +710,10 @@ async fn the_token_is_in_the_request_only() {
 }
 
 #[tokio::test]
-async fn a_redirect_to_another_host_does_not_carry_the_token() {
-    // The target is a second stub on another port; reqwest drops the header
-    // on a cross-origin redirect, and the client's redirects are checked.
+async fn a_redirect_to_another_origin_is_refused_and_never_carries_the_token() {
+    // The target is a second stub on another port. The client would drop
+    // `Authorization` there, but Magpie refuses the redirect, so the other
+    // origin sees no request at all.
     let (target, target_stub) =
         serve(Answer::Json(summary(4, 0, 0, 0, 0)), Answer::Status(500)).await;
     let location = format!("{target}{SUMMARY}?days=30");
@@ -724,10 +725,6 @@ async fn a_redirect_to_another_host_does_not_carry_the_token() {
     let origin = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-    let s = fetch(&origin).await;
-    assert_eq!(s.status, Status::Ok);
-    assert_eq!(num(&s, "up"), Some(4.0));
-    let hits = target_stub.hits_on(SUMMARY);
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].authorization, None, "the token stays with its host");
+    assert_eq!(fetch_err(&origin).await, FetchError::RedirectScheme);
+    assert!(target_stub.hits.lock().unwrap().is_empty());
 }

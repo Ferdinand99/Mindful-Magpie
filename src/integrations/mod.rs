@@ -28,6 +28,9 @@ pub mod http_kind;
 pub mod kk;
 pub mod pin;
 pub mod poller;
+pub mod proxmox;
+pub mod tofa;
+pub mod unraid;
 pub mod vv;
 pub mod ww_kind;
 
@@ -88,7 +91,15 @@ pub trait Integration: Send + Sync + 'static {
 
 /// The kinds compiled into this build.
 pub fn registry() -> &'static [&'static dyn Integration] {
-    static KINDS: [&dyn Integration; 4] = [&http_kind::HTTP, &vv::VV, &kk::KK, &ww_kind::WW];
+    static KINDS: [&dyn Integration; 7] = [
+        &http_kind::HTTP,
+        &vv::VV,
+        &kk::KK,
+        &ww_kind::WW,
+        &proxmox::PROXMOX,
+        &unraid::UNRAID,
+        &tofa::TOFA,
+    ];
     &KINDS
 }
 
@@ -319,6 +330,14 @@ pub enum FetchError {
     /// Keen Kestrel without the summary endpoint (an older release).
     #[error("Keen Kestrel too old")]
     KkTooOld,
+    /// The service knows the key but it may not read what the kind needs
+    /// (HTTP 403 where the kind's endpoints are for admins).
+    #[error("key is not an admin key")]
+    NotAdmin,
+    /// The key is accepted but the answer is empty: it sees none of what the
+    /// kind reads (a Proxmox token without a role).
+    #[error("key sees nothing")]
+    NothingVisible,
     #[error("HTTP {0}")]
     Status(u16),
     #[error("request failed")]
@@ -342,9 +361,57 @@ impl FetchError {
             FetchError::SecretUnreadable => "fetch_err.secret",
             FetchError::Auth => "fetch_err.auth",
             FetchError::KkTooOld => "fetch_err.kk_too_old",
+            FetchError::NotAdmin => "fetch_err.not_admin",
+            FetchError::NothingVisible => "fetch_err.nothing_visible",
             FetchError::Other => "fetch_err.other",
             FetchError::Status(_) => return None,
         })
+    }
+}
+
+/// The text of a text-valued metric in the current language. A kind whose
+/// metric takes one of a few known words (Unraid's array state) has a text for
+/// each in the locale files, under `value.<kind>_<metric>_<word>` with the
+/// word in lower case; any other value shows as it is. The key is built from
+/// stored data, so only characters that can be in a key are used.
+pub fn value_label(kind: &str, metric: &str, raw: &str) -> String {
+    let word: String = raw
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if word.is_empty() || word.len() > 40 {
+        return raw.to_string();
+    }
+    vole_kit::i18n::lookup(
+        vole_kit::i18n::current(),
+        &format!("value.{kind}_{metric}_{word}"),
+    )
+    .map_or_else(|| raw.to_string(), str::to_string)
+}
+
+/// Replaces the text of each text-format metric in `values` with its
+/// [`value_label`].
+pub fn localize_texts(kind: &str, values: &mut BTreeMap<String, Value>) {
+    let Some(integration) = find(kind) else {
+        return;
+    };
+    for metric in integration
+        .metrics()
+        .iter()
+        .filter(|m| m.format == Format::Text)
+    {
+        if let Some(value) = values.get_mut(metric.id)
+            && let Some(text) = value.text.as_mut()
+        {
+            *text = value_label(kind, metric.id, text);
+        }
     }
 }
 
@@ -364,6 +431,8 @@ pub fn error_text_key(text: &str) -> Option<&'static str> {
         FetchError::SecretUnreadable,
         FetchError::Auth,
         FetchError::KkTooOld,
+        FetchError::NotAdmin,
+        FetchError::NothingVisible,
         FetchError::Other,
     ]
     .into_iter()
@@ -378,6 +447,29 @@ enum RedirectError {
     TooMany,
     #[error("redirect to a scheme that is not http or https")]
     Scheme,
+    #[error("redirect to another origin while a secret is sent")]
+    CrossOrigin,
+}
+
+tokio::task_local! {
+    /// Set while a request that carries a secret is sent (see [`with_secret`]).
+    static SENDS_SECRET: ();
+}
+
+/// Runs `f` (a request being sent) as one that carries a secret: the redirect
+/// policy then refuses a redirect to an origin other than the one the request
+/// began at ([`FetchError::RedirectScheme`]). The HTTP client drops
+/// `Authorization` on such a redirect but not other headers, and the
+/// sensitive mark on a header value does not change that, so every request
+/// with a key goes through here (see [`api::send_credentialed`]). A request
+/// without a secret keeps the ordinary rules.
+pub(crate) async fn with_secret<F: Future>(f: F) -> F::Output {
+    SENDS_SECRET.scope((), f).await
+}
+
+/// Where a URL's origin is: scheme, host and port.
+fn origin(url: &url::Url) -> (&str, Option<&str>, Option<u16>) {
+    (url.scheme(), url.host_str(), url.port_or_known_default())
 }
 
 /// What a failed request is, for a short reason. The error's own text (which
@@ -390,7 +482,9 @@ pub fn classify(err: &reqwest::Error) -> FetchError {
         }
         match e.downcast_ref::<RedirectError>() {
             Some(RedirectError::TooMany) => return FetchError::Redirects,
-            Some(RedirectError::Scheme) => return FetchError::RedirectScheme,
+            Some(RedirectError::Scheme | RedirectError::CrossOrigin) => {
+                return FetchError::RedirectScheme;
+            }
             None => {}
         }
         if pin::is_certificate_error(e) {
@@ -427,6 +521,15 @@ fn redirect_policy() -> reqwest::redirect::Policy {
                 .is_some_and(|p| p.scheme() == "https")
         {
             return attempt.error(RedirectError::Scheme);
+        }
+        // A secret stays with the origin it was sent to.
+        if SENDS_SECRET.try_with(|()| ()).is_ok()
+            && attempt
+                .previous()
+                .first()
+                .is_some_and(|first| origin(first) != origin(attempt.url()))
+        {
+            return attempt.error(RedirectError::CrossOrigin);
         }
         // A name is checked when it is resolved; an address in the URL never
         // reaches the resolver.

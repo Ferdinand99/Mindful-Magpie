@@ -985,7 +985,7 @@ async fn the_token_is_in_no_reading_error_or_log() {
     let log = logged();
     // The capture does see what the HTTP library logs.
     assert!(
-        log.contains("hyper_util") || log.contains("reqwest"),
+        log.contains("reqwest::") || log.contains("hyper_util::client"),
         "the capture sees the HTTP client's own lines"
     );
     assert!(!log.contains(TOKEN), "the token reached the log");
@@ -996,9 +996,10 @@ async fn the_token_is_in_no_reading_error_or_log() {
 }
 
 #[tokio::test]
-async fn a_redirect_to_another_origin_does_not_carry_the_token() {
+async fn a_redirect_to_another_origin_is_refused_and_never_carries_the_token() {
     // Wise Wren (or whatever answers at the address) sends every call on to a
-    // second server on another port: the token must not follow.
+    // second server on another port. The client would drop `Authorization`
+    // there, but Magpie refuses the redirect: the second server sees nothing.
     let (other, other_stub) = serve().await;
     quiet(&other_stub);
     let app = Router::new().fallback(move |req: Request| {
@@ -1008,10 +1009,6 @@ async fn a_redirect_to_another_origin_does_not_carry_the_token() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let redirecting = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let s = fetch(&redirecting).await;
-    // The second server answers, but it never saw the key.
-    assert_eq!(s.status, Status::Ok, "{:?}", s.error);
-    let seen = other_stub.seen();
-    assert_eq!(seen.len(), 3, "{seen:?}");
-    assert!(seen.iter().all(|s| s.auth.is_none()), "{seen:?}");
+    assert_eq!(fetch_err(&redirecting).await, FetchError::RedirectScheme);
+    assert!(other_stub.seen().is_empty(), "{:?}", other_stub.seen());
 }

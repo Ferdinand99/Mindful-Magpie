@@ -1,8 +1,12 @@
-//! What the kinds that read a JSON API with a bearer token have in common:
-//! checking the address, joining a path to it, the token as a header, one GET
-//! that turns the answer into a value or one of [`FetchError`]'s fixed
-//! reasons, a memory of addresses that answered 404, and cleaning text that
-//! came from outside.
+//! What the kinds that read a JSON API with a key have in common: checking
+//! the address, joining a path to it, the key as a header ([`Credential`]),
+//! one GET or POST that turns the answer into a value or one of
+//! [`FetchError`]'s fixed reasons, a memory of addresses that answered 404,
+//! and cleaning text that came from outside.
+//!
+//! Every request sent with a [`Credential`] refuses a redirect to another
+//! origin (see [`super::with_secret`]): which headers a redirect carries on
+//! depends on their names, so the key is not left to that.
 //!
 //! Nothing here puts a token, an address or a response text into an error.
 
@@ -10,7 +14,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderValue};
+use reqwest::header::{ACCEPT, HeaderName, HeaderValue};
+use reqwest::{RequestBuilder, Response};
 use serde::de::DeserializeOwned;
 use serde_json::Value as Json;
 use url::Url;
@@ -60,16 +65,56 @@ pub fn endpoint(base: &Url, segments: &[&str], query: Option<&str>) -> Result<Ur
     Ok(url)
 }
 
-/// The token as an `Authorization: Bearer` value, marked sensitive so it
-/// stays out of debug output and is not sent on to another host by a
-/// redirect. No token, or one that cannot be a header value, is
-/// [`FetchError::Config`].
-pub fn bearer(secret: Option<&str>) -> Result<HeaderValue, FetchError> {
-    let secret = secret.filter(|s| !s.is_empty()).ok_or(FetchError::Config)?;
-    let mut value =
-        HeaderValue::from_str(&format!("Bearer {secret}")).map_err(|_| FetchError::Config)?;
-    value.set_sensitive(true);
-    Ok(value)
+/// A secret as one request header: the header's name and its value. The value
+/// is always marked sensitive, so it stays out of debug output.
+///
+/// Sending it with [`get_json`] or [`post_json`] also makes the request refuse
+/// a redirect to another origin. The sensitive mark does not do that, and
+/// neither does the HTTP client for every name: it drops `Authorization` on
+/// such a redirect, but a header like `x-api-key` would go along.
+#[derive(Clone, Debug)]
+pub struct Credential {
+    name: HeaderName,
+    value: HeaderValue,
+}
+
+impl Credential {
+    /// `Authorization: Bearer <secret>`. No secret, or one that cannot be a
+    /// header value, is [`FetchError::Config`].
+    pub fn bearer(secret: Option<&str>) -> Result<Credential, FetchError> {
+        let secret = secret.filter(|s| !s.is_empty()).ok_or(FetchError::Config)?;
+        Credential::raw("authorization", &format!("Bearer {secret}"))
+    }
+
+    /// The secret as the whole value of the header `name` (`x-api-key`).
+    pub fn header(name: &'static str, secret: Option<&str>) -> Result<Credential, FetchError> {
+        let secret = secret.filter(|s| !s.is_empty()).ok_or(FetchError::Config)?;
+        Credential::raw(name, secret)
+    }
+
+    /// The header `name` with exactly `value` (Proxmox's
+    /// `Authorization: PVEAPIToken=id=secret`).
+    pub fn raw(name: &'static str, value: &str) -> Result<Credential, FetchError> {
+        let mut value = HeaderValue::from_str(value).map_err(|_| FetchError::Config)?;
+        value.set_sensitive(true);
+        Ok(Credential {
+            name: HeaderName::from_static(name),
+            value,
+        })
+    }
+
+    /// `request` with the header.
+    pub fn apply(&self, request: RequestBuilder) -> RequestBuilder {
+        request.header(self.name.clone(), self.value.clone())
+    }
+}
+
+/// Sends `request`, which carries a secret: a redirect to another origin is
+/// refused ([`FetchError::RedirectScheme`]).
+pub async fn send_credentialed(request: RequestBuilder) -> Result<Response, FetchError> {
+    super::with_secret(request.send())
+        .await
+        .map_err(|err| classify(&err))
 }
 
 /// What a GET found.
@@ -92,25 +137,73 @@ impl<T> Reply<T> {
     }
 }
 
-/// One GET with the token. 401 and 403 are [`FetchError::Auth`], 404 is
+/// One GET with the credential. 401 and 403 are [`FetchError::Auth`], 404 is
 /// [`Reply::NotFound`], any other answer outside 2xx is
 /// [`FetchError::Status`]; the body is read to at most
 /// [`super::MAX_BODY`] bytes and parsed (anything else is
-/// [`FetchError::Invalid`]).
+/// [`FetchError::Invalid`]). A redirect to another origin is refused.
 pub async fn get_json<T: DeserializeOwned>(
     http: &reqwest::Client,
     url: Url,
-    auth: &HeaderValue,
+    credential: &Credential,
+) -> Result<Reply<T>, FetchError> {
+    let request = credential.apply(http.get(url).header(ACCEPT, "application/json"));
+    reply(send_credentialed(request).await?).await
+}
+
+/// [`get_json`] for an endpoint that is for admins: a 403 means the key is
+/// known but is no admin key ([`FetchError::NotAdmin`]); a 401 is
+/// [`FetchError::Auth`].
+pub async fn get_json_admin<T: DeserializeOwned>(
+    http: &reqwest::Client,
+    url: Url,
+    credential: &Credential,
+) -> Result<Reply<T>, FetchError> {
+    let request = credential.apply(http.get(url).header(ACCEPT, "application/json"));
+    reply_with(send_credentialed(request).await?, FetchError::NotAdmin).await
+}
+
+/// One GET without any key, for an address that is public (a health
+/// endpoint). Answered as [`get_json`] answers; a redirect is followed under
+/// the ordinary rules, since nothing secret goes along.
+pub async fn get_json_public<T: DeserializeOwned>(
+    http: &reqwest::Client,
+    url: Url,
 ) -> Result<Reply<T>, FetchError> {
     let response = http
         .get(url)
-        .header(AUTHORIZATION, auth.clone())
         .header(ACCEPT, "application/json")
         .send()
         .await
         .map_err(|err| classify(&err))?;
+    reply(response).await
+}
+
+/// One POST of `body` as JSON with the credential, answered as [`get_json`]
+/// answers it.
+pub async fn post_json<T: DeserializeOwned>(
+    http: &reqwest::Client,
+    url: Url,
+    credential: &Credential,
+    body: &Json,
+) -> Result<Reply<T>, FetchError> {
+    let request = credential.apply(http.post(url).header(ACCEPT, "application/json").json(body));
+    reply(send_credentialed(request).await?).await
+}
+
+/// What `response` says: see [`get_json`].
+async fn reply<T: DeserializeOwned>(response: Response) -> Result<Reply<T>, FetchError> {
+    reply_with(response, FetchError::Auth).await
+}
+
+/// What `response` says, with `forbidden` for a 403.
+async fn reply_with<T: DeserializeOwned>(
+    response: Response,
+    forbidden: FetchError,
+) -> Result<Reply<T>, FetchError> {
     match response.status().as_u16() {
-        401 | 403 => Err(FetchError::Auth),
+        401 => Err(FetchError::Auth),
+        403 => Err(forbidden),
         404 => Ok(Reply::NotFound),
         code if !(200..300).contains(&code) => Err(FetchError::Status(code)),
         _ => {
@@ -329,14 +422,37 @@ mod tests {
     }
 
     #[test]
-    fn the_token_header_is_sensitive_and_checked() {
-        let value = bearer(Some("ww_abc")).unwrap();
-        assert!(value.is_sensitive());
-        assert_eq!(value.to_str().unwrap(), "Bearer ww_abc");
-        assert!(!format!("{value:?}").contains("ww_abc"));
+    fn the_credentials_are_sensitive_and_checked() {
+        let credential = Credential::bearer(Some("ww_abc")).unwrap();
+        assert!(credential.value.is_sensitive());
+        assert_eq!(credential.name, reqwest::header::AUTHORIZATION);
+        assert_eq!(credential.value.to_str().unwrap(), "Bearer ww_abc");
+        assert!(!format!("{credential:?}").contains("ww_abc"));
         for bad in [None, Some(""), Some("a\r\nb")] {
-            assert_eq!(bearer(bad).unwrap_err(), FetchError::Config, "{bad:?}");
+            assert_eq!(
+                Credential::bearer(bad).unwrap_err(),
+                FetchError::Config,
+                "{bad:?}"
+            );
         }
+        let key = Credential::header("x-api-key", Some("k-123")).unwrap();
+        assert!(key.value.is_sensitive());
+        assert_eq!(key.name.as_str(), "x-api-key");
+        assert_eq!(key.value.to_str().unwrap(), "k-123");
+        assert!(!format!("{key:?}").contains("k-123"));
+        for bad in [None, Some(""), Some("a\nb")] {
+            assert_eq!(
+                Credential::header("x-api-key", bad).unwrap_err(),
+                FetchError::Config
+            );
+        }
+        let raw = Credential::raw("authorization", "PVEAPIToken=u@pam!t=s").unwrap();
+        assert!(raw.value.is_sensitive());
+        assert!(!format!("{raw:?}").contains("PVEAPIToken=u"));
+        assert_eq!(
+            Credential::raw("authorization", "a\r\nb").unwrap_err(),
+            FetchError::Config
+        );
     }
 
     #[test]

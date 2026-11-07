@@ -189,7 +189,7 @@ fn down_need(down: f64) -> Need {
 
 async fn read(ctx: &FetchCtx) -> Result<Snapshot, FetchError> {
     let base = api::base_url(&ctx.settings)?;
-    let auth = api::bearer(ctx.secret.as_deref())?;
+    let auth = api::Credential::bearer(ctx.secret.as_deref())?;
     let path = |last| ["api", "v1", last];
     let key = api::endpoint(&base, &path("summary"), None)?.to_string();
     if !OLD.is_old(&key, Instant::now()) {

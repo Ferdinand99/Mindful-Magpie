@@ -465,9 +465,10 @@ async fn a_title_loses_control_and_format_characters() {
 }
 
 #[tokio::test]
-async fn a_redirect_to_another_origin_does_not_carry_the_token() {
-    // The address answers with a redirect to a second stub on another port;
-    // the client drops the Authorization header on a cross-origin redirect.
+async fn a_redirect_to_another_origin_is_refused_and_never_carries_the_token() {
+    // The address answers with a redirect to a second stub on another port.
+    // The client would drop `Authorization` there, but Magpie refuses the
+    // redirect, so the other origin sees no request at all.
     let (target, target_stub) = serve(200, summary(totals(1, 0, 0), vec![])).await;
     let location = format!("{target}/api/v1/summary?hours=24");
     let app = Router::new().fallback(move || {
@@ -478,14 +479,11 @@ async fn a_redirect_to_another_origin_does_not_carry_the_token() {
     let origin = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-    let snapshot = fetch(&origin, Some(TOKEN)).await.unwrap();
-    assert_eq!(num(&snapshot, "new_issues"), Some(1.0));
-    assert_eq!(target_stub.hits.load(Ordering::SeqCst), 1);
     assert_eq!(
-        target_stub.auth.lock().unwrap().as_slice(),
-        [String::new()],
-        "the token stays with its host"
+        fetch(&origin, Some(TOKEN)).await.unwrap_err(),
+        FetchError::RedirectScheme
     );
+    assert_eq!(target_stub.hits.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -627,7 +625,10 @@ async fn the_token_is_in_no_error_snapshot_debug_output_or_log() {
 
     let logged = String::from_utf8_lossy(&buffer.0.lock().unwrap()).into_owned();
     // The capture does see what the HTTP library logs.
-    assert!(logged.contains("hyper_util"), "nothing was captured");
+    assert!(
+        (logged.contains("reqwest::") || logged.contains("hyper_util::client")),
+        "nothing was captured"
+    );
     for (what, text) in [("results", &seen), ("log", &logged)] {
         assert!(!text.contains(TOKEN), "token in {what}");
         assert!(!text.contains("token-x"), "bad token in {what}");
