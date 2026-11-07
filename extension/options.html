@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="nb">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mindful Magpie – innstillinger</title>
+  <link rel="stylesheet" href="shell.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="brand">
+      <img class="mark" src="icons/magpie-mark.svg" alt="" width="40" height="40">
+      <span class="name">Mindful Magpie</span>
+    </header>
+    <form id="form" class="card" autocomplete="off">
+      <label for="serverUrl">Adresse til Magpie
+        <input id="serverUrl" type="url" placeholder="https://magpie.example.org" required>
+      </label>
+      <label for="token">Lese-token (Innstillinger → API-tokens i Magpie)
+        <input id="token" type="password" autocomplete="off" spellcheck="false" required>
+      </label>
+      <div class="actions">
+        <button id="test" type="button">Test tilkobling</button>
+        <button id="save" type="submit" class="primary">Lagre</button>
+      </div>
+      <p id="result" class="result" role="status"></p>
+    </form>
+  </main>
+  <script type="module" src="options.js"></script>
+</body>
+</html>
