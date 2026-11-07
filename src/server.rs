@@ -7,7 +7,12 @@ use crate::config::Config;
 
 /// Starts Magpie with `config` and serves until it is told to stop.
 pub async fn run(config: Config) -> Result<(), crate::StartError> {
-    let magpie = crate::start(&config.data_dir, config.public_url.as_deref()).await?;
+    let magpie = crate::start_with(
+        &config.data_dir,
+        config.public_url.as_deref(),
+        &config.extension_ids,
+    )
+    .await?;
     // Notifications and other work outside a request use the site language.
     vole_kit::i18n::site_language(&magpie.core).await;
 

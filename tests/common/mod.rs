@@ -69,6 +69,25 @@ impl App {
         App::open(dir).await
     }
 
+    /// A Magpie that also accepts the extensions with these IDs
+    /// (`MM_EXTENSION_IDS`).
+    pub async fn with_extension_ids(ids: &[&str]) -> App {
+        let dir = std::env::temp_dir().join(format!(
+            "mindful-magpie-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ids: Vec<String> = ids.iter().map(|id| (*id).to_string()).collect();
+        let magpie = mindful_magpie::start_with(&dir, None, &ids).await.unwrap();
+        App {
+            router: mindful_magpie::router(magpie.clone()),
+            magpie,
+            dir,
+            keep_dir: false,
+        }
+    }
+
     /// Starts a Magpie on `dir` (new or existing data).
     async fn open(dir: PathBuf) -> App {
         let magpie = mindful_magpie::start(&dir, None).await.unwrap();

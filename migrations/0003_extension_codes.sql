@@ -7,7 +7,6 @@ CREATE TABLE extension_codes (
     user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     code_challenge TEXT NOT NULL,
     device         TEXT NOT NULL,
-    redirect_uri   TEXT NOT NULL,
     expires_at     INTEGER NOT NULL
 );
 CREATE INDEX extension_codes_user ON extension_codes (user_id);

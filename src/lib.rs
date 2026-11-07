@@ -40,6 +40,10 @@ pub struct Magpie {
     pub core: Core,
     /// Budget of the extension's token endpoint, per client address.
     pub token_budget: Arc<TokenBuckets<IpAddr>>,
+    /// The redirect hosts "Koble til Magpie" may send people back to: the
+    /// official extension's and those of `MM_EXTENSION_IDS` (see
+    /// [`connect::redirect_host`]).
+    pub extension_hosts: Arc<Vec<String>>,
 }
 
 /// Installs the configuration, opens and migrates the database in
@@ -48,6 +52,16 @@ pub struct Magpie {
 /// checks and the API examples read; without one the setting keeps what the
 /// General page saved.
 pub async fn start(data_dir: &Path, public_url: Option<&str>) -> Result<Magpie, StartError> {
+    start_with(data_dir, public_url, &[]).await
+}
+
+/// [`start`], and `extension_ids` (`MM_EXTENSION_IDS`): extension IDs besides
+/// the official one that may use the connect flow.
+pub async fn start_with(
+    data_dir: &Path,
+    public_url: Option<&str>,
+    extension_ids: &[String],
+) -> Result<Magpie, StartError> {
     install();
     std::fs::create_dir_all(data_dir).map_err(|e| {
         format!(
@@ -76,6 +90,7 @@ pub async fn start(data_dir: &Path, public_url: Option<&str>) -> Result<Magpie, 
     Ok(Magpie {
         core,
         token_budget: Arc::new(TokenBuckets::new()),
+        extension_hosts: Arc::new(connect::allowed_hosts(extension_ids)),
     })
 }
 

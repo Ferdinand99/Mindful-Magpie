@@ -129,7 +129,7 @@ fn plain_authority(value: &str) -> bool {
 
 /// Characters of Unicode category Cf (format): invisible, and a few reverse
 /// the text or glue it together.
-fn is_format(c: char) -> bool {
+pub fn is_format(c: char) -> bool {
     matches!(c,
         '\u{ad}' | '\u{600}'..='\u{605}' | '\u{61c}' | '\u{6dd}' | '\u{70f}'
         | '\u{890}'..='\u{891}' | '\u{8e2}' | '\u{180e}' | '\u{200b}'..='\u{200f}'

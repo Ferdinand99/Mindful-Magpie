@@ -41,6 +41,9 @@ const MAX_TOKEN_BODY: usize = 4096;
 /// The name a connected extension's token gets: the user's token list shows
 /// it, and revoking the token disconnects the extension.
 const TOKEN_NAME_PREFIX: &str = "Utvidelse: ";
+/// The most API tokens one user may have: the kit's cap on its Tokens page
+/// (`MAX_TOKENS_PER_USER` there), so the flow cannot get around it.
+const MAX_TOKENS_PER_USER: i64 = 50;
 
 const ME_START_EXAMPLE: &str = r##"{"version": 3, "background": {"kind": "preset", "name": "hav"}, "groups": [{"id": "g1", "title": "Services", "cards": [{"id": "c1", "title": "Vigilant Vole", "description": "Uptime", "url": "https://vole.example.com/", "icon": {"emoji": null, "colour": "teal"}}]}], "bookmarks": [{"id": "b1", "title": "Docs", "url": "https://docs.example.com/"}]}"##;
 
@@ -59,7 +62,7 @@ pub const ROUTES: &[RouteDoc] = &[
         "/api/v1/extension/token",
         "public",
         "Extension",
-        "Swaps the one-time code of the browser extension's connect flow (`/connect/extension`, PKCE with S256) for an API token with read access, named `Utvidelse: <device>`, owned by the user who approved. The code lives two minutes, works once and is spent by any attempt. `code_verifier` is the secret whose SHA-256 (base64url) was sent as `code_challenge`. Every failure is the same `400 invalid_grant`; more than 10 requests a minute from one address get `429`. The token shows in the user's API tokens, where it can be revoked.",
+        "Swaps the one-time code of the browser extension's connect flow (`/connect/extension`, PKCE with S256) for an API token with read access, named `Utvidelse: <device>`, owned by the user who approved. The code lives two minutes, works once and is spent by any attempt. `code_verifier` is the secret whose SHA-256 (base64url) was sent as `code_challenge`. Connecting the same device again replaces the user's earlier token of that name, and a user who already has 50 tokens gets none. Every failure is the same `400 invalid_grant`; more than 10 requests a minute from one address get `429` (behind a reverse proxy, set `MM_TRUST_PROXY=1`, or every client shares the proxy's address). The token shows in the user's API tokens, where it can be revoked.",
     )
     .req(r#"{"code": "Zm9yLWV4YW1wbGUtb25seS1ub3QtYS1yZWFsLWNvZGU", "code_verifier": "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"}"#)
     .res(r#"{"token": "mm_…"}"#),
@@ -175,14 +178,14 @@ async fn extension_token(
     let verifier = request.code_verifier;
     let redeemed = db::interact(&core.db, move |c| {
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row: Option<(i64, String, String, bool)> = tx
+        let row: Option<(i64, String, String, String, bool)> = tx
             .query_row(
-                "SELECT c.user_id, c.code_challenge, c.device,
+                "SELECT c.user_id, u.username, c.code_challenge, c.device,
                         c.expires_at > CAST(strftime('%s','now') AS INTEGER)
                  FROM extension_codes c JOIN users u ON u.id = c.user_id AND u.active = 1
                  WHERE c.code_hash = ?1",
                 params![code_hash],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
         // Single use: whoever finds the code spends it, right or wrong.
@@ -192,35 +195,80 @@ async fn extension_token(
         )?;
         connect::purge_expired(&tx)?;
         let granted = match row {
-            Some((user_id, challenge, device, true)) if pkce_matches(&verifier, &challenge) => {
-                api_tokens::insert(
-                    &tx,
-                    user_id,
-                    &format!("{TOKEN_NAME_PREFIX}{device}"),
-                    &prefix,
-                    &token_hash,
-                    TokenScope::Read,
-                    None,
+            Some((user_id, username, challenge, device, true))
+                if pkce_matches(&verifier, &challenge) =>
+            {
+                let name = format!("{TOKEN_NAME_PREFIX}{device}");
+                // The kit's cap, not counting the tokens this one replaces.
+                let others: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM api_tokens WHERE user_id = ?1 AND name != ?2",
+                    params![user_id, name],
+                    |r| r.get(0),
                 )?;
-                true
+                if others >= MAX_TOKENS_PER_USER {
+                    tracing::warn!(user = %username, "extension token refused: the user has the most API tokens allowed");
+                    None
+                } else {
+                    // Connecting the same device again replaces its token.
+                    let replaced = tx.execute(
+                        "DELETE FROM api_tokens WHERE user_id = ?1 AND name = ?2",
+                        params![user_id, name],
+                    )?;
+                    api_tokens::insert(
+                        &tx,
+                        user_id,
+                        &name,
+                        &prefix,
+                        &token_hash,
+                        TokenScope::Read,
+                        None,
+                    )?;
+                    if replaced > 0 {
+                        tracing::info!(user = %username, token = %name, replaced, "older API tokens of the same device revoked");
+                    }
+                    Some((username, name))
+                }
             }
-            _ => false,
+            _ => None,
         };
         tx.commit()?;
         Ok(granted)
     })
     .await;
     match redeemed {
-        Ok(true) => (
-            [(header::CACHE_CONTROL, "no-store")],
-            Json(json!({ "token": token })),
-        )
-            .into_response(),
-        Ok(false) => invalid_grant(),
+        Ok(Some((username, name))) => {
+            tracing::info!(user = %username, token = %name, scope = "read", "API token created");
+            (
+                [(header::CACHE_CONTROL, "no-store")],
+                Json(json!({ "token": token })),
+            )
+                .into_response()
+        }
+        Ok(None) => invalid_grant(),
+        // A busy database or a pool that makes the request wait too long is
+        // not worth a 500 to the extension: it is told what it is told for
+        // any other failure, and may try again.
+        Err(err) if is_busy(&err) => {
+            tracing::warn!("extension token exchange gave up on a busy database: {err}");
+            invalid_grant()
+        }
         Err(err) => {
             tracing::error!("extension token exchange failed: {err}");
             ApiError::internal(err).into_response()
         }
+    }
+}
+
+/// A locked database (`SQLITE_BUSY`, `SQLITE_LOCKED`) or a connection pool
+/// that timed out or closed.
+fn is_busy(err: &db::DbError) -> bool {
+    match err {
+        db::DbError::Pool(_) => true,
+        db::DbError::Sql(rusqlite::Error::SqliteFailure(failure, _)) => matches!(
+            failure.code,
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+        ),
+        _ => false,
     }
 }
 
@@ -238,6 +286,24 @@ mod tests {
             "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXl",
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         ));
+    }
+
+    #[test]
+    fn busy_and_pool_errors_are_told_apart_from_real_ones() {
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        assert!(is_busy(&db::DbError::Sql(busy)));
+        let locked = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+            None,
+        );
+        assert!(is_busy(&db::DbError::Sql(locked)));
+        assert!(!is_busy(&db::DbError::Sql(
+            rusqlite::Error::QueryReturnedNoRows
+        )));
+        assert!(!is_busy(&db::DbError::Interact("panic".into())));
     }
 
     #[test]
