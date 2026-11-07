@@ -4,6 +4,14 @@
   {%- if let Some(reason) = reason %}
   <p class="help">{{ reason }}</p>
   {%- endif %}
+  {%- if let Some(p) = presented %}
+  {#- A certificate TLS did not accept: its fingerprint (not a secret), and a button that puts it in the field. The admin still has to save. -#}
+  <div class="stack-sm">
+    <p class="help">{{ p.hint }}</p>
+    <p><code class="mono" id="service-test-fingerprint">{{ p.shown }}</code></p>
+    <p><button type="button" class="btn btn-secondary btn-sm" data-use-fingerprint="{{ p.plain }}" data-target="f-cert_sha256">{{ p.button }}</button></p>
+  </div>
+  {%- endif %}
   {%- if !rows.is_empty() %}
   <ul class="list" role="list">
     {%- for row in rows %}

@@ -15,6 +15,8 @@
 {%- else %}
 {% call m::page_header(ctx.title, tr(form.kind_label), "/settings/services") %}{% endcall %}
 
+{#- Fills the fingerprint field from the button in the test result. -#}
+<script type="module" src="/static/magpie/service-form.js"></script>
 <form class="form" id="service-form" method="post" action="{{ form.action }}">
   <input type="hidden" name="kind" value="{{ form.kind }}">
   {%- if let Some(id) = form.id %}
@@ -32,6 +34,8 @@
     {{ m::field_text(&f.name, tr(f.label_key), value=&f.value, kind="text", placeholder=f.placeholder, required=f.required, help=tr(f.help), error=&f.error) }}
     {%- endif %}
     {%- endfor %}
+    {#- Every service may pin the certificate of a server that signs its own. Only for https; shown to admins only, like the whole form. -#}
+    {{ m::field_text("cert_sha256", tr("service.pin"), value=&form.cert_value, placeholder="AA:BB:CC:…", help=tr("service.pin_help"), error=&form.cert_error) }}
     {%- if let Some(s) = form.secret %}
     {#- Never filled in: the secret does not come back from the server. -#}
     {%- if form.has_secret && form.secret_unreadable %}

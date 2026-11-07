@@ -25,6 +25,10 @@ use crate::integrations::{self, Integration};
 /// The purpose a service's secret is sealed for.
 pub const SECRET_PURPOSE: &str = "magpie.service.secret";
 
+/// The form field (and error field) of the pinned certificate's fingerprint,
+/// the same as its settings key.
+pub const CERT_FIELD: &str = integrations::pin::SETTING;
+
 /// The longest interval an admin may choose (a day).
 pub const MAX_INTERVAL_S: i64 = 86_400;
 
@@ -267,6 +271,27 @@ pub fn without_userinfo(url: &str) -> String {
     }
 }
 
+/// `settings` as they are stored: a pin in any usual spelling as 64 lowercase
+/// hex characters, an empty one left out.
+pub fn canonical_settings(settings: &Json) -> Json {
+    let mut settings = settings.clone();
+    if let Some(map) = settings.as_object_mut() {
+        let pin = map.get(integrations::pin::SETTING).and_then(Json::as_str);
+        match pin.map(str::trim) {
+            Some("") => {
+                map.remove(integrations::pin::SETTING);
+            }
+            Some(text) => {
+                if let Some(hex) = integrations::pin::normalize(text) {
+                    map.insert(integrations::pin::SETTING.to_string(), Json::String(hex));
+                }
+            }
+            None => {}
+        }
+    }
+    settings
+}
+
 impl ServiceInput {
     /// The kind, if this build has it.
     pub fn integration(&self) -> Option<&'static dyn Integration> {
@@ -327,9 +352,11 @@ impl ServiceInput {
             }
         }
         for (key, value) in settings {
-            if value
-                .as_str()
-                .is_some_and(|text| text.chars().count() > 1024)
+            // The pin has its own message.
+            if key != integrations::pin::SETTING
+                && value
+                    .as_str()
+                    .is_some_and(|text| text.chars().count() > 1024)
             {
                 errors.push(FieldError::new(format!("f_{key}"), "err.too_long"));
             }
@@ -339,6 +366,21 @@ impl ServiceInput {
                 format!("f_{}", problem.field),
                 problem.message_key,
             ));
+        }
+        match integrations::pin::from_settings(&self.settings) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                // A pin is for TLS: on a plain-http address it would pin nothing.
+                let https = self
+                    .url
+                    .as_deref()
+                    .and_then(|url| Url::parse(url.trim()).ok())
+                    .is_some_and(|url| url.scheme() == "https");
+                if !https {
+                    errors.push(FieldError::new(CERT_FIELD, "err.fingerprint_https"));
+                }
+            }
+            Err(_) => errors.push(FieldError::new(CERT_FIELD, "err.fingerprint")),
         }
         if let SecretChange::Replace(secret) = &self.secret {
             let has_field = kind.fields().iter().any(|f| f.secret);

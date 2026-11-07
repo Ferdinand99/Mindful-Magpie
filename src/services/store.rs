@@ -39,6 +39,10 @@ pub enum CtxError {
     /// it holds is no longer what the caller meant to fetch.
     #[error("the service changed")]
     Changed,
+    /// The service's settings can't be used (a pin that is not a fingerprint,
+    /// or one on an address that is not https).
+    #[error("the service's settings can't be used")]
+    Config,
     #[error(transparent)]
     Db(#[from] DbError),
 }
@@ -211,7 +215,8 @@ fn encode(input: &ServiceInput) -> (String, Option<String>, String) {
         .map(str::trim)
         .filter(|u| !u.is_empty())
         .map(str::to_string);
-    let settings = serde_json::to_string(&input.settings).unwrap_or_else(|_| "{}".into());
+    let settings = serde_json::to_string(&super::canonical_settings(&input.settings))
+        .unwrap_or_else(|_| "{}".into());
     (input.name.trim().to_string(), url, settings)
 }
 
@@ -401,14 +406,16 @@ impl CtxError {
     pub fn fetch_error(&self) -> FetchError {
         match self {
             CtxError::SecretUnreadable(_) => FetchError::SecretUnreadable,
+            CtxError::Config => FetchError::Config,
             CtxError::Changed | CtxError::Db(_) => FetchError::Other,
         }
     }
 }
 
-/// What a fetch of `service` needs: the shared client, its settings with the
-/// address added as `"url"`, and its secret, opened. The address and the secret
-/// come from one row, and [`CtxError::Changed`] answers when that row is not the
+/// What a fetch of `service` needs: its client (the shared one, or the one
+/// that accepts only its pinned certificate), its settings with the address
+/// added as `"url"`, and its secret, opened. The address and the secret come
+/// from one row, and [`CtxError::Changed`] answers when that row is not the
 /// `service` the caller holds (changed or deleted since it was read), so a new
 /// key is never sent to an old address or the other way round.
 pub async fn fetch_ctx(core: &Core, service: &Service) -> Result<FetchCtx, CtxError> {
@@ -425,9 +432,11 @@ pub async fn fetch_ctx(core: &Core, service: &Service) -> Result<FetchCtx, CtxEr
     if let Some(url) = &stored.url {
         settings.insert("url".into(), Json::String(url.clone()));
     }
+    let settings = Json::Object(settings);
+    let http = crate::integrations::client_for(&settings).map_err(|_| CtxError::Config)?;
     Ok(FetchCtx {
-        http: crate::integrations::client().clone(),
-        settings: Json::Object(settings),
+        http,
+        settings,
         secret,
     })
 }

@@ -440,7 +440,14 @@ impl Supervisor {
 
     async fn reload(&mut self, id: i64) {
         match store::get(&self.core, id).await {
-            Ok(Some(service)) => self.spawn(service, Duration::ZERO),
+            Ok(Some(service)) => {
+                // Saved again, or announced: an app that was too old a few
+                // minutes ago may have been upgraded since.
+                if let Some(url) = &service.url {
+                    super::api::forget_all_for(url);
+                }
+                self.spawn(service, Duration::ZERO);
+            }
             Ok(None) => self.remove(id).await,
             Err(err) => tracing::warn!(service_id = id, %err, "poller can't read the service"),
         }
@@ -627,7 +634,11 @@ impl Job {
                 return Some((Snapshot::failed(&err.fetch_error()), true));
             }
         };
-        ctx.http = self.http.clone();
+        // The client the poller was started with, unless the service is pinned:
+        // then it keeps its own, which accepts only its certificate.
+        if !matches!(super::pin::from_settings(&ctx.settings), Ok(Some(_))) {
+            ctx.http = self.http.clone();
+        }
         let kind = self.kind;
         let fetch = tokio::spawn(async move { kind.fetch(&ctx).await });
         let _stop = AbortOnDrop(fetch.abort_handle());

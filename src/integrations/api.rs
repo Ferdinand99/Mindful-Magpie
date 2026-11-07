@@ -7,7 +7,7 @@
 //! Nothing here puts a token, an address or a response text into an error.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderValue};
@@ -18,8 +18,9 @@ use vole_kit::net::check_host;
 
 use super::{FetchError, classify, read_capped};
 
-/// How long an address that answered 404 is left alone.
-pub const OLD_FOR: Duration = Duration::from_secs(60 * 60);
+/// How long an address that answered 404 is left alone. Short, because an
+/// app that was too old is often upgraded within minutes of being added.
+pub const OLD_FOR: Duration = Duration::from_secs(5 * 60);
 /// Most addresses an [`OldAddresses`] remembers; past that the oldest goes.
 pub const OLD_MAX: usize = 128;
 
@@ -121,27 +122,43 @@ pub async fn get_json<T: DeserializeOwned>(
     }
 }
 
+/// The addresses that answered 404, and when.
+type Seen = Mutex<VecDeque<(String, Instant)>>;
+
+/// Every [`OldAddresses`] that holds anything, so [`forget_all_for`] reaches
+/// the memory of each kind without the kinds having to be listed. Dropped
+/// memories are swept when it is used.
+fn registry() -> std::sync::MutexGuard<'static, Vec<Weak<Seen>>> {
+    static ALL: Mutex<Vec<Weak<Seen>>> = Mutex::new(Vec::new());
+    ALL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The addresses that answered 404, and when: a kind asks them again only
 /// after [`OLD_FOR`]. The keys never leave memory. Bounded by [`OLD_MAX`],
 /// oldest first out.
 #[derive(Debug, Default)]
 pub struct OldAddresses {
-    seen: Mutex<VecDeque<(String, Instant)>>,
+    seen: OnceLock<Arc<Seen>>,
 }
 
 impl OldAddresses {
     pub const fn new() -> Self {
         OldAddresses {
-            seen: Mutex::new(VecDeque::new()),
+            seen: OnceLock::new(),
         }
     }
 
     fn list(&self) -> std::sync::MutexGuard<'_, VecDeque<(String, Instant)>> {
+        let seen = self.seen.get_or_init(|| {
+            let seen = Arc::new(Mutex::new(VecDeque::new()));
+            registry().push(Arc::downgrade(&seen));
+            seen
+        });
         // A panic elsewhere cannot leave the list in a state that matters.
-        self.seen.lock().unwrap_or_else(|e| e.into_inner())
+        seen.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Whether `key` answered 404 less than an hour before `now`.
+    /// Whether `key` answered 404 less than [`OLD_FOR`] before `now`.
     pub fn is_old(&self, key: &str, now: Instant) -> bool {
         let mut seen = self.list();
         seen.retain(|(_, at)| now.saturating_duration_since(*at) < OLD_FOR);
@@ -170,6 +187,36 @@ impl OldAddresses {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+/// Makes every kind ask the service at `base` again, whatever it answered
+/// before: forgets each remembered 404 of an address on `base` (its origin and
+/// path, without the query and fragment). Call it when the service is saved or
+/// tested. A `base` that is not an address changes nothing.
+pub fn forget_all_for(base: &str) {
+    let Ok(url) = Url::parse(base.trim()) else {
+        return;
+    };
+    if !url.origin().is_tuple() {
+        return;
+    }
+    // The keys are endpoint addresses (see [`endpoint`]): the service's own
+    // address and then the path of the call.
+    let prefix = format!(
+        "{}{}/",
+        url.origin().ascii_serialization(),
+        url.path().trim_end_matches('/')
+    );
+    let all: Vec<Arc<Seen>> = {
+        let mut all = registry();
+        all.retain(|weak| weak.strong_count() > 0);
+        all.iter().filter_map(Weak::upgrade).collect()
+    };
+    for seen in all {
+        seen.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(key, _)| !key.starts_with(&prefix));
     }
 }
 
@@ -293,7 +340,8 @@ mod tests {
     }
 
     #[test]
-    fn an_old_address_is_left_alone_for_an_hour() {
+    fn an_old_address_is_left_alone_for_five_minutes() {
+        assert_eq!(OLD_FOR, Duration::from_secs(5 * 60));
         let start = Instant::now();
         let old = OldAddresses::new();
         assert!(!old.is_old("a", start));
@@ -306,6 +354,61 @@ mod tests {
         old.mark("a", start);
         old.forget("a");
         assert!(!old.is_old("a", start));
+    }
+
+    #[test]
+    fn an_address_is_forgotten_by_every_kind_that_remembers_it() {
+        let now = Instant::now();
+        let (vv, kk) = (OldAddresses::new(), OldAddresses::new());
+        let key = |base: &str, path: &str| format!("{base}{path}");
+        for memory in [&vv, &kk] {
+            memory.mark(&key("http://forget-me.test:3000", "/api/v1/summary"), now);
+            memory.mark(
+                &key("http://forget-me.test:3000/vole", "/api/v1/summary"),
+                now,
+            );
+            memory.mark(&key("http://keep-me.test:3000", "/api/v1/summary"), now);
+            memory.mark(&key("http://forget-me.test:3001", "/api/v1/summary"), now);
+        }
+        // The address as an admin typed it: a trailing slash, a query, a fragment.
+        forget_all_for(" http://forget-me.test:3000/?x=1#f ");
+        for memory in [&vv, &kk] {
+            assert!(!memory.is_old("http://forget-me.test:3000/api/v1/summary", now));
+            assert!(
+                !memory.is_old("http://forget-me.test:3000/vole/api/v1/summary", now),
+                "a service under a prefix of the same origin goes too"
+            );
+            assert!(memory.is_old("http://keep-me.test:3000/api/v1/summary", now));
+            assert!(
+                memory.is_old("http://forget-me.test:3001/api/v1/summary", now),
+                "another port is another address"
+            );
+        }
+        // An address under a path goes without the rest of its origin.
+        let other = OldAddresses::new();
+        other.mark("http://path.test/a/api/v1/summary", now);
+        other.mark("http://path.test/b/api/v1/summary", now);
+        forget_all_for("http://path.test/a");
+        assert!(!other.is_old("http://path.test/a/api/v1/summary", now));
+        assert!(other.is_old("http://path.test/b/api/v1/summary", now));
+        // Nonsense changes nothing.
+        forget_all_for("");
+        forget_all_for("not an address");
+        assert!(other.is_old("http://path.test/b/api/v1/summary", now));
+    }
+
+    #[test]
+    fn a_dropped_memory_does_not_stay_in_the_registry() {
+        {
+            let gone = OldAddresses::new();
+            gone.mark("http://dropped.test/api", Instant::now());
+        }
+        // Must not panic or leak; the dead entry is swept.
+        forget_all_for("http://dropped.test/");
+        let live = OldAddresses::new();
+        live.mark("http://dropped.test/api", Instant::now());
+        forget_all_for("http://dropped.test/");
+        assert!(live.is_empty());
     }
 
     #[test]
