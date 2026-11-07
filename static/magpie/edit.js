@@ -16,7 +16,9 @@
 // `save(layout)` resolves to `{ status, body }` (the server's answer) and rejects
 // when the network fails. `opts`: `labels` (interface strings), `lang`,
 // `editButton` (the header button; it shows aria-pressed and gets focus back),
-// `reload` (called by «Reload» after a conflict).
+// `reload` (called by «Reload» after a conflict), `draft` (a layout to start from
+// instead of the stored one: an unsaved draft that was kept, see start.js) and
+// `onDiscard` (called when the person gives the changes up).
 import {
   addBookmark,
   addCard,
@@ -90,6 +92,9 @@ export const LABEL_KEYS = [
   "confirm_leave",
   "confirm_leave_text",
   "confirm_leave_yes",
+  "restore_notice",
+  "restore_yes",
+  "restore_discard",
   "conflict",
   "reload",
   "save_failed",
@@ -251,8 +256,11 @@ export function startEditing(root, getLayout, save, opts = {}) {
   const reload = opts.reload ?? (() => win.location.reload());
   const navigate = opts.navigate ?? ((href) => win.location.assign(href));
 
-  let draft = structuredClone(getLayout());
-  const baseline = JSON.stringify(draft);
+  const stored = getLayout();
+  let draft = structuredClone(opts.draft ?? stored);
+  // What "unsaved" is measured against: the stored layout (a kept draft is unsaved by definition).
+  const baseline = JSON.stringify(opts.draft ? stored : draft);
+  const onDiscard = opts.onDiscard ?? (() => {});
   let active = true;
   let saving = false;
   let notice = null;
@@ -452,14 +460,17 @@ export function startEditing(root, getLayout, save, opts = {}) {
   }
 
   /**
-   * Puts focus on a control. `spec` is `{ toolbar: name }` or
+   * Puts focus on a control. `spec` is `{ toolbar: name }`, `{ el }` (an
+   * element outside the editor, such as the link that was clicked) or
    * `{ kind, id, act }` (an item's control, by name). A control that is
    * disabled or gone falls back to the item's first usable button.
    */
   function focusControl(spec) {
     if (!active || !spec) return;
     let target = null;
-    if (spec.toolbar) {
+    if (spec.el) {
+      target = spec.el.isConnected ? spec.el : null;
+    } else if (spec.toolbar) {
       target = toolbarButton(spec.toolbar);
     } else {
       const el = find(spec.kind, spec.id);
@@ -652,6 +663,7 @@ export function startEditing(root, getLayout, save, opts = {}) {
     sheet.foot.appendChild(submitButton);
     form.addEventListener("submit", (event) => {
       event.preventDefault();
+      if (saving) return;
       const values = read(form);
       const found = check(values);
       if (Object.keys(found).length > 0) {
@@ -886,7 +898,8 @@ export function startEditing(root, getLayout, save, opts = {}) {
   /** Handles a click on one of the page's controls. */
   function handleClick(event) {
     const button = event.target.closest?.("button[data-act]");
-    if (!button || button.hasAttribute("disabled") || !active) return;
+    // While a save is under way the draft is what was sent: no changes.
+    if (!button || button.hasAttribute("disabled") || !active || saving) return;
     const act = button.getAttribute("data-act");
     const owner = button.closest("[data-kind]");
     const kind = owner?.getAttribute("data-kind");
@@ -901,6 +914,9 @@ export function startEditing(root, getLayout, save, opts = {}) {
     } else if (act === "cancel") {
       cancel();
     } else if (act === "reload") {
+      // Off with the page guards first: the draft is given up, and the browser
+      // must not ask a second time.
+      finish(getLayout(), { focus: false });
       reload();
     } else if (kind === "group") {
       const group = draft.groups.find((g) => g.id === id);
@@ -1037,7 +1053,11 @@ export function startEditing(root, getLayout, save, opts = {}) {
       noLabel: L("confirm_keep"),
       destructive: true,
       trigger: { toolbar: "cancel" },
-      onResult: (yes) => (yes ? finish(getLayout()) : focusControl({ toolbar: "cancel" })),
+      onResult: (yes) => {
+        if (!yes) return focusControl({ toolbar: "cancel" });
+        finish(getLayout());
+        onDiscard();
+      },
     });
   }
 
@@ -1057,13 +1077,36 @@ export function startEditing(root, getLayout, save, opts = {}) {
     if (editButton) editButton.setAttribute("aria-pressed", "false");
   }
 
-  // Unsaved changes: the browser's prompt on leaving the page, and a sheet for a
-  // link inside the app (a boosted visit does not reload the page).
+  // Unsaved changes. The browser prompt covers leaving the page (a reload, a
+  // typed address, a closed tab). A link or a form inside the app is followed by
+  // htmx without a page load, so a capture-phase listener for each of them (it
+  // runs before htmx) asks with a sheet and lets the visit go on after a "yes".
+  // Back and Forward cannot be stopped: start.js keeps the draft then.
   on(win, "beforeunload", (event) => {
     if (!dirty()) return;
     event.preventDefault();
     event.returnValue = "";
   });
+
+  /** Asks whether to leave; on yes the changes are given up and `proceed` runs. */
+  function askToLeave(trigger, proceed) {
+    confirmSheet({
+      title: L("confirm_leave"),
+      message: L("confirm_leave_text"),
+      yesLabel: L("confirm_leave_yes"),
+      noLabel: L("confirm_keep"),
+      destructive: true,
+      trigger,
+      onResult: (yes) => {
+        if (!yes) return focusControl(trigger);
+        // The plain page goes into the history, not the edit controls.
+        finish(getLayout(), { focus: false });
+        onDiscard();
+        proceed();
+      },
+    });
+  }
+
   on(
     doc,
     "click",
@@ -1076,19 +1119,29 @@ export function startEditing(root, getLayout, save, opts = {}) {
       if (href.startsWith("#") || /^\s*javascript:/i.test(href)) return;
       event.preventDefault();
       event.stopPropagation();
-      confirmSheet({
-        title: L("confirm_leave"),
-        message: L("confirm_leave_text"),
-        yesLabel: L("confirm_leave_yes"),
-        noLabel: L("confirm_keep"),
-        destructive: true,
-        trigger: null,
-        onResult: (yes) => {
-          if (yes) {
-            teardown();
-            navigate(href);
-          }
-        },
+      askToLeave({ el: link }, () => navigate(href));
+    },
+    true,
+  );
+  on(
+    doc,
+    "submit",
+    (event) => {
+      if (!active || !dirty() || event.defaultPrevented) return;
+      const form = event.target;
+      // The editor's own forms are in sheets.
+      if (!form?.closest || form.closest("dialog")) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const submitter = event.submitter ?? null;
+      const trigger = { el: submitter ?? form.querySelector("button, [type=submit]") };
+      askToLeave(trigger, () => {
+        // The guard is off now, so this submit goes through (to htmx, if it boosts the form).
+        try {
+          form.requestSubmit(submitter ?? undefined);
+        } catch {
+          form.requestSubmit();
+        }
       });
     },
     true,
@@ -1098,7 +1151,7 @@ export function startEditing(root, getLayout, save, opts = {}) {
   on(host, "click", (event) => {
     handleClick(event);
     const entry = event.target.closest?.("button[data-path]");
-    if (entry) openProblem(entry.getAttribute("data-path"), problems);
+    if (entry && !saving) openProblem(entry.getAttribute("data-path"), problems);
   });
 
   // -- drag and drop (the HTML drag API) --
@@ -1131,7 +1184,7 @@ export function startEditing(root, getLayout, save, opts = {}) {
 
   /** Where the dragged thing would land: `{ groupId?, index, el, className }` or null. */
   function target(event) {
-    if (!drag) return null;
+    if (!drag || saving) return null;
     const under = event.target;
     if (drag.kind === "card") {
       const cardEl = under.closest?.('[data-kind="card"]');
@@ -1164,6 +1217,10 @@ export function startEditing(root, getLayout, save, opts = {}) {
     const source = draggable(event.target);
     const owner = source?.closest("[data-kind]");
     if (!owner) return;
+    if (saving) {
+      event.preventDefault();
+      return;
+    }
     drag = { kind: owner.getAttribute("data-kind"), id: owner.getAttribute("data-id") };
     owner.classList.add("mm-dragging");
     const transfer = event.dataTransfer;
@@ -1185,7 +1242,7 @@ export function startEditing(root, getLayout, save, opts = {}) {
     const spot = target(event);
     const dragged = drag;
     endDrag();
-    if (!spot || !dragged) return;
+    if (!spot || !dragged || saving) return;
     event.preventDefault();
     if (dragged.kind === "card") {
       const from = findCard(dragged.id);

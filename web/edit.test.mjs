@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { parseHTML } from "linkedom";
 
 import { startEditing } from "../static/magpie/edit.js";
-import { draw, drawIfNeeded, initEditing, makeSave } from "../static/magpie/start.js";
+import { clearStash, draw, drawIfNeeded, initEditing, makeSave, readStash, stashDraft } from "../static/magpie/start.js";
 
 // The real English strings, so that the tests and the locale file cannot drift.
 function readStartStrings(path) {
@@ -538,7 +538,6 @@ test("a_link_click_with_unsaved_changes_asks_first", async () => {
   const link = t.document.createElement("a");
   link.setAttribute("href", "/settings");
   t.document.body.appendChild(link);
-  assert.equal(new t.window.Event("click", { cancelable: true }).defaultPrevented, false);
   const clean = new t.window.Event("click", { bubbles: true, cancelable: true });
   link.dispatchEvent(clean);
   assert.equal(clean.defaultPrevented, false, "nothing to lose");
@@ -547,7 +546,13 @@ test("a_link_click_with_unsaved_changes_asks_first", async () => {
   const e = new t.window.Event("click", { bubbles: true, cancelable: true });
   link.dispatchEvent(e);
   assert.equal(e.defaultPrevented, true);
-  assert.ok(sheet(t.document), "the confirm sheet is open");
+  const confirm = sheet(t.document);
+  assert.ok(confirm, "the confirm sheet is open");
+  // "Keep editing" puts focus back on the link that was clicked.
+  click(confirm.querySelector('[data-answer="no"]'));
+  await tick();
+  assert.equal(t.focus.last, link);
+  assert.ok(t.root.hasAttribute("data-editing"));
 });
 
 test("the_limits_stop_an_add_with_a_message", () => {
@@ -608,13 +613,11 @@ test("hostile_text_stays_text_in_edit_mode", () => {
 
 test("the_edit_button_opens_and_closes_edit_mode", async () => {
   const t = setup();
-  const loaded = [];
   initEditing(t.document, {
     load: async () => ({ startEditing }),
     save: async (next) => ({ status: 200, body: { version: next.version + 1 } }),
     reload: () => {},
   });
-  void loaded;
   const button = t.document.getElementById("mm-edit");
   click(button);
   await tick();
@@ -690,4 +693,372 @@ test("every_string_edit_mode_uses_is_in_both_locales", () => {
   // The page's own strings too (the Edit button).
   assert.ok(LABELS.edit && NB.edit);
   assert.deepEqual(Object.keys(NB).sort(), Object.keys(LABELS).sort(), "nb and en have the same keys");
+});
+
+test("a_form_submit_with_unsaved_changes_asks_first_and_goes_on_after_yes", async () => {
+  const t = setup();
+  t.start();
+  const form = t.document.createElement("form");
+  form.setAttribute("action", "/logout");
+  form.setAttribute("method", "post");
+  const submitter = t.document.createElement("button");
+  submitter.setAttribute("type", "submit");
+  form.appendChild(submitter);
+  t.document.body.appendChild(form);
+  const submits = [];
+  form.requestSubmit = (who) => submits.push(who ?? null);
+  const fire = () => {
+    const event = new t.window.Event("submit", { bubbles: true, cancelable: true });
+    event.submitter = submitter;
+    form.dispatchEvent(event);
+    return event;
+  };
+  assert.equal(fire().defaultPrevented, false, "nothing to lose");
+
+  click(act(item(t.root, "card", "c1"), "delete"));
+  assert.equal(fire().defaultPrevented, true);
+  assert.equal(submits.length, 0);
+  const confirm = sheet(t.document);
+  assert.ok(confirm, "the leave sheet is open");
+  assert.match(confirm.textContent, /Leave without saving/);
+
+  // Keep editing: focus goes back to the button that was pressed.
+  click(confirm.querySelector('[data-answer="no"]'));
+  await tick();
+  assert.equal(t.focus.last, submitter);
+  assert.equal(submits.length, 0);
+  assert.ok(t.root.hasAttribute("data-editing"));
+
+  fire();
+  click(sheet(t.document).querySelector('[data-answer="yes"]'));
+  await tick();
+  assert.deepEqual(submits, [submitter], "the form is submitted again, with its submitter");
+  assert.equal(t.root.hasAttribute("data-editing"), false);
+  assert.equal(t.root.querySelectorAll("[data-act]").length, 0, "the history gets the plain page");
+  assert.equal(fire().defaultPrevented, false, "the guard is gone");
+});
+
+test("the_forms_of_the_editor_itself_are_not_guarded", async () => {
+  const t = setup();
+  const ed = t.start();
+  click(act(item(t.root, "card", "c1"), "delete"));
+  click(act(bar(t.document), "add-bookmark"));
+  fill(sheet(t.document), { title: "Docs", url: "docs.example.com" });
+  submit(sheet(t.document));
+  await tick();
+  assert.equal(ed.draft().bookmarks.length, 2);
+});
+
+test("input_is_refused_while_a_save_is_under_way", async () => {
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const t = setup({ saveResult: () => gate });
+  const ed = t.start();
+  click(act(item(t.root, "card", "c1"), "delete"));
+  click(act(bar(t.document), "done"));
+  await tick();
+  assert.equal(t.saved.length, 1);
+
+  // The controls and the drag and drop do nothing now.
+  click(act(item(t.root, "card", "c2"), "delete"));
+  click(act(item(t.root, "group", "g1"), "rename"));
+  click(act(bar(t.document), "add-group"));
+  assert.equal(sheet(t.document), null);
+  assert.equal(ed.draft().groups[0].cards.length, 1);
+  const start = new t.window.Event("dragstart", { bubbles: true, cancelable: true });
+  start.dataTransfer = { setData() {}, setDragImage() {}, effectAllowed: "" };
+  item(t.root, "card", "c2").dispatchEvent(start);
+  assert.equal(start.defaultPrevented, true, "no drag starts");
+
+  release({ status: 200, body: { version: 4 } });
+  await tick();
+  assert.equal(t.root.hasAttribute("data-editing"), false);
+  // What was drawn is what was saved: Radarr (c2) is still there.
+  assert.deepEqual(t.saved[0].groups[0].cards.map((c) => c.id), ["c2"]);
+  assert.ok(t.root.textContent.includes("Radarr"));
+});
+
+test("reload_gives_up_the_page_guards_so_the_browser_does_not_ask_twice", async () => {
+  const t = setup({ saveResult: { status: 409, body: { error: "conflict", current: 9 } } });
+  t.start();
+  click(act(item(t.root, "card", "c1"), "delete"));
+  click(act(bar(t.document), "done"));
+  await tick();
+  const unload = () => {
+    const event = new t.window.Event("beforeunload", { cancelable: true });
+    t.window.dispatchEvent(event);
+    return event.defaultPrevented;
+  };
+  assert.equal(unload(), true, "the guard is on while the draft is open");
+  click(act(t.document.querySelector(".mm-edit-alert"), "reload"));
+  assert.equal(t.reloads.length, 1);
+  assert.equal(unload(), false, "and off when the page reloads");
+  assert.equal(t.root.hasAttribute("data-editing"), false);
+});
+
+// ---- a draft kept across Back and Forward ----------------------------------
+
+function fakeStorage() {
+  const map = new Map();
+  return {
+    map,
+    getItem: (key) => (map.has(key) ? map.get(key) : null),
+    setItem: (key, value) => void map.set(key, String(value)),
+    removeItem: (key) => void map.delete(key),
+  };
+}
+
+const denied = {
+  getItem() {
+    throw new Error("SecurityError");
+  },
+  setItem() {
+    throw new Error("QuotaExceededError");
+  },
+  removeItem() {
+    throw new Error("SecurityError");
+  },
+};
+
+function wired(t, storage, save) {
+  return initEditing(t.document, {
+    load: async () => ({ startEditing }),
+    save: save ?? (async (next) => ({ status: 200, body: { version: next.version + 1 } })),
+    reload: () => {},
+    navigate: () => {},
+    storage,
+  });
+}
+
+const keptDraft = () => {
+  const draft = layoutFixture();
+  draft.groups[0].cards.shift();
+  draft.groups[0].title = "Kept";
+  return draft;
+};
+
+test("history_save_while_dirty_keeps_the_draft_and_shows_the_plain_page", async () => {
+  const t = setup();
+  const storage = fakeStorage();
+  const editing = wired(t, storage);
+  click(t.document.getElementById("mm-edit"));
+  await tick();
+  click(act(item(t.root, "card", "c1"), "delete"));
+
+  editing.leave();
+  assert.equal(t.root.hasAttribute("data-editing"), false, "the history gets the plain page");
+  assert.equal(t.root.querySelectorAll("[data-act]").length, 0);
+  assert.ok(t.root.textContent.includes("Sonarr"), "the page shows what is stored");
+  const kept = readStash(storage);
+  assert.deepEqual(kept.groups[0].cards.map((c) => c.id), ["c2"], "the draft is not lost");
+  assert.equal(kept.version, 3);
+  assert.equal(JSON.parse([...storage.map.values()][0]).version, 3);
+});
+
+test("history_save_without_changes_keeps_nothing", async () => {
+  const t = setup();
+  const storage = fakeStorage();
+  const editing = wired(t, storage);
+  click(t.document.getElementById("mm-edit"));
+  await tick();
+  editing.leave();
+  assert.equal(t.root.hasAttribute("data-editing"), false);
+  assert.equal(storage.map.size, 0);
+});
+
+test("the_restore_notice_reopens_edit_mode_on_the_kept_draft", async () => {
+  const t = setup();
+  const storage = fakeStorage();
+  stashDraft(storage, keptDraft());
+  const editing = wired(t, storage);
+  editing.offerRestore();
+  editing.offerRestore();
+  const notice = t.document.getElementById("mm-restore");
+  assert.ok(notice);
+  assert.equal(t.document.querySelectorAll("#mm-restore").length, 1, "offered once");
+  assert.match(notice.textContent, /You have unsaved changes from before/);
+  const [restore, forget] = notice.querySelectorAll("button");
+  assert.equal(restore.textContent, "Restore");
+  assert.equal(forget.textContent, "Discard");
+  assert.equal(t.focus.count, 0, "the notice does not take focus");
+
+  click(restore);
+  await tick();
+  assert.ok(t.root.hasAttribute("data-editing"));
+  assert.equal(t.document.getElementById("mm-restore"), null);
+  assert.equal(item(t.root, "card", "c1"), null, "the kept draft is on screen");
+  assert.ok(item(t.root, "card", "c2"));
+  assert.ok(t.root.textContent.includes("Kept"));
+  assert.ok(readStash(storage), "kept until it is saved or given up");
+});
+
+test("a_restored_draft_saves_with_its_version_and_clears_the_kept_copy", async () => {
+  const t = setup();
+  const storage = fakeStorage();
+  stashDraft(storage, keptDraft());
+  const sent = [];
+  const editing = wired(t, storage, async (next) => {
+    sent.push(next);
+    return { status: 200, body: { version: next.version + 1 } };
+  });
+  editing.offerRestore();
+  click(t.document.querySelector("#mm-restore button"));
+  await tick();
+  click(act(bar(t.document), "done"));
+  await tick();
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].version, 3);
+  assert.equal(sent[0].groups[0].title, "Kept");
+  assert.equal(readStash(storage), null);
+  assert.equal(storage.map.size, 0);
+});
+
+test("a_restored_draft_over_a_newer_page_takes_the_normal_409_path", async () => {
+  const t = setup();
+  const storage = fakeStorage();
+  stashDraft(storage, { ...keptDraft(), version: 1 });
+  const editing = wired(t, storage, async () => ({ status: 409, body: { error: "conflict", current: 3 } }));
+  editing.offerRestore();
+  click(t.document.querySelector("#mm-restore button"));
+  await tick();
+  click(act(bar(t.document), "done"));
+  await tick();
+  assert.match(alertText(t.document), /changed in another tab/);
+  assert.ok(readStash(storage), "a failed save keeps the draft");
+  assert.ok(t.root.hasAttribute("data-editing"));
+});
+
+test("cancel_and_discard_delete_the_kept_draft", async () => {
+  // Cancel in a restored edit session.
+  let t = setup();
+  let storage = fakeStorage();
+  stashDraft(storage, keptDraft());
+  let editing = wired(t, storage);
+  editing.offerRestore();
+  click(t.document.querySelector("#mm-restore button"));
+  await tick();
+  click(act(bar(t.document), "cancel"));
+  click(sheet(t.document).querySelector('[data-answer="yes"]'));
+  await tick();
+  assert.equal(storage.map.size, 0);
+  assert.equal(t.root.hasAttribute("data-editing"), false);
+
+  // The notice's Discard.
+  t = setup();
+  storage = fakeStorage();
+  stashDraft(storage, keptDraft());
+  editing = wired(t, storage);
+  editing.offerRestore();
+  click(t.document.querySelectorAll("#mm-restore button")[1]);
+  assert.equal(storage.map.size, 0);
+  assert.equal(t.document.getElementById("mm-restore"), null);
+  assert.equal(t.root.hasAttribute("data-editing"), false);
+
+  // Leaving through a link after "Leave" also gives the changes up.
+  t = setup();
+  storage = fakeStorage();
+  stashDraft(storage, keptDraft());
+  editing = wired(t, storage);
+  editing.offerRestore();
+  click(t.document.querySelector("#mm-restore button"));
+  await tick();
+  const link = t.document.createElement("a");
+  link.setAttribute("href", "/settings");
+  t.document.body.appendChild(link);
+  link.dispatchEvent(new t.window.Event("click", { bubbles: true, cancelable: true }));
+  click(sheet(t.document).querySelector('[data-answer="yes"]'));
+  await tick();
+  assert.equal(storage.map.size, 0);
+});
+
+test("a_kept_draft_that_is_not_a_layout_is_ignored", () => {
+  const t = setup();
+  const storage = fakeStorage();
+  for (const junk of ["garbage", "null", "{}", JSON.stringify({ version: 1, draft: { groups: [1], bookmarks: [] } }), JSON.stringify({ draft: keptDraft() })]) {
+    storage.setItem("mm-unsaved-draft", junk);
+    assert.equal(readStash(storage), null, junk);
+    wired(t, storage).offerRestore();
+    assert.equal(t.document.getElementById("mm-restore"), null, junk);
+  }
+  clearStash(storage);
+  assert.equal(storage.map.size, 0);
+});
+
+test("storage_that_throws_does_not_break_the_page", async () => {
+  const t = setup();
+  const editing = wired(t, denied);
+  assert.doesNotThrow(() => editing.offerRestore());
+  assert.equal(t.document.getElementById("mm-restore"), null);
+  click(t.document.getElementById("mm-edit"));
+  await tick();
+  click(act(item(t.root, "card", "c1"), "delete"));
+  assert.doesNotThrow(() => editing.leave(), "the draft is lost, as before, but nothing breaks");
+  assert.equal(t.root.hasAttribute("data-editing"), false);
+
+  // Saving still works, and so does a restored session without storage.
+  click(t.document.getElementById("mm-edit"));
+  await tick();
+  click(act(item(t.root, "card", "c1"), "delete"));
+  click(act(bar(t.document), "done"));
+  await tick();
+  assert.equal(t.root.hasAttribute("data-editing"), false);
+
+  // sessionStorage itself refusing to be read (blocked cookies).
+  const blocked = setup();
+  Object.defineProperty(blocked.window, "sessionStorage", {
+    get() {
+      throw new Error("SecurityError");
+    },
+  });
+  const other = initEditing(blocked.document, {
+    load: async () => ({ startEditing }),
+    save: async (next) => ({ status: 200, body: { version: next.version + 1 } }),
+  });
+  assert.doesNotThrow(() => other.offerRestore());
+  click(blocked.document.getElementById("mm-edit"));
+  await tick();
+  click(act(item(blocked.root, "card", "c1"), "delete"));
+  assert.doesNotThrow(() => other.leave());
+  assert.equal(blocked.root.hasAttribute("data-editing"), false);
+});
+
+test("edit_mode_works_on_a_page_htmx_put_back_without_its_data_blocks", async () => {
+  // htmx does not keep script elements when it restores a saved body (Back and
+  // Forward): the page is drawn but #mm-layout and #mm-labels are gone.
+  const t = setup();
+  draw(t.document);
+  t.document.getElementById("mm-layout").remove();
+  t.document.getElementById("mm-labels").remove();
+  const storage = fakeStorage();
+  stashDraft(storage, keptDraft());
+  const editing = wired(t, storage);
+  editing.offerRestore();
+  assert.ok(t.document.getElementById("mm-restore"), "the notice still has its strings");
+
+  click(t.document.getElementById("mm-edit"));
+  await tick();
+  // The notice goes when edit mode opens on the stored layout.
+  assert.ok(t.root.hasAttribute("data-editing"));
+  assert.ok(item(t.root, "card", "c1"), "the stored layout, remembered from the first draw");
+  assert.equal(t.document.getElementById("mm-restore"), null);
+  click(act(bar(t.document), "cancel"));
+  await tick();
+  assert.equal(t.root.hasAttribute("data-editing"), false);
+});
+
+test("a_restored_body_without_blocks_is_redrawn_from_memory_not_emptied", () => {
+  // Back to the start page: htmx puts the body back without its script blocks,
+  // and <html> has lost data-bg. Redrawing from the missing blocks would wipe the page.
+  const t = setup();
+  draw(t.document);
+  const drawn = t.root.innerHTML;
+  assert.ok(drawn.includes("Sonarr"));
+  t.document.getElementById("mm-layout").remove();
+  t.document.getElementById("mm-labels").remove();
+  t.document.documentElement.removeAttribute("data-bg");
+  drawIfNeeded(t.document);
+  assert.equal(t.root.innerHTML, drawn);
+  assert.equal(t.document.documentElement.getAttribute("data-bg"), "hedgerow");
 });

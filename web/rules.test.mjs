@@ -52,8 +52,23 @@ test("normalizeUrl_adds_https_to_a_bare_address", () => {
   assert.equal(normalizeUrl("localhost:8080"), "https://localhost:8080");
   assert.equal(normalizeUrl("http://a.example/"), "http://a.example/");
   assert.equal(normalizeUrl("javascript://x"), "javascript://x");
-  assert.equal(urlProblem(normalizeUrl("javascript:alert(1)")), "bad_url");
   assert.equal(normalizeUrl(""), "");
+});
+
+test("normalizeUrl_leaves_a_scheme_alone_so_it_is_refused_as_the_wrong_scheme", () => {
+  for (const value of ["mailto:a@example.com", "javascript:alert(1)", "data:text/html,x", "tel:+4712345678", "file:foo"]) {
+    assert.equal(normalizeUrl(value), value, value);
+    assert.equal(urlProblem(normalizeUrl(value)), "bad_scheme", value);
+  }
+});
+
+test("normalizeUrl_still_treats_host_and_port_as_an_address", () => {
+  assert.equal(normalizeUrl("example.com:8080"), "https://example.com:8080");
+  assert.equal(normalizeUrl("localhost:3000"), "https://localhost:3000");
+  assert.equal(normalizeUrl("example.com:8080/path?x=1"), "https://example.com:8080/path?x=1");
+  assert.equal(normalizeUrl("[::1]:8080"), "https://[::1]:8080");
+  assert.equal(urlProblem(normalizeUrl("localhost:3000")), null);
+  assert.equal(urlProblem(normalizeUrl("example.com:8080")), null);
 });
 
 test("emoji_is_one_visible_symbol_or_empty", () => {

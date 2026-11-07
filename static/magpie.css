@@ -103,6 +103,14 @@ body:has(.main.start) .topbar-inner {
 .mm-notice > div {
   flex: 1 1 18rem;
 }
+.mm-notice > .mm-notice-actions {
+  display: flex;
+  flex: none;
+  gap: var(--sp-2);
+}
+.mm-notice p {
+  margin: 0;
+}
 
 /* Edit mode ------------------------------------------------------------------
    edit.js draws the page with the renderer and adds the controls below. The

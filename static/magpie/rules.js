@@ -48,12 +48,18 @@ function checkText(value, max, required) {
 
 /**
  * What a person typed as a link, made ready to check: surrounding blanks are
- * taken off, and an address without `://` (`example.com`, `localhost:8080`)
- * gets `https://` in front.
+ * taken off, and an address without a scheme (`example.com`, `localhost:3000`,
+ * `example.com:8080/path`) gets `https://` in front. Anything that starts with
+ * a scheme (`mailto:a@b.c`, `javascript:...`) is left as typed, so that the
+ * check refuses it as the wrong scheme instead of turning it into a host.
  */
 export function normalizeUrl(raw) {
   const value = String(raw ?? "").trim();
   if (value === "" || value.includes("://") || /\s/.test(value)) return value;
+  const scheme = /^[A-Za-z][A-Za-z0-9+.-]*:(.*)$/.exec(value);
+  // `host:port` also looks like `scheme:rest`: a port is only digits, and
+  // then the path, query or fragment.
+  if (scheme && !/^\d{1,5}(?:[/?#]|$)/.test(scheme[1])) return value;
   return `https://${value}`;
 }
 
