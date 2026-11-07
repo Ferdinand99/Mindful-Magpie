@@ -4,8 +4,8 @@
 //! **Which needs.** Those of the services that are bound on the user's own
 //! layout and visible to them (the list [`crate::values`] builds the values
 //! document from), and for the `config` need (a service whose settings or
-//! secret can't be used) only an admin's: it asks for something only an admin
-//! can do. A need shows nothing but the translated label of its fixed text
+//! secret can't be used) only an admin's, or the user's own for a personal
+//! service: it asks for something only the one who set the service up can do. A need shows nothing but the translated label of its fixed text
 //! key (see [`label_of`]), without the service's name (the row shows it beside
 //! the text), with a numeric `count` parameter filled in; no other text of a
 //! snapshot reaches a page.
@@ -164,7 +164,9 @@ pub fn needs_for(
     for (service, snapshot) in services {
         let Some(snapshot) = snapshot else { continue };
         for need in &snapshot.needs {
-            if need.key == CONFIG_KEY && !admin {
+            // The config need asks for something only the one who set the service
+            // up can do: an admin for a shared service, the user for their own.
+            if need.key == CONFIG_KEY && !admin && !service.personal {
                 continue;
             }
             let acked = acks
@@ -396,7 +398,7 @@ async fn change(
     let current = snapshot
         .needs
         .iter()
-        .find(|n| n.key == target.key && (viewer.admin || n.key != CONFIG_KEY));
+        .find(|n| n.key == target.key && (viewer.admin || service.personal || n.key != CONFIG_KEY));
     let Some(need) = current else {
         return Ok(not_found());
     };
@@ -427,6 +429,7 @@ mod tests {
             kind: "http".into(),
             name: name.into(),
             interval_s: 60,
+            personal: false,
         }
     }
 

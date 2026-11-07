@@ -164,6 +164,7 @@ pub enum Change {
 enum Control {
     Reload(i64),
     Remove(i64),
+    Resync,
 }
 
 /// A running poller, as the pages see it. Cheap to clone; when the last clone
@@ -191,6 +192,15 @@ impl PollerHandle {
     pub fn reload(&self, service_id: i64) {
         if let Some(control) = &self.control {
             let _ = control.send(Control::Reload(service_id));
+        }
+    }
+
+    /// Looks at every stored service again: a service that is gone (a deleted
+    /// user's personal ones go with the user) loses its task and snapshot, a
+    /// changed or new one is fetched. For changes that make no service event.
+    pub fn resync(&self) {
+        if let Some(control) = &self.control {
+            let _ = control.send(Control::Resync);
         }
     }
 
@@ -319,7 +329,7 @@ impl Supervisor {
         events: broadcast::Receiver<ServiceEvent>,
     ) {
         self.load_stored().await;
-        match store::list(&self.core).await {
+        match store::list_all(&self.core).await {
             Ok(services) => {
                 tracing::info!(services = services.len(), "poller started");
                 for service in services {
@@ -336,6 +346,7 @@ impl Supervisor {
                     None => break,
                     Some(Control::Reload(id)) => self.reload(id).await,
                     Some(Control::Remove(id)) => self.remove(id).await,
+                    Some(Control::Resync) => self.resync().await,
                 },
                 event = next_event(&mut events) => match event {
                     Ok(ServiceEvent::Created(id) | ServiceEvent::Updated(id)) => {
@@ -423,7 +434,7 @@ impl Supervisor {
     }
 
     async fn reload(&mut self, id: i64) {
-        match store::get(&self.core, id).await {
+        match store::get_any(&self.core, id).await {
             Ok(Some(service)) => self.spawn(service, Duration::ZERO),
             Ok(None) => self.remove(id).await,
             Err(err) => tracing::warn!(service_id = id, %err, "poller can't read the service"),
@@ -455,7 +466,7 @@ impl Supervisor {
     /// schedule, backoff and count of bad readings. A task of a service that is
     /// gone stops.
     async fn resync(&mut self) {
-        let services = match store::list(&self.core).await {
+        let services = match store::list_all(&self.core).await {
             Ok(services) => services,
             Err(err) => {
                 tracing::warn!(%err, "poller can't list the services");

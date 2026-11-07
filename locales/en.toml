@@ -187,6 +187,7 @@ base_url_help = "Where people reach this instance: used in links. If MM_PUBLIC_U
 
 [nav]
 services = "Services"
+my_integrations = "My integrations"
 
 [service]
 sub = "The websites and apps Magpie fetches numbers from. Only admins set them up; the secret is stored encrypted and never shown again."
@@ -227,6 +228,16 @@ created = "Service added."
 saved = "Service saved."
 deleted = "Service deleted."
 
+[integration]
+sub = "Your own accounts that Magpie fetches numbers from. Only you see them and use them, admins included. The key is stored encrypted and never shown again."
+new = "New integration"
+edit = "Edit integration"
+none_title = "No integrations yet"
+none_text = "Add your own GitHub key so the start page can show your numbers."
+created = "Integration added."
+saved = "Integration saved."
+deleted = "Integration deleted."
+
 [err]
 name = "Give the service a name of at most 80 characters."
 kind = "Choose a kind of service."
@@ -241,12 +252,14 @@ number = "Use a whole number."
 visibility = "Choose who sees the service."
 too_long = "This is too long."
 http_expected = "Use a status like 200, a range like 200-399, or a list like 200, 301-308."
+github_owners = "Use user or organisation names (letters, digits and single hyphens), separated by commas, at most 5."
 
 [kind]
 http = "Website"
 vv = "Vigilant Vole"
 kk = "Keen Kestrel"
 ww = "Wise Wren"
+github = "GitHub"
 
 [field]
 http_expected = "Expected status"
@@ -259,6 +272,10 @@ kk_secret = "Read token"
 kk_secret_help = "Create a token in Keen Kestrel under Settings → API tokens with the scope \"Read only\", and paste it here. Sent as Authorization: Bearer. Stored encrypted."
 ww_secret = "Read token"
 ww_secret_help = "Create a token in Wise Wren under Settings → API tokens with the scope \"Read only\", and paste it here. Sent as Authorization: Bearer. Stored encrypted."
+github_owners = "Users and organisations (optional)"
+github_owners_help = "Only count repositories of these users and organisations, separated by commas. Empty means the account the token belongs to."
+github_secret = "Access token"
+github_secret_help = "Create a fine-grained personal access token at github.com under Settings → Developer settings → Personal access tokens → Fine-grained tokens. Pick one owner (your account or one organisation), choose the repositories, and give it these permissions, all read-only: Metadata, Pull requests, Commit statuses, Actions, Dependabot alerts and Contents. A permission it lacks only leaves its number out. One token covers one owner or organisation, so add one integration for each. Sent as Authorization: Bearer. Stored encrypted."
 
 [metric]
 http_status = "HTTP status"
@@ -282,6 +299,11 @@ ww_agents_online = "Agents online"
 ww_agents_total = "Agents total"
 ww_last_run = "Last run"
 ww_failed_targets = "Failed updates"
+gh_review_requests = "Waiting for your review"
+gh_ci_red = "Red CI"
+gh_dependabot = "Dependabot alerts"
+gh_releases_24h = "Releases, 24 hours"
+gh_open_prs = "Your open pull requests"
 
 [fetch_err]
 config = "The settings can't be used"
@@ -296,6 +318,7 @@ other = "The request failed"
 secret = "The secret can no longer be read - type it again"
 auth = "The key was refused"
 kk_too_old = "Requires Keen Kestrel 0.10 or newer"
+rate_limited = "GitHub's request limit is reached, trying again later"
 
 [need]
 other = "needs attention"
@@ -306,3 +329,5 @@ ww_offline = "Agents offline: {count}"
 vv_down = "Down: {count}"
 kk_regressed = "Regressed issues: {count}"
 kk_new = "New issues: {count}"
+gh_review = "Waiting for you: {count}"
+gh_ci_red = "Red CI: {count}"

@@ -1,16 +1,25 @@
-//! The admin's Settings page for services.
+//! The Settings pages for services, in two areas that share every handler:
 //!
-//! - `GET  /settings/services`: the list
-//! - `GET  /settings/services/new[?kind=…]`, `POST /settings/services/new`
-//! - `GET  /settings/services/{id}`, `POST /settings/services/{id}`
-//! - `POST /settings/services/{id}/delete`
-//! - `POST /settings/services/test`: one fetch with the form's values, shown
-//!   as a fragment; it never saves.
+//! - **Services** (`/settings/services`, admins): the shared services, which
+//!   the people their visibility names see.
+//! - **My integrations** (`/settings/integrations`, every signed-in user): the
+//!   user's own personal services (kinds such as `github`, whose key is the
+//!   user's own). A user sees, changes, tests and deletes their own and no one
+//!   else's; an admin's page lists the shared services only and answers 404 for
+//!   a personal one, as a missing service.
 //!
-//! Every route is for admins. The forms never show a secret: the edit form
-//! has an empty password input whose placeholder says one is saved, and an
-//! empty input on save keeps the stored secret. A refused form is shown again
-//! with the secret field empty.
+//! Each area has
+//!
+//! - `GET  <base>`: the list
+//! - `GET  <base>/new[?kind=…]`, `POST <base>/new`
+//! - `GET  <base>/{id}`, `POST <base>/{id}`
+//! - `POST <base>/{id}/delete`
+//! - `POST <base>/test`: one fetch with the form's values, shown as a
+//!   fragment; it never saves.
+//!
+//! The forms never show a secret: the edit form has an empty password input
+//! whose placeholder says one is saved, and an empty input on save keeps the
+//! stored secret. A refused form is shown again with the secret field empty.
 
 use std::collections::BTreeMap;
 
@@ -33,7 +42,7 @@ use vole_kit::state::Core;
 
 use super::store::{self, StoreError};
 use super::{
-    FieldError, SecretChange, Service, ServiceEvent, ServiceInput, Visibility, same_origin,
+    FieldError, Scope, SecretChange, Service, ServiceEvent, ServiceInput, Visibility, same_origin,
     without_userinfo,
 };
 use crate::Magpie;
@@ -44,15 +53,138 @@ use crate::integrations::{
 /// The most a service form is allowed to send.
 const MAX_FORM: usize = 64 * 1024;
 
-/// The routes (the caller adds the sign-in guard).
+/// The routes of both areas (the caller adds the sign-in guard).
 pub fn router() -> Router<Core> {
+    area_routes("/settings/services", Area::Admin)
+        .merge(area_routes("/settings/integrations", Area::Personal))
+}
+
+fn area_routes(base: &'static str, area: Area) -> Router<Core> {
+    let at = |tail: &str| format!("{base}{tail}");
     Router::new()
-        .route("/settings/services", get(list))
-        .route("/settings/services/new", get(new_form).post(create))
-        .route("/settings/services/test", post(test))
-        .route("/settings/services/{id}", get(edit_form).post(update))
-        .route("/settings/services/{id}/delete", post(delete))
+        .route(&at(""), get(list))
+        .route(&at("/new"), get(new_form).post(create))
+        .route(&at("/test"), post(test))
+        .route(&at("/{id}"), get(edit_form).post(update))
+        .route(&at("/{id}/delete"), post(delete))
         .layer(DefaultBodyLimit::max(MAX_FORM))
+        .layer(Extension(area))
+}
+
+// ---------------------------------------------------------------------------
+// The two areas
+
+/// Which area a route belongs to (set as an extension on its routes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Area {
+    Admin,
+    Personal,
+}
+
+/// An area as one request sees it: the admin's, or the signed-in user's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Admin,
+    Personal(i64),
+}
+
+impl Area {
+    /// The mode for `user`: admins only in the admin area, anyone in their own.
+    fn enter(self, user: &CurrentUser) -> ApiResult<Mode> {
+        match self {
+            Area::Admin => {
+                user.require_admin()?;
+                Ok(Mode::Admin)
+            }
+            Area::Personal => Ok(Mode::Personal(user.id)),
+        }
+    }
+}
+
+impl Mode {
+    /// Which services the area works on.
+    fn scope(self) -> Scope {
+        match self {
+            Mode::Admin => Scope::Shared,
+            Mode::Personal(user) => Scope::Personal(user),
+        }
+    }
+
+    fn personal(self) -> bool {
+        matches!(self, Mode::Personal(_))
+    }
+
+    fn base(self) -> &'static str {
+        match self {
+            Mode::Admin => "/settings/services",
+            Mode::Personal(_) => "/settings/integrations",
+        }
+    }
+
+    /// The settings tab that is current on the area's pages.
+    fn subnav(self) -> &'static str {
+        match self {
+            Mode::Admin => "services",
+            Mode::Personal(_) => "integrations",
+        }
+    }
+
+    /// The kinds of service the area may make (personal kinds are for the
+    /// personal area only).
+    fn kinds(self) -> impl Iterator<Item = &'static dyn Integration> {
+        let personal = self.personal();
+        integrations::registry()
+            .iter()
+            .copied()
+            .filter(move |k| k.personal() == personal)
+    }
+
+    /// The kind called `name`, if the area may make it.
+    fn kind(self, name: &str) -> Option<&'static dyn Integration> {
+        self.kinds().find(|k| k.kind() == name)
+    }
+
+    /// The translation keys of the area's own texts.
+    fn texts(self) -> Texts {
+        match self {
+            Mode::Admin => Texts {
+                title: "nav.services",
+                sub: "service.sub",
+                new: "service.new",
+                edit: "service.edit",
+                none_title: "service.none_title",
+                none_text: "service.none_text",
+                created: "service.created",
+                saved: "service.saved",
+                deleted: "service.deleted",
+            },
+            Mode::Personal(_) => Texts {
+                title: "nav.my_integrations",
+                sub: "integration.sub",
+                new: "integration.new",
+                edit: "integration.edit",
+                none_title: "integration.none_title",
+                none_text: "integration.none_text",
+                created: "integration.created",
+                saved: "integration.saved",
+                deleted: "integration.deleted",
+            },
+        }
+    }
+}
+
+/// The translation keys of an area's texts.
+#[derive(Debug, Clone, Copy)]
+struct Texts {
+    title: &'static str,
+    sub: &'static str,
+    new: &'static str,
+    edit: &'static str,
+    none_title: &'static str,
+    none_text: &'static str,
+    created: &'static str,
+    saved: &'static str,
+    deleted: &'static str,
 }
 
 // ---------------------------------------------------------------------------
@@ -91,7 +223,7 @@ struct Parsed {
     errors: Vec<FieldError>,
 }
 
-fn parse(form: &Raw, kind: &'static dyn Integration) -> Parsed {
+fn parse(form: &Raw, kind: &'static dyn Integration, mode: Mode) -> Parsed {
     let mut errors = Vec::new();
     let mut settings = Map::new();
     let mut typed = BTreeMap::new();
@@ -143,7 +275,10 @@ fn parse(form: &Raw, kind: &'static dyn Integration) -> Parsed {
         })
     };
 
+    // A personal service is for its user alone: no visibility to choose, and
+    // no address (the kind has its own), whatever the form says.
     let visibility = match form.get("visibility") {
+        _ if mode.personal() => Visibility::Users,
         "" => Visibility::Admin,
         text => Visibility::parse(text).unwrap_or_else(|| {
             errors.push(FieldError {
@@ -154,7 +289,8 @@ fn parse(form: &Raw, kind: &'static dyn Integration) -> Parsed {
         }),
     };
 
-    let url = Some(form.get("url").trim().to_string()).filter(|u| !u.is_empty());
+    let url =
+        Some(form.get("url").trim().to_string()).filter(|u| !u.is_empty() && !mode.personal());
     Parsed {
         input: ServiceInput {
             kind: kind.kind().to_string(),
@@ -164,7 +300,11 @@ fn parse(form: &Raw, kind: &'static dyn Integration) -> Parsed {
             secret,
             interval_s,
             visibility,
-            users: form.all("users").filter_map(|u| u.parse().ok()).collect(),
+            users: if mode.personal() {
+                Vec::new()
+            } else {
+                form.all("users").filter_map(|u| u.parse().ok()).collect()
+            },
         },
         interval,
         settings: typed,
@@ -202,34 +342,51 @@ impl Row {
     }
 }
 
+/// What the list page needs to know about its area.
+struct ListView {
+    base: &'static str,
+    new_href: String,
+    personal: bool,
+    texts: Texts,
+}
+
 #[derive(Template)]
 #[template(path = "services.html")]
 struct ListPage {
     ctx: PageCtx,
     rows: Vec<Row>,
+    list: ListView,
 }
 
 async fn list(
     State(core): State<Core>,
+    Extension(area): Extension<Area>,
     user: CurrentUser,
     jar: SignedCookieJar,
 ) -> ApiResult<Response> {
-    user.require_admin()?;
-    let rows = store::list(&core)
+    let mode = area.enter(&user)?;
+    let rows = store::list_in(&core, mode.scope())
         .await?
         .into_iter()
         .map(Row::new)
         .collect();
+    let texts = mode.texts();
     let (ctx, jar) = PageCtx::build(
         &core,
         Some(&user),
         &jar,
-        i18n::t("nav.services"),
+        i18n::t(texts.title),
         "settings",
-        "services",
+        mode.subnav(),
     )
     .await;
-    Ok((jar, HtmlTemplate(ListPage { ctx, rows })).into_response())
+    let list = ListView {
+        base: mode.base(),
+        new_href: format!("{}/new", mode.base()),
+        personal: mode.personal(),
+        texts,
+    };
+    Ok((jar, HtmlTemplate(ListPage { ctx, rows, list })).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -262,6 +419,12 @@ struct KindChoice {
 }
 
 struct FormView {
+    /// The area's path (`/settings/services` or `/settings/integrations`).
+    base: &'static str,
+    /// A personal service: no address, no visibility.
+    personal: bool,
+    /// Translation key of the chooser's title.
+    new_key: &'static str,
     /// Where the form posts.
     action: String,
     id: Option<i64>,
@@ -382,6 +545,7 @@ async fn user_choices(core: &Core, chosen: &[i64]) -> ApiResult<Vec<UserChoice>>
 
 async fn form_view(
     core: &Core,
+    mode: Mode,
     kind: &'static dyn Integration,
     id: Option<i64>,
     has_secret: bool,
@@ -414,9 +578,12 @@ async fn form_view(
         help: f.help_key,
     });
     Ok(FormView {
+        base: mode.base(),
+        personal: mode.personal(),
+        new_key: mode.texts().new,
         action: match id {
-            Some(id) => format!("/settings/services/{id}"),
-            None => "/settings/services/new".to_string(),
+            Some(id) => format!("{}/{id}", mode.base()),
+            None => format!("{}/new", mode.base()),
         },
         id,
         kind: kind.kind(),
@@ -425,7 +592,11 @@ async fn form_view(
         url_required: kind.url_required(),
         interval_default: kind.default_interval().as_secs(),
         interval_min: kind.min_interval().as_secs(),
-        users: user_choices(core, &shown.users).await?,
+        users: if mode.personal() {
+            Vec::new()
+        } else {
+            user_choices(core, &shown.users).await?
+        },
         name_error: error("name"),
         url_error: error("url"),
         interval_error: error("interval"),
@@ -443,14 +614,17 @@ async fn form_view(
 }
 
 /// The kind chooser, as a form view that has no form.
-fn chooser() -> FormView {
+fn chooser(mode: Mode) -> FormView {
     FormView {
+        base: mode.base(),
+        personal: mode.personal(),
+        new_key: mode.texts().new,
         action: String::new(),
         id: None,
         kind: "",
         kind_label: "",
-        choose: integrations::registry()
-            .iter()
+        choose: mode
+            .kinds()
             .map(|k| KindChoice {
                 kind: k.kind(),
                 label_key: k.label_key(),
@@ -478,13 +652,14 @@ fn chooser() -> FormView {
 
 async fn render_form(
     core: &Core,
+    mode: Mode,
     user: &CurrentUser,
     jar: SignedCookieJar,
     status: StatusCode,
     form: FormView,
     title: &'static str,
 ) -> ApiResult<Response> {
-    let (ctx, jar) = PageCtx::build(core, Some(user), &jar, title, "settings", "services").await;
+    let (ctx, jar) = PageCtx::build(core, Some(user), &jar, title, "settings", mode.subnav()).await;
     Ok((status, jar, HtmlTemplate(FormPage { ctx, form })).into_response())
 }
 
@@ -495,61 +670,69 @@ struct NewQuery {
 
 async fn new_form(
     State(core): State<Core>,
+    Extension(area): Extension<Area>,
     user: CurrentUser,
     jar: SignedCookieJar,
     Query(query): Query<NewQuery>,
 ) -> ApiResult<Response> {
-    user.require_admin()?;
+    let mode = area.enter(&user)?;
     let kind = match query.kind.as_deref() {
-        Some(kind) => integrations::find(kind),
+        Some(kind) => mode.kind(kind),
         // One kind: no need to choose.
-        None if integrations::registry().len() == 1 => integrations::registry().first().copied(),
-        None => None,
+        None => {
+            let mut kinds = mode.kinds();
+            kinds.next().filter(|_| kinds.next().is_none())
+        }
     };
     let form = match kind {
-        Some(kind) => form_view(&core, kind, None, false, Shown::empty()).await?,
-        None => chooser(),
+        Some(kind) => form_view(&core, mode, kind, None, false, Shown::empty()).await?,
+        None => chooser(mode),
     };
     render_form(
         &core,
+        mode,
         &user,
         jar,
         StatusCode::OK,
         form,
-        i18n::t("service.new"),
+        i18n::t(mode.texts().new),
     )
     .await
 }
 
 /// Whether the service has a secret that can't be opened any more (the instance
 /// key changed): the form says so instead of "saved".
-async fn unreadable(core: &Core, service: &Service) -> bool {
+async fn unreadable(core: &Core, mode: Mode, service: &Service) -> bool {
     service.has_secret
         && matches!(
-            store::open_secret(core, service.id).await,
+            store::open_secret_in(core, Some(mode.scope()), service.id).await,
             Err(store::CtxError::SecretUnreadable(_))
         )
 }
 
 async fn edit_form(
     State(core): State<Core>,
+    Extension(area): Extension<Area>,
     user: CurrentUser,
     jar: SignedCookieJar,
     Path(id): Path<i64>,
 ) -> ApiResult<Response> {
-    user.require_admin()?;
-    let service = store::get(&core, id).await?.ok_or(ApiError::NotFound)?;
+    let mode = area.enter(&user)?;
+    let service = store::get_in(&core, mode.scope(), id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     let kind = service.integration().ok_or(ApiError::NotFound)?;
     let has_secret = service.has_secret;
-    let mut form = form_view(&core, kind, Some(id), has_secret, Shown::of(&service)).await?;
-    form.secret_unreadable = unreadable(&core, &service).await;
+    let mut form = form_view(&core, mode, kind, Some(id), has_secret, Shown::of(&service)).await?;
+    form.secret_unreadable = unreadable(&core, mode, &service).await;
     render_form(
         &core,
+        mode,
         &user,
         jar,
         StatusCode::OK,
         form,
-        i18n::t("service.edit"),
+        i18n::t(mode.texts().edit),
     )
     .await
 }
@@ -559,58 +742,68 @@ fn announce(magpie: &Magpie, event: ServiceEvent) {
     let _ = magpie.service_events.send(event);
 }
 
-fn done(jar: SignedCookieJar, message: &'static str) -> Response {
+fn done(jar: SignedCookieJar, mode: Mode, message: &'static str) -> Response {
     (
         flash(jar, "success", i18n::t(message)),
-        Redirect::to("/settings/services"),
+        Redirect::to(mode.base()),
     )
         .into_response()
 }
 
 async fn create(
     State(core): State<Core>,
+    Extension(area): Extension<Area>,
     Extension(magpie): Extension<Magpie>,
     user: CurrentUser,
     jar: SignedCookieJar,
     body: Bytes,
 ) -> ApiResult<Response> {
-    user.require_admin()?;
+    let mode = area.enter(&user)?;
     let raw = Raw::parse(&body);
-    let Some(kind) = integrations::find(raw.get("kind")) else {
+    let Some(kind) = mode.kind(raw.get("kind")) else {
         return render_form(
             &core,
+            mode,
             &user,
             jar,
             StatusCode::UNPROCESSABLE_ENTITY,
-            chooser(),
-            i18n::t("service.new"),
+            chooser(mode),
+            i18n::t(mode.texts().new),
         )
         .await;
     };
-    let parsed = parse(&raw, kind);
+    let parsed = parse(&raw, kind, mode);
     let mut errors = parsed.errors.clone();
     errors.extend(parsed.input.check());
     let result = if errors.is_empty() {
-        store::create(&core, &parsed.input).await
+        store::create_in(&core, mode.scope(), &parsed.input).await
     } else {
         Err(StoreError::Invalid(errors.clone()))
     };
     match result {
         Ok(id) => {
-            tracing::info!(admin = %user.username, service_id = id, kind = kind.kind(), "service created");
+            tracing::info!(user = %user.username, service_id = id, kind = kind.kind(), personal = mode.personal(), "service created");
             announce(&magpie, ServiceEvent::Created(id));
-            Ok(done(jar, "service.created"))
+            Ok(done(jar, mode, mode.texts().created))
         }
         Err(StoreError::Invalid(errors)) => {
-            let form =
-                form_view(&core, kind, None, false, Shown::typed(parsed, &raw, errors)).await?;
+            let form = form_view(
+                &core,
+                mode,
+                kind,
+                None,
+                false,
+                Shown::typed(parsed, &raw, errors),
+            )
+            .await?;
             render_form(
                 &core,
+                mode,
                 &user,
                 jar,
                 StatusCode::UNPROCESSABLE_ENTITY,
                 form,
-                i18n::t("service.new"),
+                i18n::t(mode.texts().new),
             )
             .await
         }
@@ -621,47 +814,52 @@ async fn create(
 
 async fn update(
     State(core): State<Core>,
+    Extension(area): Extension<Area>,
     Extension(magpie): Extension<Magpie>,
     user: CurrentUser,
     jar: SignedCookieJar,
     Path(id): Path<i64>,
     body: Bytes,
 ) -> ApiResult<Response> {
-    user.require_admin()?;
-    let service = store::get(&core, id).await?.ok_or(ApiError::NotFound)?;
+    let mode = area.enter(&user)?;
+    let service = store::get_in(&core, mode.scope(), id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     let kind = service.integration().ok_or(ApiError::NotFound)?;
     let raw = Raw::parse(&body);
-    let parsed = parse(&raw, kind);
+    let parsed = parse(&raw, kind, mode);
     let mut errors = parsed.errors.clone();
     errors.extend(parsed.input.check());
     let result = if errors.is_empty() {
-        store::update(&core, id, &parsed.input).await
+        store::update_in(&core, mode.scope(), id, &parsed.input).await
     } else {
         Err(StoreError::Invalid(errors.clone()))
     };
     match result {
         Ok(()) => {
-            tracing::info!(admin = %user.username, service_id = id, kind = kind.kind(), "service updated");
+            tracing::info!(user = %user.username, service_id = id, kind = kind.kind(), personal = mode.personal(), "service updated");
             announce(&magpie, ServiceEvent::Updated(id));
-            Ok(done(jar, "service.saved"))
+            Ok(done(jar, mode, mode.texts().saved))
         }
         Err(StoreError::Invalid(errors)) => {
             let mut form = form_view(
                 &core,
+                mode,
                 kind,
                 Some(id),
                 service.has_secret,
                 Shown::typed(parsed, &raw, errors),
             )
             .await?;
-            form.secret_unreadable = unreadable(&core, &service).await;
+            form.secret_unreadable = unreadable(&core, mode, &service).await;
             render_form(
                 &core,
+                mode,
                 &user,
                 jar,
                 StatusCode::UNPROCESSABLE_ENTITY,
                 form,
-                i18n::t("service.edit"),
+                i18n::t(mode.texts().edit),
             )
             .await
         }
@@ -672,18 +870,19 @@ async fn update(
 
 async fn delete(
     State(core): State<Core>,
+    Extension(area): Extension<Area>,
     Extension(magpie): Extension<Magpie>,
     user: CurrentUser,
     jar: SignedCookieJar,
     Path(id): Path<i64>,
 ) -> ApiResult<Response> {
-    user.require_admin()?;
-    if !store::delete(&core, id).await? {
+    let mode = area.enter(&user)?;
+    if !store::delete_in(&core, mode.scope(), id).await? {
         return Err(ApiError::NotFound);
     }
-    tracing::info!(admin = %user.username, service_id = id, "service deleted");
+    tracing::info!(user = %user.username, service_id = id, personal = mode.personal(), "service deleted");
     announce(&magpie, ServiceEvent::Deleted(id));
-    Ok(done(jar, "service.deleted"))
+    Ok(done(jar, mode, mode.texts().deleted))
 }
 
 // ---------------------------------------------------------------------------
@@ -818,13 +1017,18 @@ fn describe(kind: &'static dyn Integration, outcome: Result<Snapshot, FetchError
     }
 }
 
-async fn test(State(core): State<Core>, user: CurrentUser, body: Bytes) -> ApiResult<Response> {
-    user.require_admin()?;
+async fn test(
+    State(core): State<Core>,
+    Extension(area): Extension<Area>,
+    user: CurrentUser,
+    body: Bytes,
+) -> ApiResult<Response> {
+    let mode = area.enter(&user)?;
     let raw = Raw::parse(&body);
-    let Some(kind) = integrations::find(raw.get("kind")) else {
+    let Some(kind) = mode.kind(raw.get("kind")) else {
         return Ok(HtmlTemplate(unknown(i18n::t("err.kind").to_string())).into_response());
     };
-    let parsed = parse(&raw, kind);
+    let parsed = parse(&raw, kind, mode);
     let mut errors = parsed.errors.clone();
     errors.extend(parsed.input.check_connection());
     if let Some(first) = errors.first() {
@@ -837,7 +1041,7 @@ async fn test(State(core): State<Core>, user: CurrentUser, body: Bytes) -> ApiRe
         SecretChange::Replace(secret) => Some(secret.clone()),
         SecretChange::Clear => None,
         SecretChange::Keep => match raw.get("id").parse::<i64>() {
-            Ok(id) => match store::get(&core, id).await? {
+            Ok(id) => match store::get_in(&core, mode.scope(), id).await? {
                 Some(service) if service.kind == input.kind && service.has_secret => {
                     // The stored secret only goes to the address it was saved for.
                     if !same_origin(service.url.as_deref(), input.url.as_deref()) {
@@ -846,7 +1050,7 @@ async fn test(State(core): State<Core>, user: CurrentUser, body: Bytes) -> ApiRe
                                 .into_response(),
                         );
                     }
-                    match store::open_secret(&core, id).await {
+                    match store::open_secret_in(&core, Some(mode.scope()), id).await {
                         Ok(secret) => secret,
                         Err(store::CtxError::SecretUnreadable(_)) => {
                             return Ok(HtmlTemplate(unknown(reason_text(
@@ -874,6 +1078,6 @@ async fn test(State(core): State<Core>, user: CurrentUser, body: Bytes) -> ApiRe
     let outcome = kind.fetch(&ctx).await;
     let result = describe(kind, outcome);
     // Only what happened, never the address, the settings or the secret.
-    tracing::info!(admin = %user.username, kind = kind.kind(), status = result.status, "service tested");
+    tracing::info!(user = %user.username, kind = kind.kind(), personal = mode.personal(), status = result.status, "service tested");
     Ok(HtmlTemplate(result).into_response())
 }

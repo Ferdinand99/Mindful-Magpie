@@ -540,7 +540,8 @@ async fn background_image(
 /// The kit deletes a user (and their `backgrounds` row, by `ON DELETE
 /// CASCADE`) at `POST /settings/users/{id}/delete` and has no hook for what
 /// else the product keeps of the user. After an admin's request to that path,
-/// sweep the files of users that have no picture any more.
+/// sweep the files of users that have no picture any more, and let the poller
+/// look at the services again (the user's personal ones went with them).
 pub async fn sweep_after_user_delete(
     Extension(magpie): Extension<Magpie>,
     request: Request,
@@ -563,6 +564,11 @@ pub async fn sweep_after_user_delete(
         && let Err(err) = magpie.backgrounds.reconcile(&magpie.core).await
     {
         tracing::warn!("can't sweep the background files: {err}");
+    }
+    if by_admin && deletes_user {
+        // The user's personal services went with them (by `ON DELETE
+        // CASCADE`), without a service event: the poller drops their tasks.
+        magpie.poller.resync();
     }
     response
 }

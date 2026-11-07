@@ -187,6 +187,7 @@ base_url_help = "Adressen folk når instansen på: brukes i lenker. Er MM_PUBLIC
 
 [nav]
 services = "Tjenester"
+my_integrations = "Mine integrasjoner"
 
 [service]
 sub = "Nettsidene og appene Magpie henter tall fra. Bare admin setter dem opp; nøkkelen lagres kryptert og vises aldri igjen."
@@ -227,6 +228,16 @@ created = "Tjenesten er lagt til."
 saved = "Tjenesten er lagret."
 deleted = "Tjenesten er slettet."
 
+[integration]
+sub = "Dine egne kontoer som Magpie henter tall fra. Bare du ser og bruker dem, også admin. Nøkkelen lagres kryptert og vises aldri igjen."
+new = "Ny integrasjon"
+edit = "Rediger integrasjon"
+none_title = "Ingen integrasjoner ennå"
+none_text = "Legg inn din egen GitHub-nøkkel så startsiden kan vise tallene dine."
+created = "Integrasjonen er lagt til."
+saved = "Integrasjonen er lagret."
+deleted = "Integrasjonen er slettet."
+
 [err]
 name = "Gi tjenesten et navn på høyst 80 tegn."
 kind = "Velg en type tjeneste."
@@ -241,12 +252,14 @@ number = "Bruk et helt tall."
 visibility = "Velg hvem som ser tjenesten."
 too_long = "Dette er for langt."
 http_expected = "Bruk en status som 200, et område som 200-399 eller en liste som 200, 301-308."
+github_owners = "Bruk navn på brukere eller organisasjoner (bokstaver, sifre og enkle bindestreker), atskilt med komma, høyst 5."
 
 [kind]
 http = "Nettside"
 vv = "Vigilant Vole"
 kk = "Keen Kestrel"
 ww = "Wise Wren"
+github = "GitHub"
 
 [field]
 http_expected = "Forventet status"
@@ -259,6 +272,10 @@ kk_secret = "Lesetoken"
 kk_secret_help = "Lag et token i Keen Kestrel under Innstillinger → API-tokener med tilgangen «Bare lesing», og lim det inn her. Sendes som Authorization: Bearer. Lagres kryptert."
 ww_secret = "Lesetoken"
 ww_secret_help = "Lag et token i Wise Wren under Innstillinger → API-tokener med tilgangen «Bare lesing», og lim det inn her. Sendes som Authorization: Bearer. Lagres kryptert."
+github_owners = "Brukere og organisasjoner (valgfritt)"
+github_owners_help = "Tell bare repoer som tilhører disse brukerne og organisasjonene, atskilt med komma. Tomt betyr kontoen tokenet tilhører."
+github_secret = "Tilgangstoken"
+github_secret_help = "Lag et finkornet personlig tilgangstoken på github.com under Settings → Developer settings → Personal access tokens → Fine-grained tokens. Velg én eier (kontoen din eller én organisasjon), velg repoene, og gi det disse tilgangene, alle bare lesing: Metadata, Pull requests, Commit statuses, Actions, Dependabot alerts og Contents. En tilgang det mangler, utelater bare tallet sitt. Ett token dekker én eier eller organisasjon, så legg til én integrasjon for hver. Sendes som Authorization: Bearer. Lagres kryptert."
 
 [metric]
 http_status = "HTTP-status"
@@ -282,6 +299,11 @@ ww_agents_online = "Agenter tilkoblet"
 ww_agents_total = "Agenter i alt"
 ww_last_run = "Siste kjøring"
 ww_failed_targets = "Mislykkede oppdateringer"
+gh_review_requests = "Venter på din gjennomgang"
+gh_ci_red = "Rød CI"
+gh_dependabot = "Dependabot-varsler"
+gh_releases_24h = "Utgivelser, 24 timer"
+gh_open_prs = "Dine åpne pull requests"
 
 [fetch_err]
 config = "Innstillingene kan ikke brukes"
@@ -296,6 +318,7 @@ other = "Forespørselen feilet"
 secret = "Nøkkelen kan ikke leses – skriv den inn på nytt"
 auth = "Nøkkelen ble avvist"
 kk_too_old = "Krever Keen Kestrel 0.10 eller nyere"
+rate_limited = "GitHubs forespørselsgrense er nådd, prøver igjen senere"
 
 [need]
 other = "trenger oppmerksomhet"
@@ -306,3 +329,5 @@ ww_offline = "Agenter frakoblet: {count}"
 vv_down = "Nede: {count}"
 kk_regressed = "Feil som er tilbake: {count}"
 kk_new = "Nye feil: {count}"
+gh_review = "Venter på deg: {count}"
+gh_ci_red = "Rød CI: {count}"

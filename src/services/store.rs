@@ -1,7 +1,12 @@
 //! The `services` and `service_users` tables.
 //!
-//! The secret is sealed here and opened only by [`fetch_ctx`]; every other
-//! read leaves the column alone.
+//! The secret is sealed here and opened only by [`fetch_ctx`] and
+//! [`open_secret_in`]; every other read leaves the column alone.
+//!
+//! Every function a page calls takes a [`Scope`] (or has a shared-only name):
+//! the admin's pages work on the shared services, a user's own page on that
+//! user's personal ones, and neither can reach the other's rows. The poller
+//! alone reads every service ([`list_all`], [`get_any`]).
 
 use rusqlite::{Connection, OptionalExtension as _, params};
 use serde_json::{Map, Value as Json};
@@ -10,10 +15,10 @@ use vole_kit::db::{self, DbError};
 use vole_kit::state::Core;
 
 use super::{
-    FieldError, SECRET_PURPOSE, SecretChange, Service, ServiceInput, ServiceSummary, Viewer,
+    FieldError, SECRET_PURPOSE, Scope, SecretChange, Service, ServiceInput, ServiceSummary, Viewer,
     Visibility, same_origin,
 };
-use crate::integrations::{FetchCtx, FetchError};
+use crate::integrations::{FetchCtx, FetchError, SERVICE_ID_KEY};
 
 /// Why a service was not stored.
 #[derive(Debug, thiserror::Error)]
@@ -40,7 +45,7 @@ pub enum CtxError {
 }
 
 const COLUMNS: &str = "id, kind, name, url, settings, secret IS NOT NULL, interval_s, visibility, \
-                       created_at, updated_at";
+                       created_at, updated_at, owner_user_id";
 
 fn sealer(core: &Core) -> Sealer {
     Sealer::new(&core.session_key, SECRET_PURPOSE)
@@ -67,6 +72,7 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Service> {
         users: Vec::new(),
         created_at: r.get(8)?,
         updated_at: r.get(9)?,
+        owner_user_id: r.get(10)?,
     })
 }
 
@@ -76,22 +82,33 @@ fn user_ids(c: &Connection, service_id: i64) -> rusqlite::Result<Vec<i64>> {
     stmt.query_map(params![service_id], |r| r.get(0))?.collect()
 }
 
-fn select_all(c: &Connection) -> rusqlite::Result<Vec<Service>> {
+/// The services of `scope`, or all of them (`None`), by name.
+fn select_all(c: &Connection, scope: Option<Scope>) -> rusqlite::Result<Vec<Service>> {
     let mut stmt = c.prepare(&format!(
-        "SELECT {COLUMNS} FROM services ORDER BY name COLLATE NOCASE, id"
+        "SELECT {COLUMNS} FROM services
+         WHERE ?1 = 0 OR owner_user_id IS ?2
+         ORDER BY name COLLATE NOCASE, id"
     ))?;
-    let mut services: Vec<Service> = stmt.query_map([], row)?.collect::<Result<_, _>>()?;
+    let owner = scope.and_then(Scope::owner);
+    let mut services: Vec<Service> = stmt
+        .query_map(params![scope.is_some(), owner], row)?
+        .collect::<Result<_, _>>()?;
     for service in &mut services {
         service.users = user_ids(c, service.id)?;
     }
     Ok(services)
 }
 
-fn select_one(c: &Connection, id: i64) -> rusqlite::Result<Option<Service>> {
+/// The service `id` when it is of `scope` (or of any, `None`).
+fn select_one(c: &Connection, scope: Option<Scope>, id: i64) -> rusqlite::Result<Option<Service>> {
+    let owner = scope.and_then(Scope::owner);
     let found = c
         .query_row(
-            &format!("SELECT {COLUMNS} FROM services WHERE id = ?1"),
-            params![id],
+            &format!(
+                "SELECT {COLUMNS} FROM services
+                 WHERE id = ?1 AND (?2 = 0 OR owner_user_id IS ?3)"
+            ),
+            params![id, scope.is_some(), owner],
             row,
         )
         .optional()?;
@@ -102,18 +119,42 @@ fn select_one(c: &Connection, id: i64) -> rusqlite::Result<Option<Service>> {
     Ok(Some(service))
 }
 
-/// Every service, by name.
+/// Every shared service, by name (the admin's list).
 pub async fn list(core: &Core) -> Result<Vec<Service>, DbError> {
-    db::interact(&core.db, |c| select_all(c)).await
+    list_in(core, Scope::Shared).await
 }
 
-/// One service.
+/// The services of `scope`, by name.
+pub async fn list_in(core: &Core, scope: Scope) -> Result<Vec<Service>, DbError> {
+    db::interact(&core.db, move |c| select_all(c, Some(scope))).await
+}
+
+/// Every service, shared and personal: for the poller, which fetches them all.
+/// No page may use it.
+pub async fn list_all(core: &Core) -> Result<Vec<Service>, DbError> {
+    db::interact(&core.db, |c| select_all(c, None)).await
+}
+
+/// One shared service.
 pub async fn get(core: &Core, id: i64) -> Result<Option<Service>, DbError> {
-    db::interact(&core.db, move |c| select_one(c, id)).await
+    get_in(core, Scope::Shared, id).await
 }
 
-/// The services `viewer` may see, by name. Admins see all of them; anyone
-/// else sees the ones for everybody and the ones that name them.
+/// One service of `scope`; `None` for one that is of the other kind, like one
+/// that does not exist.
+pub async fn get_in(core: &Core, scope: Scope, id: i64) -> Result<Option<Service>, DbError> {
+    db::interact(&core.db, move |c| select_one(c, Some(scope), id)).await
+}
+
+/// One service, shared or personal: for the poller. No page may use it.
+pub async fn get_any(core: &Core, id: i64) -> Result<Option<Service>, DbError> {
+    db::interact(&core.db, move |c| select_one(c, None, id)).await
+}
+
+/// The services `viewer` may see, by name. Admins see all the shared ones;
+/// anyone else sees the shared ones for everybody and the ones that name
+/// them. A personal service is seen by its user and by nobody else, whatever
+/// their role.
 pub async fn visible_to(
     core: &Core,
     viewer: impl Into<Viewer>,
@@ -121,11 +162,12 @@ pub async fn visible_to(
     let viewer = viewer.into();
     db::interact(&core.db, move |c| {
         let mut stmt = c.prepare(
-            "SELECT id, kind, name, interval_s FROM services s
-             WHERE ?1 = 1 OR s.visibility = 'all'
+            "SELECT id, kind, name, interval_s, owner_user_id IS NOT NULL FROM services s
+             WHERE (s.owner_user_id IS NULL AND (?1 = 1 OR s.visibility = 'all'
                 OR (s.visibility = 'users' AND EXISTS (
                       SELECT 1 FROM service_users su
-                      WHERE su.service_id = s.id AND su.user_id = ?2))
+                      WHERE su.service_id = s.id AND su.user_id = ?2))))
+                OR s.owner_user_id = ?2
              ORDER BY name COLLATE NOCASE, id",
         )?;
         stmt.query_map(params![viewer.admin, viewer.id], |r| {
@@ -134,6 +176,7 @@ pub async fn visible_to(
                 kind: r.get(1)?,
                 name: r.get(2)?,
                 interval_s: r.get(3)?,
+                personal: r.get(4)?,
             })
         })?
         .collect()
@@ -153,10 +196,11 @@ pub fn visible_kind(
     let viewer = viewer.into();
     c.query_row(
         "SELECT s.kind FROM services s
-         WHERE s.id = ?3 AND (?1 = 1 OR s.visibility = 'all'
+         WHERE s.id = ?3 AND ((s.owner_user_id IS NULL AND (?1 = 1 OR s.visibility = 'all'
             OR (s.visibility = 'users' AND EXISTS (
                   SELECT 1 FROM service_users su
-                  WHERE su.service_id = s.id AND su.user_id = ?2)))",
+                  WHERE su.service_id = s.id AND su.user_id = ?2))))
+            OR s.owner_user_id = ?2)",
         params![viewer.admin, viewer.id, id],
         |r| r.get(0),
     )
@@ -207,9 +251,29 @@ fn encode(input: &ServiceInput) -> (String, Option<String>, String) {
     (input.name.trim().to_string(), url, settings)
 }
 
-/// Stores a new service; its id.
+/// What is wrong with `input` for `scope` besides [`ServiceInput::check`]: a
+/// personal kind (one with a fixed address and a key of the user's own) is
+/// only for personal services, and a shared kind only for shared ones.
+fn check_scope(scope: Scope, input: &ServiceInput) -> Vec<FieldError> {
+    match input.integration() {
+        Some(kind) if kind.personal() != scope.is_personal() => {
+            vec![FieldError::new("kind", "err.kind")]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Stores a new shared service; its id.
 pub async fn create(core: &Core, input: &ServiceInput) -> Result<i64, StoreError> {
-    let errors = input.check();
+    create_in(core, Scope::Shared, input).await
+}
+
+/// Stores a new service of `scope`; its id. A personal service is for its
+/// user only: whatever visibility and users the input names, nobody else
+/// sees it.
+pub async fn create_in(core: &Core, scope: Scope, input: &ServiceInput) -> Result<i64, StoreError> {
+    let mut errors = input.check();
+    errors.extend(check_scope(scope, input));
     if !errors.is_empty() {
         return Err(StoreError::Invalid(errors));
     }
@@ -218,13 +282,19 @@ pub async fn create(core: &Core, input: &ServiceInput) -> Result<i64, StoreError
         SecretChange::Keep | SecretChange::Clear => None,
     };
     let (name, url, settings) = encode(input);
-    let input = input.clone();
+    let mut input = input.clone();
+    if scope.is_personal() {
+        input.visibility = Visibility::Users;
+        input.users.clear();
+    }
+    let owner = scope.owner();
     Ok(db::interact(&core.db, move |c| {
         let tx = c.transaction()?;
         tx.execute(
             "INSERT INTO services
-               (kind, name, url, settings, secret, interval_s, visibility, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+               (kind, name, url, settings, secret, interval_s, visibility, owner_user_id,
+                created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
                      strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
             params![
                 input.kind,
@@ -233,7 +303,8 @@ pub async fn create(core: &Core, input: &ServiceInput) -> Result<i64, StoreError
                 settings,
                 sealed,
                 input.interval_s,
-                input.visibility.as_str()
+                input.visibility.as_str(),
+                owner
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -244,10 +315,23 @@ pub async fn create(core: &Core, input: &ServiceInput) -> Result<i64, StoreError
     .await?)
 }
 
-/// Replaces a service's name, address, settings, interval and viewers; its
-/// secret follows `input.secret`. The kind cannot change.
+/// Replaces a shared service's name, address, settings, interval and viewers;
+/// its secret follows `input.secret`. The kind cannot change.
 pub async fn update(core: &Core, id: i64, input: &ServiceInput) -> Result<(), StoreError> {
-    let errors = input.check();
+    update_in(core, Scope::Shared, id, input).await
+}
+
+/// [`update`] for a service of `scope`; a service of the other kind is
+/// [`StoreError::NotFound`]. A personal service stays its user's own and
+/// visible to nobody else.
+pub async fn update_in(
+    core: &Core,
+    scope: Scope,
+    id: i64,
+    input: &ServiceInput,
+) -> Result<(), StoreError> {
+    let mut errors = input.check();
+    errors.extend(check_scope(scope, input));
     if !errors.is_empty() {
         return Err(StoreError::Invalid(errors));
     }
@@ -256,13 +340,19 @@ pub async fn update(core: &Core, id: i64, input: &ServiceInput) -> Result<(), St
         SecretChange::Keep | SecretChange::Clear => None,
     };
     let (name, url, settings) = encode(input);
-    let input = input.clone();
+    let mut input = input.clone();
+    if scope.is_personal() {
+        input.visibility = Visibility::Users;
+        input.users.clear();
+    }
+    let owner = scope.owner();
     db::interact(&core.db, move |c| {
         let tx = c.transaction()?;
         let stored: Option<(String, Option<String>, bool)> = tx
             .query_row(
-                "SELECT kind, url, secret IS NOT NULL FROM services WHERE id = ?1",
-                params![id],
+                "SELECT kind, url, secret IS NOT NULL FROM services
+                 WHERE id = ?1 AND owner_user_id IS ?2",
+                params![id, owner],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
@@ -320,20 +410,43 @@ pub async fn update(core: &Core, id: i64, input: &ServiceInput) -> Result<(), St
     .await?
 }
 
-/// Deletes a service and its viewers; whether there was one.
+/// Deletes a shared service and its viewers; whether there was one.
 pub async fn delete(core: &Core, id: i64) -> Result<bool, DbError> {
+    delete_in(core, Scope::Shared, id).await
+}
+
+/// Deletes a service of `scope` and what goes with it (its viewers, snapshot
+/// and acknowledgements); whether there was one.
+pub async fn delete_in(core: &Core, scope: Scope, id: i64) -> Result<bool, DbError> {
+    let owner = scope.owner();
     db::interact(&core.db, move |c| {
-        Ok(c.execute("DELETE FROM services WHERE id = ?1", params![id])? > 0)
+        Ok(c.execute(
+            "DELETE FROM services WHERE id = ?1 AND owner_user_id IS ?2",
+            params![id, owner],
+        )? > 0)
     })
     .await
 }
 
-/// The stored secret of service `id`, opened. `None` when there is none.
+/// The stored secret of the shared service `id`, opened. `None` when there is
+/// none.
 pub async fn open_secret(core: &Core, id: i64) -> Result<Option<String>, CtxError> {
+    open_secret_in(core, Some(Scope::Shared), id).await
+}
+
+/// The stored secret of service `id` when it is of `scope` (of any kind,
+/// `None`: for the fetch), opened. `None` when there is none.
+pub async fn open_secret_in(
+    core: &Core,
+    scope: Option<Scope>,
+    id: i64,
+) -> Result<Option<String>, CtxError> {
+    let owner = scope.and_then(Scope::owner);
+    let scoped = scope.is_some();
     let sealed: Option<String> = db::interact(&core.db, move |c| {
         c.query_row(
-            "SELECT secret FROM services WHERE id = ?1",
-            params![id],
+            "SELECT secret FROM services WHERE id = ?1 AND (?2 = 0 OR owner_user_id IS ?3)",
+            params![id, scoped, owner],
             |r| r.get(0),
         )
         .optional()
@@ -360,17 +473,22 @@ impl CtxError {
 }
 
 /// What a fetch of `service` needs: the shared client, its settings with the
-/// address added as `"url"`, and its secret, opened.
+/// address added as `"url"` and the service's number as `"service_id"` (what a
+/// kind keeps its memory of the service under), and its secret, opened. Both
+/// names are the store's alone: a stored setting of that name is dropped.
 pub async fn fetch_ctx(core: &Core, service: &Service) -> Result<FetchCtx, CtxError> {
     let secret = if service.has_secret {
-        open_secret(core, service.id).await?
+        open_secret_in(core, None, service.id).await?
     } else {
         None
     };
     let mut settings = service.settings.as_object().cloned().unwrap_or_default();
+    settings.remove("url");
+    settings.remove(SERVICE_ID_KEY);
     if let Some(url) = &service.url {
         settings.insert("url".into(), Json::String(url.clone()));
     }
+    settings.insert(SERVICE_ID_KEY.into(), Json::from(service.id));
     Ok(FetchCtx {
         http: crate::integrations::client().clone(),
         settings: Json::Object(settings),
