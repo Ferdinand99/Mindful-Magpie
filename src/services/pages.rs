@@ -1003,7 +1003,7 @@ fn trim_number(n: f64) -> String {
 
 /// A value for the result list. (The start page draws its own from the
 /// snapshot; this is the plain version «Test» needs.)
-fn format_value(format: Format, value: &Value) -> String {
+fn format_value(format: Format, value: &Value, now: i64) -> String {
     let Some(n) = value.num else {
         return value.text.clone().unwrap_or_default();
     };
@@ -1034,8 +1034,8 @@ fn format_value(format: Format, value: &Value) -> String {
             }
         }
         Format::Since => {
-            let age = (jiff::Timestamp::now().as_second() as f64 - n).max(0.0);
-            format_value(Format::Duration, &Value::num(age))
+            let age = (now as f64 - n).max(0.0);
+            format_value(Format::Duration, &Value::num(age), now)
         }
         Format::Text => value.text.clone().unwrap_or_else(|| trim_number(n)),
     }
@@ -1051,7 +1051,11 @@ fn unknown(reason: String) -> TestResult {
     }
 }
 
-fn describe(kind: &'static dyn Integration, outcome: Result<Snapshot, FetchError>) -> TestResult {
+fn describe(
+    kind: &'static dyn Integration,
+    outcome: Result<Snapshot, FetchError>,
+    now: i64,
+) -> TestResult {
     match outcome {
         Ok(snapshot) => {
             let status = status_name(snapshot.status);
@@ -1063,7 +1067,7 @@ fn describe(kind: &'static dyn Integration, outcome: Result<Snapshot, FetchError
                 .filter_map(|metric| {
                     values.get(metric.id).map(|value| TestRow {
                         label: i18n::t(metric.label_key),
-                        value: format_value(metric.format, value),
+                        value: format_value(metric.format, value, now),
                     })
                 })
                 .collect();
@@ -1205,7 +1209,7 @@ async fn test(
     } else {
         None
     };
-    let mut result = describe(kind, outcome);
+    let mut result = describe(kind, outcome, magpie.poller.now());
     result.presented = presented.map(|plain| Presented {
         shown: pin::display(&plain),
         plain,

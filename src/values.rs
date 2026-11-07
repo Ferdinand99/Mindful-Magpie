@@ -542,10 +542,22 @@ impl Open {
                         changed = true;
                     }
                 }
-                if refresh_daily {
-                    let held = new_sent.get(&id).into_iter().flat_map(|m| m.keys());
-                    whole.entry(id).or_default().extend(held.cloned());
+                if from_scratch {
+                    // Also a bound metric with daily rows but no point in the
+                    // last 24 hours (the service has been quiet): the days
+                    // are still worth sending.
+                    whole.entry(id).or_default().extend(metrics.iter().cloned());
                     changed = true;
+                } else if refresh_daily {
+                    let held: Vec<String> = new_sent
+                        .get(&id)
+                        .into_iter()
+                        .flat_map(|m| m.keys().cloned())
+                        .collect();
+                    if !held.is_empty() {
+                        whole.entry(id).or_default().extend(held);
+                        changed = true;
+                    }
                 }
             }
             if changed {

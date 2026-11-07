@@ -1705,7 +1705,13 @@ async fn a_new_utc_day_sends_the_history_and_the_daily_rows_again() {
         &doc(0, vec![card("c1", Some(bind(w.a, &["latency_ms"])))]),
     )
     .await;
-    let now = noon(&w.app);
+    // The poller's clock reads 23:55 UTC; the stream opens with two points.
+    let now = w.app.magpie.poller.now();
+    w.app
+        .magpie
+        .poller
+        .advance_clock_for_tests((86_400 - 300 - now.rem_euclid(86_400)).rem_euclid(86_400));
+    let now = w.app.magpie.poller.now();
     feed(&w.app, w.a, now - 600, 10.0);
     feed(&w.app, w.a, now - 300, 11.0);
     store_daily(&w.app, w.a, now - 300, 10.0).await;
@@ -1715,17 +1721,26 @@ async fn a_new_utc_day_sends_the_history_and_the_daily_rows_again() {
     tokio::task::yield_now().await;
     tokio::time::pause();
 
-    // Two days later, with the stream open all the time.
-    w.app.magpie.poller.advance_clock_for_tests(2 * 86_400);
+    // Ten minutes on, past midnight: a quarter of an hour has not passed and
+    // the page's points are all still within 24 hours, so a point alone would
+    // be an append with no daily rows. The new day sends the series and both
+    // days' rows instead.
+    w.app.magpie.poller.advance_clock_for_tests(600);
     let later = w.app.magpie.poller.now();
+    assert_ne!(
+        mindful_magpie::history::day_of(later),
+        mindful_magpie::history::day_of(now)
+    );
     store_daily(&w.app, w.a, later, 20.0).await;
     feed(&w.app, w.a, later, 20.0);
     let update = live.event().await;
     assert_eq!(update["full"], false);
     let a = &update["services"][w.a.to_string()];
-    // The whole series of the new day (the old points are more than 24 h
-    // old), not an append, and both days' rows.
-    assert_eq!(a["history"], json!({ "latency_ms": [[later, 20]] }), "{a}");
+    assert_eq!(
+        a["history"],
+        json!({ "latency_ms": [[now - 600, 10], [now - 300, 11], [later, 20]] }),
+        "{a}"
+    );
     assert!(a.get("history_append").is_none(), "{a}");
     assert_eq!(
         a["history_daily"]["latency_ms"].as_array().unwrap().len(),
