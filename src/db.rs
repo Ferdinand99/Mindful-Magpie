@@ -5,8 +5,17 @@ use rusqlite::Connection;
 use vole_kit::db::migrate::{self, MigrationError, MigrationSet};
 
 /// Magpie's own migrations, sorted by name. They run after the kit's core set.
-const MIGRATION_FILES: &[(&str, &str)] =
-    &[("0001_init.sql", include_str!("../migrations/0001_init.sql"))];
+const MIGRATION_FILES: &[(&str, &str)] = &[
+    ("0001_init.sql", include_str!("../migrations/0001_init.sql")),
+    (
+        "0002_layouts.sql",
+        include_str!("../migrations/0002_layouts.sql"),
+    ),
+    (
+        "0003_extension_codes.sql",
+        include_str!("../migrations/0003_extension_codes.sql"),
+    ),
+];
 
 fn migrations() -> Vec<(String, String)> {
     MIGRATION_FILES

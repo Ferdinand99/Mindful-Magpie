@@ -69,6 +69,25 @@ impl App {
         App::open(dir).await
     }
 
+    /// A Magpie that also accepts the extensions with these IDs
+    /// (`MM_EXTENSION_IDS`).
+    pub async fn with_extension_ids(ids: &[&str]) -> App {
+        let dir = std::env::temp_dir().join(format!(
+            "mindful-magpie-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ids: Vec<String> = ids.iter().map(|id| (*id).to_string()).collect();
+        let magpie = mindful_magpie::start_with(&dir, None, &ids).await.unwrap();
+        App {
+            router: mindful_magpie::router(magpie.clone()),
+            magpie,
+            dir,
+            keep_dir: false,
+        }
+    }
+
     /// Starts a Magpie on `dir` (new or existing data).
     async fn open(dir: PathBuf) -> App {
         let magpie = mindful_magpie::start(&dir, None).await.unwrap();
@@ -244,4 +263,62 @@ impl<'a> Web<'a> {
             .unwrap();
         self.send(req).await
     }
+}
+
+/// The id of the user called `name`.
+pub async fn user_id(app: &App, name: &'static str) -> i64 {
+    app.magpie
+        .core
+        .with_conn(move |c| {
+            c.query_row("SELECT id FROM users WHERE username = ?1", [name], |r| {
+                r.get(0)
+            })
+        })
+        .await
+        .unwrap()
+}
+
+/// Makes an API token for `user_id` (as the Tokens page does) and returns the
+/// plaintext.
+pub async fn make_token(
+    app: &App,
+    user_id: i64,
+    scope: vole_kit::auth::TokenScope,
+    name: &'static str,
+) -> String {
+    let token = vole_kit::auth::tokens::generate();
+    let (prefix, hash) = (
+        vole_kit::auth::tokens::display_prefix(&token),
+        vole_kit::auth::tokens::hash(&token),
+    );
+    app.magpie
+        .core
+        .with_conn(move |c| {
+            vole_kit::db::api_tokens::insert(c, user_id, name, &prefix, &hash, scope, None)
+        })
+        .await
+        .unwrap();
+    token
+}
+
+/// `GET path` as a program with `Authorization: Bearer token`.
+pub async fn bearer_get(app: &App, path: &str, token: &str) -> Res {
+    app.send(
+        Request::get(path)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+}
+
+/// `POST path` with a JSON body and no credentials.
+pub async fn post_json(app: &App, path: &str, body: &str) -> Res {
+    app.send(
+        Request::post(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await
 }

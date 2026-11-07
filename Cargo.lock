@@ -1553,17 +1553,24 @@ dependencies = [
  "askama",
  "axum",
  "axum-extra",
+ "base64 0.23.1",
  "clap",
  "jiff",
+ "rand 0.10.3",
  "reqwest",
  "rusqlite",
  "rust-embed",
  "rustls",
+ "serde",
  "serde_json",
+ "sha1",
+ "sha2 0.11.1",
+ "thiserror",
  "tokio",
  "tower",
  "tracing",
  "tracing-subscriber",
+ "unicode-segmentation",
  "url",
  "vole-kit",
  "vole-kit-build",
@@ -2758,6 +2765,12 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "unicode-segmentation"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "untrusted"

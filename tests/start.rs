@@ -27,6 +27,25 @@ async fn start_page_renders_for_signed_in_user() {
     assert!(res.body.contains(r#"id="needs""#), "{}", res.body);
     assert!(res.body.contains(r#"id="clock""#), "{}", res.body);
     assert!(
+        res.body.contains(r#"href="/static/magpie/render.css""#),
+        "{}",
+        res.body
+    );
+    // The renderer draws the empty state (the text is in the labels block).
+    assert!(!res.body.contains("empty-card"), "{}", res.body);
+    // The root the renderer fills carries the hook the background styles need.
+    assert!(
+        res.body.contains(r#"<section id="groups" class="mm-root""#),
+        "{}",
+        res.body
+    );
+    // Without scripts the page says why it is bare.
+    assert!(
+        res.body.contains("<noscript>") && res.body.contains("Startsiden trenger JavaScript"),
+        "{}",
+        res.body
+    );
+    assert!(
         res.body
             .contains("Startsiden er tom. Rediger den for å legge til tjenester og bokmerker."),
         "{}",
@@ -40,6 +59,57 @@ async fn start_page_renders_for_signed_in_user() {
         "{}",
         res.body
     );
+    assert!(
+        res.body.contains("The start page needs JavaScript"),
+        "{}",
+        res.body
+    );
+}
+
+#[tokio::test]
+async fn background_rules_only_apply_where_the_root_is() {
+    // htmx swaps only the body, so `<html>` outlives a boosted visit to another
+    // page. Every rule that paints <html> or forces its colour scheme must
+    // need the renderer's root (`.mm-root`) to be in the page.
+    let app = App::new().await;
+    let res = app.get("/static/magpie/render.css").await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    // Comments out first: they talk about these selectors too.
+    let mut css = res.body;
+    while let Some(start) = css.find("/*") {
+        let end = css[start..].find("*/").expect("comment never closes") + start + 2;
+        css.replace_range(start..end, "");
+    }
+    let mut selector_start = 0;
+    let mut checked = 0;
+    for (at, c) in css.char_indices() {
+        match c {
+            '{' => {
+                let selector = css[selector_start..at].trim();
+                let body = &css[at..css[at..].find('}').map_or(css.len(), |end| at + end)];
+                if selector.contains("data-bg") || selector.starts_with("html") {
+                    // A selector list: every member needs the root.
+                    for member in selector.split(',') {
+                        assert!(
+                            member.contains(":has(.mm-root)"),
+                            "this rule outlives the start page: {member} (in {selector})"
+                        );
+                        checked += 1;
+                    }
+                }
+                if selector.contains("data-bg") {
+                    assert!(
+                        body.contains("background") || body.contains("color-scheme"),
+                        "{selector}"
+                    );
+                }
+                selector_start = at + 1;
+            }
+            '}' => selector_start = at + 1,
+            _ => {}
+        }
+    }
+    assert!(checked >= 6, "only {checked} html rules found");
 }
 
 #[tokio::test]
@@ -134,31 +204,73 @@ async fn start_page_never_takes_focus() {
     }
 
     // Page scripts are static files (the CSP allows no inline scripts), and
-    // the clock script never moves focus either.
+    // none of them moves focus either.
     assert!(
         html.contains(r#"<script src="/static/clock.js""#),
         "the clock script is not loaded"
     );
-    let js = app.get("/static/clock.js").await;
-    assert_eq!(js.status, StatusCode::OK, "{}", js.body);
     assert!(
-        js.header("content-type").contains("javascript"),
-        "content-type: {}",
-        js.header("content-type")
+        html.contains(r#"<script type="module" src="/static/magpie/start.js""#),
+        "the start page script is not loaded as a module"
     );
-    assert!(!js.body.contains(".focus("), "clock.js moves focus");
-    assert!(!js.body.contains("autofocus"), "clock.js sets autofocus");
+    for path in [
+        "/static/clock.js",
+        "/static/magpie/start.js",
+        "/static/magpie/render.js",
+    ] {
+        let js = app.get(path).await;
+        assert_eq!(js.status, StatusCode::OK, "{path}: {}", js.body);
+        assert!(
+            js.header("content-type").contains("javascript"),
+            "{path} content-type: {}",
+            js.header("content-type")
+        );
+    }
+
+    // Every script of the page's own, read from disk so that a new file is
+    // covered at once. Only edit mode (`edit.js`, which the user opens on
+    // purpose) may move focus, and nothing sets `autofocus`.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("static");
+    let mut scripts = vec![dir.join("clock.js")];
+    for entry in std::fs::read_dir(dir.join("magpie")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "js") && path.file_name().unwrap() != "edit.js" {
+            scripts.push(path);
+        }
+    }
+    assert!(
+        scripts.iter().any(|p| p.ends_with("render.js")),
+        "render.js is not among the scripts checked: {scripts:?}"
+    );
+    for path in scripts {
+        let source = std::fs::read_to_string(&path).unwrap().to_lowercase();
+        assert!(
+            !source.contains(".focus("),
+            "{} moves focus",
+            path.display()
+        );
+        assert!(
+            !source.contains("autofocus"),
+            "{} sets autofocus",
+            path.display()
+        );
+    }
 }
 
 #[tokio::test]
 async fn grid_fills_the_width() {
     let app = App::new().await;
-    let res = app.get("/static/magpie.css").await;
-    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    let css = res.body;
+    let mut css = String::new();
+    for path in ["/static/magpie.css", "/static/magpie/render.css"] {
+        let res = app.get(path).await;
+        assert_eq!(res.status, StatusCode::OK, "{path}: {}", res.body);
+        css.push_str(&res.body);
+        css.push('\n');
+    }
+    // The renderer's card grid fills the width: as many 260px columns as fit.
     assert!(
         css.contains("repeat(auto-fill, minmax(260px, 1fr))"),
-        "the group grid is not auto-fill"
+        "the card grid is not auto-fill"
     );
 
     // No rule for `#groups` caps the width (at-rules nest, so read the text
@@ -179,6 +291,138 @@ async fn grid_fills_the_width() {
             }
             '}' => selector_start = at + 1,
             _ => {}
+        }
+    }
+}
+
+/// The JSON inside `<script type="application/json" id="{id}">`, found the
+/// way a browser finds it: the block ends at the first `</script>`.
+fn json_block(page: &str, id: &str) -> serde_json::Value {
+    let open = format!(r#"<script type="application/json" id="{id}">"#);
+    let start = page
+        .find(&open)
+        .unwrap_or_else(|| panic!("no {id} block in {page}"))
+        + open.len();
+    // A browser ends the block at `</script` in any case, whatever follows.
+    let end = page[start..]
+        .to_ascii_lowercase()
+        .find("</script")
+        .expect("block never closes")
+        + start;
+    serde_json::from_str(&page[start..end]).unwrap_or_else(|e| panic!("{e}: {}", &page[start..end]))
+}
+
+/// Saves a layout with one card titled `title` for the signed-in `web`.
+async fn save_card(web: &mut Web<'_>, title: &str) {
+    let layout = serde_json::json!({
+        "version": 0,
+        "background": { "kind": "preset", "name": "hedgerow" },
+        "groups": [{
+            "id": "g1",
+            "title": "Services",
+            "cards": [{
+                "id": "c1",
+                "title": title,
+                "description": "",
+                "url": "https://vole.example.com/",
+                "icon": { "emoji": null, "colour": "teal" }
+            }]
+        }],
+        "bookmarks": []
+    });
+    let req = Request::post("/start/layout")
+        .header("hx-request", "true")
+        .header("content-type", "application/json")
+        .body(Body::from(layout.to_string()))
+        .unwrap();
+    let res = web.send(req).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+}
+
+#[tokio::test]
+async fn start_page_embeds_the_users_layout() {
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+
+    // Before any save: the default layout, as data.
+    let res = start_page(&mut web, "en").await;
+    let layout = json_block(&res.body, "mm-layout");
+    assert_eq!(layout["version"], 0);
+    assert_eq!(layout["groups"], serde_json::json!([]));
+    assert_eq!(layout["background"]["name"], "hedgerow");
+
+    save_card(&mut web, "Vigilant Vole").await;
+    let res = start_page(&mut web, "en").await;
+    let layout = json_block(&res.body, "mm-layout");
+    assert_eq!(layout["version"], 1);
+    assert_eq!(layout["groups"][0]["cards"][0]["title"], "Vigilant Vole");
+}
+
+#[tokio::test]
+async fn hostile_titles_cannot_close_the_json_block() {
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    let hostile = "</SCRIPT x></script ><script>alert(1)</script><!-- <script>";
+    save_card(&mut web, hostile).await;
+
+    let res = start_page(&mut web, "en").await;
+    // The block parses, and holds the title as text.
+    let layout = json_block(&res.body, "mm-layout");
+    assert_eq!(layout["groups"][0]["cards"][0]["title"], hostile);
+    // The raw text never appears in the page: `</` and `<!--` are escaped.
+    assert!(
+        !res.body.contains("</script><script>alert(1)"),
+        "{}",
+        res.body
+    );
+    assert!(res.body.contains(r"<\/script>"), "{}", res.body);
+    assert!(!res.body.contains("<!-- <script>"), "{}", res.body);
+    // And the page has no script of its own beyond the static files.
+    // (The data blocks are cut out first: their text is data, and `<script`
+    // in a title is harmless once `<!--` and `</` are escaped.)
+    let mut outside = res.body.clone();
+    for id in ["mm-layout", "mm-labels"] {
+        let open = format!(r#"<script type="application/json" id="{id}">"#);
+        let start = outside.find(&open).unwrap() + open.len();
+        let end = outside[start..]
+            .to_ascii_lowercase()
+            .find("</script")
+            .unwrap()
+            + start;
+        outside.replace_range(start..end, "");
+    }
+    for (at, _) in outside.match_indices("<script") {
+        let tag = &outside[at..outside[at..].find('>').map_or(outside.len(), |e| at + e)];
+        assert!(
+            tag.contains("src=") || tag.contains(r#"type="application/json""#),
+            "an inline script: {tag}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn start_page_embeds_the_labels_for_the_renderer() {
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    for (lang, empty, invalid) in [
+        (
+            "en",
+            "Your start page is empty. Edit it to add services and bookmarks.",
+            "invalid link",
+        ),
+        (
+            "nb",
+            "Startsiden er tom. Rediger den for å legge til tjenester og bokmerker.",
+            "ugyldig lenke",
+        ),
+    ] {
+        let res = start_page(&mut web, lang).await;
+        let labels = json_block(&res.body, "mm-labels");
+        assert_eq!(labels["empty"], empty, "{lang}");
+        assert_eq!(labels["invalid_link"], invalid, "{lang}");
+        for key in ["group_label", "bookmarks_label"] {
+            let text = labels[key].as_str().unwrap_or_default();
+            assert!(!text.is_empty() && !text.contains("start."), "{lang} {key}");
         }
     }
 }

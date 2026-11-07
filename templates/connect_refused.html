@@ -1,0 +1,14 @@
+{% extends "kit/layout.html" %}
+{% import "kit/macros.html" as m %}
+
+{% block head %}
+  <link rel="stylesheet" href="/static/magpie.css">
+{% endblock %}
+
+{% block content %}
+<section class="card connect" aria-labelledby="connect-title">
+  <h1 class="connect-title" id="connect-title">{{ tr("connect.refused_title") }}</h1>
+  {{ m::callout("warning", tr("connect.refused")) }}
+  <p class="connect-actions"><a class="btn btn-secondary" href="/">{{ tr("error.back") }}</a></p>
+</section>
+{% endblock %}
