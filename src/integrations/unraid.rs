@@ -334,6 +334,9 @@ fn is_extra(error: &Json) -> bool {
 
 /// A number with one decimal, and none when it is whole («14», «12.3»).
 fn short_number(n: f64) -> String {
+    // A figure past what is a count of anything real is cut, so that the text
+    // stays short.
+    let n = n.min(api::MAX_COUNT);
     let rounded = (n * 10.0).round() / 10.0;
     if rounded.fract() == 0.0 {
         format!("{rounded:.0}")
@@ -413,7 +416,7 @@ fn day(seconds: f64) -> Option<String> {
 
 /// «8 h 12 min»: a length of time in seconds.
 fn length(seconds: f64) -> String {
-    let minutes = (seconds / 60.0).round() as u64;
+    let minutes = (seconds.min(api::MAX_COUNT) / 60.0).round() as u64;
     match (minutes / 60, minutes % 60) {
         (0, 0) => "< 1 min".to_string(),
         (0, m) => format!("{m} min"),
@@ -661,6 +664,18 @@ fn query_rejected(doc: &Json) -> bool {
             })
 }
 
+/// Whether the answer has no usable `data` and every error is about something
+/// only the top bar or the details read (`info`, `metrics`, `notifications`): a
+/// key that may not read one of those can make the server drop the whole
+/// `data`, which the core query then answers without.
+fn only_extras_failed(doc: &Json) -> bool {
+    doc.get("data").is_none_or(|data| !data.is_object())
+        && doc
+            .get("errors")
+            .and_then(Json::as_array)
+            .is_some_and(|list| !list.is_empty() && list.iter().all(is_extra))
+}
+
 /// The snapshot of a GraphQL answer.
 fn answer(doc: &Json) -> Result<Snapshot, FetchError> {
     let data = doc.get("data").filter(|data| data.is_object());
@@ -703,7 +718,7 @@ async fn read(ctx: &FetchCtx) -> Result<Snapshot, FetchError> {
     if !CORE_ONLY.is_old(&address, Instant::now()) {
         match ask(ctx, &url, &key, QUERY).await {
             Err(FetchError::Status(400)) => {}
-            Ok(doc) if query_rejected(&doc) => {}
+            Ok(doc) if query_rejected(&doc) || only_extras_failed(&doc) => {}
             Ok(doc) => {
                 CORE_ONLY.forget(&address);
                 return answer(&doc);

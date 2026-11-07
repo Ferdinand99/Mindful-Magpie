@@ -1308,3 +1308,70 @@ async fn odd_figures_cost_only_their_own_part_of_the_details() {
     assert!(!titles(&s).contains(&"unraid_parity"));
     assert!(!titles(&s).contains(&"unraid_notices"));
 }
+
+#[tokio::test]
+async fn a_key_that_may_not_read_the_extras_gets_the_core_query() {
+    // The server drops the whole data when a field it may not read cannot be
+    // null; the core query has none of the extras and is answered.
+    for path in ["notifications", "info", "metrics"] {
+        let refused = Answer::Json(json!({
+            "data": null,
+            "errors": [{ "message": "no", "path": [path], "extensions": { "code": "FORBIDDEN" } }],
+        }));
+        let core = Answer::Json(plain());
+        let answer = Answer::With(Arc::new(move |hit| {
+            if hit.body.contains("notifications") {
+                refused.clone()
+            } else {
+                core.clone()
+            }
+        }));
+        let (url, stub) = serve(answer).await;
+        let s = fetch(&url).await;
+        assert_eq!(s.status, Status::Ok, "{path}");
+        assert_eq!(s.error, None, "{path}");
+        assert_eq!(num(&s, "disk_used"), Some(62.0), "{path}");
+        assert_eq!(num(&s, "containers_running"), Some(2.0), "{path}");
+        assert_eq!(
+            stub.seen().len(),
+            2,
+            "the full query, then the core: {path}"
+        );
+        // The next reading goes straight to the core query.
+        let again = fetch(&url).await;
+        assert_eq!(again.status, Status::Ok);
+        assert_eq!(stub.seen().len(), 3, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_of_a_core_field_without_data_is_still_a_refused_key() {
+    for path in [json!(["array"]), json!(["docker"])] {
+        let doc = json!({
+            "data": null,
+            "errors": [{ "message": "no", "path": path, "extensions": { "code": "FORBIDDEN" } }],
+        });
+        let (url, stub) = serve(Answer::Json(doc)).await;
+        assert_eq!(fetch_err(&url).await, FetchError::Auth, "{path}");
+        assert_eq!(stub.seen().len(), 1, "not retried: {path}");
+    }
+}
+
+#[tokio::test]
+async fn huge_figures_keep_the_details_short() {
+    let mut doc = healthy();
+    doc["data"]["array"]["disks"] = json!([
+        { "name": "big", "temp": 40, "fsSize": 1.7e308, "fsUsed": 1e308 },
+    ]);
+    doc["data"]["array"]["caches"] = json!([]);
+    doc["data"]["array"]["parityCheckStatus"]["duration"] = json!(1e300);
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let s = fetch(&url).await;
+    let bars = bars_of(&s, "unraid_disks").unwrap();
+    assert!(bars[0].text.chars().count() <= 60, "{}", bars[0].text);
+    let rows = facts_of(&s, "unraid_parity").unwrap();
+    assert!(
+        rows.iter().all(|(_, v)| v.chars().count() <= 40),
+        "{rows:?}"
+    );
+}

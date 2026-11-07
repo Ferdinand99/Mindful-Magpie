@@ -28,7 +28,7 @@ use std::time::Duration;
 use serde_json::Value as Json;
 
 use super::api;
-use super::block::{Bar, Block, ListItem, MAX_ITEMS};
+use super::block::{Bar, Block, Fact, ListItem, MAX_ITEMS};
 use super::{
     BoxFuture, FetchCtx, FetchError, Field, FieldKind, Format, Integration, Level, MetricDef, Need,
     SettingError, Snapshot, Status, Value,
@@ -310,12 +310,19 @@ fn read_answer(doc: &Json) -> Result<Reading, FetchError> {
 /// (the id or the node that goes after it still fits in a line).
 const LINE_NAME_CHARS: usize = 48;
 
+/// Longest name or node in the label of a storage that has both, in
+/// characters.
+const LABEL_PART_CHARS: usize = 38;
+
 const MIB: f64 = 1024.0 * 1024.0;
 const GIB: f64 = 1024.0 * MIB;
 const TIB: f64 = 1024.0 * GIB;
 
 /// A number with one decimal, and none when it is whole («62», «25.6»).
 fn short_number(n: f64) -> String {
+    // A figure past what is a count of anything real is cut, so that the text
+    // stays short.
+    let n = n.min(api::MAX_COUNT);
     let rounded = (n * 10.0).round() / 10.0;
     if rounded.fract() == 0.0 {
         format!("{rounded:.0}")
@@ -324,19 +331,19 @@ fn short_number(n: f64) -> String {
     }
 }
 
-/// The unit for a size and what to divide by: MB, GB or TB (powers of 1024,
+/// The unit for a size and what to divide by: MiB, GiB or TiB (powers of 1024,
 /// the way Proxmox shows them).
 fn unit_for(total: f64) -> (f64, &'static str) {
     if total >= TIB {
-        (TIB, "TB")
+        (TIB, "TiB")
     } else if total >= GIB {
-        (GIB, "GB")
+        (GIB, "GiB")
     } else {
-        (MIB, "MB")
+        (MIB, "MiB")
     }
 }
 
-/// «25.6 / 62 GB»: `used` of `total` bytes, both in the unit of the total.
+/// «25.6 / 62 GiB»: `used` of `total` bytes, both in the unit of the total.
 fn used_of(used: f64, total: f64) -> String {
     let (div, unit) = unit_for(total);
     format!(
@@ -346,7 +353,7 @@ fn used_of(used: f64, total: f64) -> String {
     )
 }
 
-/// «8 GB»: a size in bytes.
+/// «8 GiB»: a size in bytes.
 fn size_text(bytes: f64) -> String {
     let (div, unit) = unit_for(bytes);
     format!("{} {unit}", short_number(bytes / div))
@@ -363,11 +370,19 @@ fn byte_bar(label: String, item: &Json, used: &str, max: &str) -> Option<Bar> {
     })
 }
 
-/// The bars of the nodes that are up: CPU, RAM and the root disk for each, with
-/// the figures in the text. A cluster so big that this is more than a block
-/// holds gets CPU and RAM only (a shorter title says so).
-fn node_bars(doc: &Json) -> Option<Block> {
-    let nodes: Vec<(String, &Json)> = entries(doc)?
+/// Most nodes a block shows when the disk bars have gone too: two bars each.
+const MAX_NODES_SHORT: usize = MAX_ITEMS / 2;
+
+/// The blocks of the nodes that are up: bars of CPU, RAM and the root disk for
+/// each, with the figures in the text. A cluster so big that this is more than
+/// a block holds gets CPU and RAM only (a shorter title says so), and one with
+/// more nodes than fit even then shows the first few by name and a fact with
+/// how many are left out.
+fn node_blocks(doc: &Json) -> Vec<Block> {
+    let Some(items) = entries(doc) else {
+        return Vec::new();
+    };
+    let mut nodes: Vec<(String, &Json)> = items
         .filter(|item| text(item, "type") == Some("node"))
         .filter(|item| text(item, "status") == Some("online"))
         .filter_map(|node| {
@@ -377,9 +392,9 @@ fn node_bars(doc: &Json) -> Option<Block> {
         })
         .collect();
     let many = nodes.len() > 1;
-    let build = |with_disk: bool| -> Vec<Bar> {
+    let build = |nodes: &[(String, &Json)], with_disk: bool| -> Vec<Bar> {
         let mut bars = Vec::new();
-        for (name, node) in &nodes {
+        for (name, node) in nodes {
             let label = |what: &str| {
                 if many {
                     format!("{name} {what}")
@@ -405,16 +420,40 @@ fn node_bars(doc: &Json) -> Option<Block> {
         }
         bars
     };
-    let full = build(true);
-    let (title_key, bars) = if full.len() > MAX_ITEMS {
-        ("pve_nodes_short", build(false))
-    } else {
+    let mut blocks = Vec::new();
+    let full = build(&nodes, true);
+    let (title_key, bars) = if full.len() <= MAX_ITEMS {
         ("pve_nodes", full)
+    } else {
+        let mut bars = build(&nodes, false);
+        if bars.len() > MAX_ITEMS {
+            nodes.sort_by(|a, b| a.0.cmp(&b.0));
+            let left_out = nodes.len().saturating_sub(MAX_NODES_SHORT);
+            nodes.truncate(MAX_NODES_SHORT);
+            bars = build(&nodes, false);
+            if left_out > 0 {
+                blocks.push(Block::Facts {
+                    title_key: "pve_nodes".into(),
+                    rows: vec![Fact {
+                        label_key: Some("pve_nodes_more".into()),
+                        label: None,
+                        value: left_out.to_string(),
+                    }],
+                });
+            }
+        }
+        ("pve_nodes_short", bars)
     };
-    (!bars.is_empty()).then(|| Block::Bars {
-        title_key: title_key.into(),
-        bars,
-    })
+    if !bars.is_empty() {
+        blocks.insert(
+            0,
+            Block::Bars {
+                title_key: title_key.into(),
+                bars,
+            },
+        );
+    }
+    blocks
 }
 
 /// A guest of the answer.
@@ -443,7 +482,7 @@ impl Guest<'_> {
         cpu_percent(self.item)
     }
 
-    /// «4 vCPU · 11 / 32 GB RAM»: what it has and, when it runs, what it uses.
+    /// «4 vCPU · 11 / 32 GiB RAM»: what it has and, when it runs, what it uses.
     fn sub(&self, running: bool) -> Option<String> {
         let mut parts = Vec::new();
         if let Some(cpus) = amount(self.item.get("maxcpu")).filter(|n| *n > 0.0) {
@@ -560,16 +599,23 @@ fn storage_bars(doc: &Json) -> Option<Block> {
             let node = text(storage, "node")
                 .map(|n| api::clean_text(n, LINE_NAME_CHARS))
                 .unwrap_or_default();
-            let owner = if shared { String::new() } else { node.clone() };
-            if !seen.insert((name.clone(), owner)) {
+            let place = if shared { String::new() } else { node.clone() };
+            if seen.contains(&(name.clone(), place.clone())) {
                 return None;
             }
+            // Each part is cut so that the node still shows in the 80
+            // characters of a line.
+            let part = |text: &str| text.chars().take(LABEL_PART_CHARS).collect::<String>();
             let label = if shared || nodes < 2 || node.is_empty() {
-                name
+                name.clone()
             } else {
-                format!("{name} · {node}")
+                format!("{} · {}", part(&name), part(&node))
             };
-            byte_bar(label, storage, "disk", "maxdisk")
+            // Only a storage that gives a bar counts as seen: a shared one
+            // that is unreadable on one node may be readable on the next.
+            let bar = byte_bar(label, storage, "disk", "maxdisk")?;
+            seen.insert((name, place));
+            Some(bar)
         })
         .collect();
     bars.sort_by(|a, b| b.pct.total_cmp(&a.pct));
@@ -584,10 +630,10 @@ fn storage_bars(doc: &Json) -> Option<Block> {
 /// blocks (the poller cuts them down; see [`super::block`]).
 pub fn details(doc: &Json) -> Vec<Block> {
     [
-        node_bars(doc),
-        running_list(doc),
-        stopped_list(doc),
-        storage_bars(doc),
+        node_blocks(doc),
+        running_list(doc).into_iter().collect(),
+        stopped_list(doc).into_iter().collect(),
+        storage_bars(doc).into_iter().collect(),
     ]
     .into_iter()
     .flatten()

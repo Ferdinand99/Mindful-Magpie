@@ -689,8 +689,12 @@ fn node_rows_come_from_the_same_answer() {
 async fn the_rows_are_not_in_the_snapshot() {
     let (url, _) = serve(Answer::Json(cluster())).await;
     let s = fetch(&url).await;
-    // Names are in the detail blocks only, never in a value or a need.
-    let all = format!("{:?}{:?}", s.values, s.needs);
+    // Names are in the detail blocks only: everything else of the snapshot,
+    // as text and as JSON, has none.
+    let mut rest = s.clone();
+    assert!(!rest.details.is_empty());
+    rest.details.clear();
+    let all = format!("{rest:?}{}", serde_json::to_string(&rest).unwrap());
     assert!(!all.contains("pve1") && !all.contains("pve2"), "{all}");
     assert!(s.needs.iter().all(|n| n.key.starts_with("pve:")));
 }
@@ -868,11 +872,11 @@ async fn the_nodes_become_bars_with_the_figures_in_the_text() {
         got,
         [
             ("pve1 CPU", 10.0, "10 % · 8 CPU"),
-            ("pve1 RAM", 25.0, "16 / 64 GB"),
-            ("pve1 Disk", 20.0, "20 / 100 GB"),
+            ("pve1 RAM", 25.0, "16 / 64 GiB"),
+            ("pve1 Disk", 20.0, "20 / 100 GiB"),
             ("pve2 CPU", 30.0, "30 % · 8 CPU"),
-            ("pve2 RAM", 75.0, "48 / 64 GB"),
-            ("pve2 Disk", 60.0, "60 / 100 GB"),
+            ("pve2 RAM", 75.0, "48 / 64 GiB"),
+            ("pve2 Disk", 60.0, "60 / 100 GiB"),
         ]
     );
 }
@@ -895,8 +899,8 @@ async fn one_node_has_bars_without_its_name_and_decimals_where_there_are_some() 
         got,
         [
             ("CPU", "25.6 % · 4 CPU"),
-            ("RAM", "25.6 / 62 GB"),
-            ("Disk", "0 / 2 TB"),
+            ("RAM", "25.6 / 62 GiB"),
+            ("Disk", "0 / 2 TiB"),
         ]
     );
     assert!(close(Some(bars[0].pct), 25.6));
@@ -923,10 +927,10 @@ async fn running_guests_are_listed_busiest_first_with_what_they_use() {
             "svc (CT 110)"
         ]
     );
-    assert_eq!(items[0].sub.as_deref(), Some("4 vCPU · 11 / 32 GB RAM"));
+    assert_eq!(items[0].sub.as_deref(), Some("4 vCPU · 11 / 32 GiB RAM"));
     assert_eq!(items[0].right.as_deref(), Some("38 % CPU"));
     assert_eq!(items[0].status, Some(Status::Ok));
-    assert_eq!(items[1].sub.as_deref(), Some("3 / 8 GB RAM"));
+    assert_eq!(items[1].sub.as_deref(), Some("3 / 8 GiB RAM"));
     assert_eq!(items[3].right.as_deref(), Some("0 % CPU"));
 }
 
@@ -938,7 +942,7 @@ async fn stopped_guests_are_greyed_and_templates_are_left_out() {
     let got: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
     assert_eq!(got, ["old (VM 102)", "idle (CT 111)"], "no template");
     assert!(items.iter().all(|i| i.status == Some(Status::Unknown)));
-    assert_eq!(items[0].sub.as_deref(), Some("4 GB RAM"));
+    assert_eq!(items[0].sub.as_deref(), Some("4 GiB RAM"));
     assert_eq!(items[0].right, None);
 }
 
@@ -954,9 +958,9 @@ async fn storage_is_listed_by_use_with_a_shared_storage_once() {
     assert_eq!(
         got,
         [
-            ("local · pve2", 50.0, "50 / 100 GB"),
-            ("local · pve1", 30.0, "30 / 100 GB"),
-            ("nas", 20.0, "40 / 200 GB"),
+            ("local · pve2", 50.0, "50 / 100 GiB"),
+            ("local · pve1", 30.0, "30 / 100 GiB"),
+            ("nas", 20.0, "40 / 200 GiB"),
         ],
         "the unavailable one is not there"
     );
@@ -1106,4 +1110,128 @@ async fn odd_answers_give_fewer_blocks_and_never_a_panic() {
     assert_eq!(bars_of(&s, "pve_nodes").unwrap()[0].label, "Disk");
     assert_eq!(list_of(&s, "pve_running").unwrap()[0].text, "VM");
     assert!(bars_of(&s, "pve_storage").is_none());
+}
+
+#[tokio::test]
+async fn five_nodes_show_the_first_four_by_name_and_say_how_many_are_left() {
+    let _app = common::App::new().await;
+    // Named out of order; two are offline and do not count.
+    let node = |name: &str, status: &str| {
+        json!({ "type": "node", "node": name, "status": status,
+                "cpu": 0.5, "mem": GIB, "maxmem": 2 * GIB, "disk": GIB, "maxdisk": 4 * GIB })
+    };
+    let data = vec![
+        node("e", "online"),
+        node("b", "online"),
+        node("x", "offline"),
+        node("d", "online"),
+        node("a", "online"),
+        node("c", "online"),
+        node("y", "offline"),
+    ];
+    let (url, _) = serve(Answer::Json(json!({ "data": data }))).await;
+    let s = fetch(&url).await;
+    let bars = bars_of(&s, "pve_nodes_short").expect("the short title");
+    let labels: Vec<_> = bars.iter().map(|b| b.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        [
+            "a CPU", "a RAM", "b CPU", "b RAM", "c CPU", "c RAM", "d CPU", "d RAM"
+        ]
+    );
+    let Some(Block::Facts { title_key, rows }) =
+        s.details.iter().find(|b| matches!(b, Block::Facts { .. }))
+    else {
+        panic!("the hint")
+    };
+    assert_eq!(title_key, "pve_nodes");
+    assert_eq!(rows[0].label_key.as_deref(), Some("pve_nodes_more"));
+    assert_eq!(rows[0].value, "1");
+    for key in s.details.iter().flat_map(Block::keys) {
+        assert!(block::key_known(key), "{key}");
+    }
+    for (lang, file) in locales() {
+        assert!(
+            text_of(file, "detail", "pve_nodes_more").is_some(),
+            "{lang}"
+        );
+    }
+    // Four nodes fit without a hint.
+    let four: Vec<Json> = ["a", "b", "c", "d"]
+        .iter()
+        .map(|n| node(n, "online"))
+        .collect();
+    let (url, _) = serve(Answer::Json(json!({ "data": four }))).await;
+    let s = fetch(&url).await;
+    assert!(s.details.iter().all(|b| !matches!(b, Block::Facts { .. })));
+}
+
+#[tokio::test]
+async fn a_storage_label_with_a_long_name_and_node_keeps_the_node() {
+    let name = "s".repeat(60);
+    let node = "n".repeat(60);
+    let doc = json!({ "data": [
+        { "type": "node", "node": node, "status": "online" },
+        { "type": "node", "node": "other", "status": "online" },
+        { "type": "storage", "storage": name, "node": node, "status": "available",
+          "disk": GIB, "maxdisk": 2 * GIB },
+    ]});
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let mut s = fetch(&url).await;
+    s.bound_details();
+    let bars = bars_of(&s, "pve_storage").unwrap();
+    let want = format!("{} · {}", "s".repeat(38), "n".repeat(38));
+    assert_eq!(bars[0].label, want);
+}
+
+#[tokio::test]
+async fn a_shared_storage_that_gave_no_bar_on_one_node_is_read_on_the_next() {
+    let doc = json!({ "data": [
+        { "type": "node", "node": "a", "status": "online" },
+        { "type": "node", "node": "b", "status": "online" },
+        { "type": "storage", "storage": "nas", "node": "a", "status": "available",
+          "shared": 1, "disk": "x", "maxdisk": 10 * GIB },
+        { "type": "storage", "storage": "nas", "node": "b", "status": "available",
+          "shared": 1, "disk": 5 * GIB, "maxdisk": 10 * GIB },
+        { "type": "storage", "storage": "nas", "node": "c", "status": "available",
+          "shared": 1, "disk": 6 * GIB, "maxdisk": 10 * GIB },
+    ]});
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let s = fetch(&url).await;
+    let bars = bars_of(&s, "pve_storage").unwrap();
+    assert_eq!(bars.len(), 1, "once");
+    assert_eq!(bars[0].label, "nas");
+    assert_eq!(
+        bars[0].text, "5 / 10 GiB",
+        "the first node that had figures"
+    );
+}
+
+#[tokio::test]
+async fn huge_figures_keep_the_text_short() {
+    let doc = json!({ "data": [
+        { "type": "node", "node": "a", "status": "online", "cpu": 0.5, "maxcpu": 1e300,
+          "mem": 1e300, "maxmem": 1e301, "disk": 1e308, "maxdisk": 1.7e308 },
+        { "type": "qemu", "vmid": 1, "name": "g", "status": "running", "cpu": 0.1,
+          "maxcpu": 1e300, "mem": 1e300, "maxmem": 1.7e308 },
+        { "type": "storage", "storage": "s", "status": "available",
+          "disk": 1e308, "maxdisk": 1.7e308 },
+    ]});
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let s = fetch(&url).await;
+    assert_eq!(s.details.len(), 3);
+    for block in &s.details {
+        let texts: Vec<&str> = match block {
+            Block::Bars { bars, .. } => bars.iter().map(|b| b.text.as_str()).collect(),
+            Block::List { items, .. } => items
+                .iter()
+                .flat_map(|i| [i.sub.as_deref(), i.right.as_deref()])
+                .flatten()
+                .collect(),
+            other => panic!("{other:?}"),
+        };
+        for text in texts {
+            assert!(text.chars().count() <= block::TEXT_CHARS, "{text}");
+        }
+    }
 }

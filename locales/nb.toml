@@ -402,6 +402,7 @@ unraid_array_no_data_disks = "Ingen datadisker"
 [detail]
 # Proxmox og Unraid
 pve_nodes = "Noder"
+pve_nodes_more = "Flere noder"
 pve_nodes_short = "Noder (CPU og RAM)"
 pve_running = "Kjører"
 pve_stopped = "Stoppet"
