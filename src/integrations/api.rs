@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderValue};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderName, HeaderValue};
 use serde::de::DeserializeOwned;
 use serde_json::Value as Json;
 use url::Url;
@@ -108,6 +108,36 @@ pub async fn get_json<T: DeserializeOwned>(
         .send()
         .await
         .map_err(|err| classify(&err))?;
+    reply(response).await
+}
+
+/// One POST of `body` as JSON, with the key as the header `name` (not
+/// `Authorization`: a service such as Unraid takes `x-api-key`). The answer is
+/// read as [`get_json`] reads it. A redirect to another origin is not followed
+/// ([`FetchError::RedirectScheme`]): unlike `Authorization`, a header of this
+/// kind would go along with it.
+pub async fn post_json<T: DeserializeOwned>(
+    http: &reqwest::Client,
+    url: Url,
+    name: HeaderName,
+    auth: &HeaderValue,
+    body: &Json,
+) -> Result<Reply<T>, FetchError> {
+    let request = http
+        .post(url)
+        .header(name, auth.clone())
+        .header(ACCEPT, "application/json")
+        .json(body)
+        .send();
+    let response = super::KEY_IN_OWN_HEADER
+        .scope((), request)
+        .await
+        .map_err(|err| classify(&err))?;
+    reply(response).await
+}
+
+/// What `response` says: see [`get_json`].
+async fn reply<T: DeserializeOwned>(response: reqwest::Response) -> Result<Reply<T>, FetchError> {
     match response.status().as_u16() {
         401 | 403 => Err(FetchError::Auth),
         404 => Ok(Reply::NotFound),
