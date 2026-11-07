@@ -12,7 +12,7 @@ pub mod pages;
 pub mod store;
 pub mod view;
 
-pub use view::{MetricView, ServiceView, services_for};
+pub use view::{MetricView, ServiceView, services_for, view_of};
 
 use std::time::Duration;
 

@@ -1160,3 +1160,214 @@ async fn no_kind_of_token_opens_the_stream() {
         assert_ne!(res.header("content-type"), "text/event-stream");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Views of services that become visible, and bindings that go
+
+fn add_ids(event: &Value) -> Vec<i64> {
+    let mut ids: Vec<i64> = event["services_add"]
+        .as_array()
+        .expect("services_add")
+        .iter()
+        .map(|v| v["id"].as_i64().unwrap())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+fn sorted_ids(ids: &[i64]) -> Vec<i64> {
+    let mut ids = ids.to_vec();
+    ids.sort_unstable();
+    ids
+}
+
+#[tokio::test]
+async fn the_first_event_carries_a_view_of_each_entry_and_later_ones_only_new_services() {
+    let w = world().await;
+    let mut bob = Web::new(&w.app, "bob", "viewer").await;
+    save(
+        &mut bob,
+        &doc(
+            0,
+            vec![
+                card("c1", Some(bind(w.a, &["status"]))),
+                card("c2", Some(bind(w.b, &["status"]))),
+            ],
+        ),
+    )
+    .await;
+    for id in [w.a, w.b] {
+        w.app
+            .magpie
+            .poller
+            .set_snapshot_for_tests(id, snap(Status::Ok, 1.0));
+    }
+    let mut live = open_live(&bob, "nb").await;
+    let first = live.event().await;
+    assert_eq!(add_ids(&first), sorted_ids(&[w.a, w.b]));
+    // The view has what #mm-services has: name, kind, interval, labelled metrics.
+    let view = first["services_add"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == w.a)
+        .unwrap();
+    assert_eq!(view["name"], "Blog");
+    assert_eq!(view["kind"], "http");
+    assert_eq!(view["interval_s"], 60);
+    assert_eq!(view["metrics"][0]["id"], "status");
+    assert!(!view["metrics"][0]["label"].as_str().unwrap().is_empty());
+    assert_eq!(view["metrics"][0]["format"], "number");
+    assert!(view.get("url").is_none() && view.get("settings").is_none());
+    assert_clean(&first.to_string(), "first event");
+    tokio::time::pause();
+
+    // A change of a reading brings no view: the page has them.
+    w.app
+        .magpie
+        .poller
+        .set_snapshot_for_tests(w.a, snap(Status::Warn, 9.0));
+    let update = live.event().await;
+    assert_eq!(update["services_add"], json!([]));
+}
+
+#[tokio::test]
+async fn a_service_that_is_hidden_and_shown_again_comes_back_with_its_view() {
+    let w = world().await;
+    let mut bob = Web::new(&w.app, "bob", "viewer").await;
+    save(
+        &mut bob,
+        &doc(
+            0,
+            vec![
+                card("c1", Some(bind(w.a, &["status"]))),
+                card("c2", Some(bind(w.b, &["status"]))),
+            ],
+        ),
+    )
+    .await;
+    for id in [w.a, w.b] {
+        w.app
+            .magpie
+            .poller
+            .set_snapshot_for_tests(id, snap(Status::Ok, 1.0));
+    }
+    let mut live = open_live(&bob, "en").await;
+    live.event().await;
+    tokio::time::pause();
+
+    set_visibility(&w.app, w.b, "Wiki", Visibility::Admin, &[]).await;
+    let hidden = live.event().await;
+    assert_eq!(hidden["removed"], json!([w.b]));
+    assert_eq!(hidden["services_add"], json!([]));
+    assert!(!hidden.to_string().contains("Wiki"));
+
+    set_visibility(&w.app, w.b, "Wiki", Visibility::All, &[]).await;
+    let shown = live.event().await;
+    assert_eq!(add_ids(&shown), vec![w.b]);
+    assert_eq!(shown["services_add"][0]["name"], "Wiki");
+    assert!(shown["services"][w.b.to_string()].is_object());
+    live.nothing().await;
+}
+
+#[tokio::test]
+async fn a_service_hidden_at_load_arrives_with_its_view_once_it_is_visible() {
+    let w = world().await;
+    let mut bob = Web::new(&w.app, "bob", "viewer").await;
+    let bob_id = user_id(&w.app, "bob").await;
+    let vera_id = common::add_user(&w.app, "vera", "viewer").await;
+    save(
+        &mut bob,
+        &doc(
+            0,
+            vec![
+                card("c1", Some(bind(w.a, &["status"]))),
+                card("c2", Some(bind(w.b, &["status"]))),
+            ],
+        ),
+    )
+    .await;
+    // Wiki is for selected users, and the list leaves Bob out.
+    set_visibility(&w.app, w.b, "Wiki", Visibility::Users, &[vera_id]).await;
+    for id in [w.a, w.b] {
+        w.app
+            .magpie
+            .poller
+            .set_snapshot_for_tests(id, snap(Status::Ok, 1.0));
+    }
+    assert_eq!(ids(&embed(&mut bob).await), sorted([w.a]));
+    let mut live = open_live(&bob, "en").await;
+    let first = live.event().await;
+    assert_eq!(ids(&first), sorted([w.a]));
+    assert_eq!(add_ids(&first), vec![w.a]);
+    assert!(!first.to_string().contains("Wiki"));
+    tokio::time::pause();
+
+    // Its readings are nothing to him.
+    w.app
+        .magpie
+        .poller
+        .set_snapshot_for_tests(w.b, snap(Status::Bad, 5.0));
+    live.nothing().await;
+
+    // Put on the list, it arrives whole, with its view.
+    set_visibility(&w.app, w.b, "Wiki", Visibility::Users, &[vera_id, bob_id]).await;
+    let update = live.event().await;
+    assert_eq!(ids(&update), sorted([w.b]));
+    assert_eq!(add_ids(&update), vec![w.b]);
+    assert_eq!(update["services_add"][0]["name"], "Wiki");
+    assert_eq!(update["services"][w.b.to_string()]["status"], "bad");
+}
+
+#[tokio::test]
+async fn unbinding_a_card_while_the_stream_is_open_removes_the_service_at_the_next_wake() {
+    let w = world().await;
+    let mut bob = Web::new(&w.app, "bob", "viewer").await;
+    save(
+        &mut bob,
+        &doc(
+            0,
+            vec![
+                card("c1", Some(bind(w.a, &["status"]))),
+                card("c2", Some(bind(w.b, &["status"]))),
+            ],
+        ),
+    )
+    .await;
+    for id in [w.a, w.b] {
+        w.app
+            .magpie
+            .poller
+            .set_snapshot_for_tests(id, snap(Status::Ok, 1.0));
+    }
+    let mut live = open_live(&bob, "en").await;
+    assert_eq!(ids(&live.event().await).len(), 2);
+    tokio::time::pause();
+
+    // The card for Wiki loses its binding (a save from another tab).
+    save(
+        &mut bob,
+        &doc(
+            1,
+            vec![card("c1", Some(bind(w.a, &["status"]))), card("c2", None)],
+        ),
+    )
+    .await;
+    // A save wakes nothing by itself; the next wake finds it.
+    live.nothing().await;
+    w.app
+        .magpie
+        .poller
+        .set_snapshot_for_tests(w.c, snap(Status::Ok, 1.0));
+    let update = live.event().await;
+    assert_eq!(update["removed"], json!([w.b]));
+    assert_eq!(update["services"], json!({}));
+    assert_eq!(update["services_add"], json!([]));
+
+    // Its readings say nothing more.
+    w.app
+        .magpie
+        .poller
+        .set_snapshot_for_tests(w.b, snap(Status::Bad, 9.0));
+    live.nothing().await;
+}

@@ -20,17 +20,22 @@
 //! Unix seconds.
 //!
 //! **The stream.** One event name, `values`, whose data is
-//! `{ now, full, services, removed }`: the first event of a stream has
+//! `{ now, full, services, removed, services_add }`: the first event of a stream has
 //! `full: true` and holds every entry (the page replaces what it has); after
 //! that an event holds the entries that changed since the last one and, in
 //! `removed`, the ids the user no longer gets (the service was deleted, hidden
-//! from them or is no longer bound). The server remembers what it sent, so a
+//! from them or is no longer bound). `services_add` lists the views (the
+//! `#mm-services` shape: id, name, kind, interval, metrics with labels) of the
+//! services this stream has not sent one of yet (all of them in the first
+//! event), so that a service that became visible after the page was made can
+//! be drawn; it is built from the same bindings-and-visibility list as the
+//! entries, so it never names a hidden service. The server remembers what it sent, so a
 //! change is compared with the document the client actually has, not guessed
 //! from which service announced it. The visibility and the layout are read
 //! again at every wake, the account too: a signed-out, disabled or demoted
 //! user loses the stream or the services.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -55,14 +60,46 @@ use crate::Magpie;
 use crate::integrations::poller::{Change, PollerHandle};
 use crate::integrations::{self, Need, Status, Value};
 use crate::layout::{self, Layout};
-use crate::services::{ServiceEvent, ServiceSummary, Viewer, store};
+use crate::services::{ServiceEvent, ServiceSummary, ServiceView, Viewer, store, view_of};
 
 /// Streams open at once, across all users.
 pub const MAX_STREAMS: usize = 64;
 /// The quiet period after a change: a burst of readings is one event.
 pub const QUIET: Duration = Duration::from_secs(1);
 
+/// Streams one user may have open at once (the tabs of one person).
+pub const MAX_STREAMS_PER_USER: usize = 8;
+
 static STREAMS: StreamLimit = StreamLimit::new(MAX_STREAMS);
+static USER_STREAMS: std::sync::LazyLock<std::sync::Mutex<HashMap<i64, usize>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// One of a user's places under [`MAX_STREAMS_PER_USER`], given back on drop.
+struct UserSlot(i64);
+
+impl UserSlot {
+    fn acquire(user_id: i64) -> Option<UserSlot> {
+        let mut open = USER_STREAMS.lock().unwrap_or_else(|e| e.into_inner());
+        let n = open.entry(user_id).or_insert(0);
+        if *n >= MAX_STREAMS_PER_USER {
+            return None;
+        }
+        *n += 1;
+        Some(UserSlot(user_id))
+    }
+}
+
+impl Drop for UserSlot {
+    fn drop(&mut self) {
+        let mut open = USER_STREAMS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = open.get_mut(&self.0) {
+            *n -= 1;
+            if *n == 0 {
+                open.remove(&self.0);
+            }
+        }
+    }
+}
 
 /// One service as a page or the extension sees it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -147,19 +184,34 @@ pub async fn values_for(
     viewer: impl Into<Viewer>,
     layout: &Layout,
 ) -> Result<ValuesDoc, DbError> {
+    let summaries = bound_visible(core, viewer, layout).await?;
+    Ok(doc_of(&summaries, poller))
+}
+
+/// The services bound on `layout` that `viewer` may see: the intersection
+/// everything here is built from. Nothing outside it is ever named.
+async fn bound_visible(
+    core: &Core,
+    viewer: impl Into<Viewer>,
+    layout: &Layout,
+) -> Result<Vec<ServiceSummary>, DbError> {
     let bound = bound_ids(layout);
-    let mut services = BTreeMap::new();
-    if !bound.is_empty() {
-        for summary in store::visible_to(core, viewer).await? {
-            if bound.contains(&summary.id) {
-                services.insert(summary.id.to_string(), entry(&summary, poller));
-            }
-        }
+    if bound.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(ValuesDoc {
+    let mut visible = store::visible_to(core, viewer).await?;
+    visible.retain(|s| bound.contains(&s.id));
+    Ok(visible)
+}
+
+fn doc_of(summaries: &[ServiceSummary], poller: &PollerHandle) -> ValuesDoc {
+    ValuesDoc {
         now: jiff::Timestamp::now().as_second(),
-        services,
-    })
+        services: summaries
+            .iter()
+            .map(|s| (s.id.to_string(), entry(s, poller)))
+            .collect(),
+    }
 }
 
 pub fn router() -> Router<Core> {
@@ -218,10 +270,14 @@ struct Open {
     changes: Changes<()>,
     /// What the client has: each entry as it was sent.
     sent: HashMap<i64, String>,
+    /// The services this stream has sent a view of (`services_add`); an id
+    /// leaves it when it is removed, so it is sent again if it comes back.
+    viewed: HashSet<i64>,
     first: bool,
     lagged: Arc<AtomicBool>,
     shutdown: watch::Receiver<bool>,
     _slot: live::StreamSlot,
+    _user_slot: UserSlot,
     _forwarder: AbortOnDrop,
 }
 
@@ -246,18 +302,19 @@ impl Open {
             }
         };
         let viewer = Viewer::new(user.id, user.role.is_admin());
-        let doc = match layout::load_or_default(&self.core, id).await {
-            Ok((layout, _)) => values_for(&self.core, &self.poller, viewer, &layout).await,
+        let summaries = match layout::load_or_default(&self.core, id).await {
+            Ok((layout, _)) => bound_visible(&self.core, viewer, &layout).await,
             Err(err) => Err(err),
         };
-        let doc = match doc {
-            Ok(doc) => doc,
+        let summaries = match summaries {
+            Ok(list) => list,
             Err(err) => {
                 tracing::warn!(%err, "live values: could not read the values; ending the stream");
                 return Turn::End;
             }
         };
 
+        let doc = doc_of(&summaries, &self.poller);
         // (Not `full || take(..)`: that would leave `first` set.)
         let first = std::mem::take(&mut self.first);
         let full = full || first;
@@ -281,6 +338,14 @@ impl Open {
                 .collect()
         };
         removed.sort_unstable();
+        // The views the client has not been given: the services list it holds
+        // (the page's `#mm-services`) may lack a service that has become visible.
+        let add: Vec<ServiceView> = summaries
+            .iter()
+            .filter(|s| full || !self.viewed.contains(&s.id))
+            .map(view_of)
+            .collect();
+        self.viewed = current.keys().copied().collect();
         self.sent = current;
         if !full && entries.is_empty() && removed.is_empty() {
             return Turn::Nothing;
@@ -290,6 +355,7 @@ impl Open {
             "full": full,
             "services": entries,
             "removed": removed,
+            "services_add": add,
         });
         Turn::Send(Event::default().event("values").data(data.to_string()))
     }
@@ -314,6 +380,10 @@ async fn live_values(
         return live::busy();
     };
     let id = user.id;
+    let Some(user_slot) = UserSlot::acquire(id) else {
+        tracing::warn!(user = id, "too many live value streams for one user");
+        return live::busy();
+    };
     let session_version = match core.with_conn(move |c| users::get_user(c, id)).await {
         Ok(Some(u)) if u.active => u.session_version,
         Ok(_) => return ApiError::Unauthorized.into_response(),
@@ -339,10 +409,12 @@ async fn live_values(
         session_version,
         changes: Changes::all(wake_rx).quiet(QUIET),
         sent: HashMap::new(),
+        viewed: HashSet::new(),
         first: true,
         lagged,
         shutdown,
         _slot: slot,
+        _user_slot: user_slot,
         _forwarder: AbortOnDrop(forwarder),
     };
     // The stream is polled after this handler returned, outside the request's

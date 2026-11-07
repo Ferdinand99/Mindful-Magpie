@@ -7,7 +7,7 @@ use vole_kit::db::DbError;
 use vole_kit::i18n;
 use vole_kit::state::Core;
 
-use super::{Viewer, store};
+use super::{ServiceSummary, Viewer, store};
 use crate::integrations::{self, Format};
 
 /// One metric a card can show, with its label in the request's language.
@@ -44,28 +44,28 @@ pub async fn services_for(
     viewer: impl Into<Viewer>,
 ) -> Result<Vec<ServiceView>, DbError> {
     let visible = store::visible_to(core, viewer).await?;
-    Ok(visible
-        .into_iter()
-        .map(|s| {
-            let metrics = integrations::find(&s.kind)
-                .map(|kind| {
-                    kind.metrics()
-                        .iter()
-                        .map(|m| MetricView {
-                            id: m.id,
-                            label: i18n::t(m.label_key),
-                            format: m.format,
-                        })
-                        .collect()
+    Ok(visible.iter().map(view_of).collect())
+}
+
+/// The view of one visible service (see [`services_for`]).
+pub fn view_of(s: &ServiceSummary) -> ServiceView {
+    let metrics = integrations::find(&s.kind)
+        .map(|kind| {
+            kind.metrics()
+                .iter()
+                .map(|m| MetricView {
+                    id: m.id,
+                    label: i18n::t(m.label_key),
+                    format: m.format,
                 })
-                .unwrap_or_default();
-            ServiceView {
-                id: s.id,
-                name: s.name,
-                kind: s.kind,
-                interval_s: s.interval_s,
-                metrics,
-            }
+                .collect()
         })
-        .collect())
+        .unwrap_or_default();
+    ServiceView {
+        id: s.id,
+        name: s.name.clone(),
+        kind: s.kind.clone(),
+        interval_s: s.interval_s,
+        metrics,
+    }
 }

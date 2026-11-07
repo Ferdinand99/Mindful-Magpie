@@ -464,16 +464,27 @@ export function mergeValues(current, update) {
   return { values: { now: update?.now ?? current?.now, services }, removed: [...removed] };
 }
 
-/** The services list after an event: the removed ones gone, names and intervals as the event has them. */
-function mergeServices(list, values, removed) {
-  const gone = new Set(removed);
-  return list
-    .filter((s) => !gone.has(String(s?.id)))
-    .map((s) => {
-      const entry = values.services[String(s?.id)];
-      if (!entry) return s;
-      return { ...s, name: entry.name ?? s.name, interval_s: entry.interval_s ?? s.interval_s };
-    });
+/**
+ * The services list after an event: the removed ones gone, the views the event
+ * adds (`services_add`: a service that became visible while the page was open)
+ * put in, or replacing the one the list has, and names and intervals as the
+ * event's entries have them. By name, as the server lists them.
+ */
+export function mergeServices(list, values, removed, add = []) {
+  const gone = new Set(removed.map(String));
+  const out = list.filter((s) => !gone.has(String(s?.id)));
+  for (const view of Array.isArray(add) ? add : []) {
+    if (!view || typeof view !== "object" || view.id === undefined) continue;
+    const at = out.findIndex((s) => String(s?.id) === String(view.id));
+    if (at >= 0) out[at] = view;
+    else out.push(view);
+  }
+  const byName = (a, b) => String(a?.name ?? "").localeCompare(String(b?.name ?? ""), undefined, { sensitivity: "base" });
+  return out.sort(byName).map((s) => {
+    const entry = values.services[String(s?.id)];
+    if (!entry) return s;
+    return { ...s, name: entry.name ?? s.name, interval_s: entry.interval_s ?? s.interval_s };
+  });
 }
 
 /** Whether any card of the layout shows a service. */
@@ -502,10 +513,11 @@ function hasBoundCards(layout) {
  * (`htmx:beforeSwap`, a boosted visit) or when `#groups` is no longer in the
  * document, so nothing stays open across navigation. A server that refuses a
  * stream (an `EventSource` does not retry those) is asked again after
- * `RETRY_MS`.
+ * `RETRY_MS`, unless the answer shows the person is signed out: then nothing
+ * more is tried until the page is shown again or the body is swapped.
  *
  * `deps` (for tests): `EventSource`, `now`, `setInterval`, `clearInterval`,
- * `setTimeout`, `clearTimeout`. Returns `{ sync, close, tick, apply, isOpen }`:
+ * `setTimeout`, `clearTimeout`, `fetch` (the probe after a refusal). Returns `{ sync, close, tick, apply, isOpen }`:
  * `sync()` opens or closes the stream as the page's state asks (call it when
  * anything that matters changed), `tick()` is the timer's work.
  */
@@ -517,7 +529,12 @@ export function initLive(doc, deps = {}) {
   const stopEvery = deps.clearInterval ?? ((id) => globalThis.clearInterval(id));
   const later = deps.setTimeout ?? ((fn, ms) => globalThis.setTimeout(fn, ms));
   const stopLater = deps.clearTimeout ?? ((id) => globalThis.clearTimeout(id));
+  const request = deps.fetch ?? ((...args) => (win?.fetch ?? globalThis.fetch)(...args));
   let source = null;
+  // Set after a refusal because the person is signed out: no more tries until
+  // the page is shown again or the body is swapped.
+  let signedOut = false;
+  let probing = false;
   let timer = null;
   let retry = null;
   // Server clock minus this one, in ms; null until a page or an event says.
@@ -567,6 +584,43 @@ export function initLive(doc, deps = {}) {
     ages();
   }
 
+  /**
+   * Whether the server turns this session away (an `EventSource` does not say
+   * why it failed): asks once for the stream and looks at the answer's head.
+   */
+  async function turnedAway() {
+    try {
+      const controller = typeof AbortController === "function" ? new AbortController() : null;
+      const res = await request(LIVE_URL, {
+        credentials: "same-origin",
+        redirect: "manual",
+        headers: { Accept: "text/event-stream" },
+        signal: controller?.signal,
+      });
+      controller?.abort();
+      return res.type === "opaqueredirect" || [0, 301, 302, 303, 307, 308, 401, 403].includes(res.status);
+    } catch {
+      return false;
+    }
+  }
+
+  async function refused() {
+    probing = true;
+    const out = await turnedAway();
+    probing = false;
+    if (source !== null || !wanted()) return;
+    if (out) {
+      signedOut = true;
+      return;
+    }
+    if (retry === null) {
+      retry = later(() => {
+        retry = null;
+        sync();
+      }, RETRY_MS);
+    }
+  }
+
   function open() {
     const mine = new EventSourceCtor(LIVE_URL);
     source = mine;
@@ -586,19 +640,14 @@ export function initLive(doc, deps = {}) {
       // something other than a stream (a refusal, a sign-out): that is final.
       if (mine.readyState === 2) {
         source = null;
-        if (retry === null) {
-          retry = later(() => {
-            retry = null;
-            sync();
-          }, RETRY_MS);
-        }
+        refused();
       }
     });
   }
 
   function sync() {
     if (!wanted()) return close();
-    if (!source && retry === null) open();
+    if (!source && retry === null && !probing && !signedOut) open();
     if (timer === null) {
       timer = every(tick, TICK_MS);
       // The page may have been hidden for a while: the ages are old.
@@ -611,7 +660,9 @@ export function initLive(doc, deps = {}) {
     const { values, removed } = mergeValues(readJson(doc, "mm-values"), update);
     writeBlock(doc, "mm-values", values);
     const listed = readJson(doc, "mm-services");
-    if (Array.isArray(listed)) writeBlock(doc, "mm-services", mergeServices(listed, values, removed));
+    if (Array.isArray(listed)) {
+      writeBlock(doc, "mm-services", mergeServices(listed, values, removed, update.services_add));
+    }
     learnClock(values);
     // Edit mode owns the page; the blocks are current for when it ends.
     if (editing()) return;
@@ -627,9 +678,17 @@ export function initLive(doc, deps = {}) {
     if (!updateValues(root, layout, options)) draw(doc);
   }
 
-  doc.addEventListener("visibilitychange", sync);
-  // A boosted visit swaps the body: nothing may stay open for the old page.
-  doc.addEventListener("htmx:beforeSwap", close);
+  doc.addEventListener("visibilitychange", () => {
+    signedOut = false;
+    sync();
+  });
+  // A boosted visit swaps the body: nothing may stay open for the old page. A
+  // response htmx does not swap (an error answer, say) leaves the page as it is.
+  doc.addEventListener("htmx:beforeSwap", (event) => {
+    if (event?.detail?.shouldSwap !== true) return;
+    signedOut = false;
+    close();
+  });
 
   return { sync, close, tick, apply, isOpen: () => source !== null };
 }

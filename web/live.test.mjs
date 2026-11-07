@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { parseHTML } from "linkedom";
 
 import { startEditing } from "../static/magpie/edit.js";
-import { LIVE_URL, RETRY_MS, TICK_MS, draw, initLive, mergeValues, wirePage } from "../static/magpie/start.js";
+import { LIVE_URL, RETRY_MS, TICK_MS, draw, initLive, mergeServices, mergeValues, wirePage } from "../static/magpie/start.js";
 
 function readStartStrings(path) {
   const strings = {};
@@ -136,10 +136,15 @@ function page({ layout = layoutFixture(), values = valuesFixture(), services = S
   );
   const state = { visibility: visible ? "visible" : "hidden" };
   Object.defineProperty(document, "visibilityState", { get: () => state.visibility, configurable: true });
-  const focus = { count: 0 };
+  const focus = { count: 0, active: null };
   window.Element.prototype.focus = function () {
     focus.count++;
+    focus.active = this;
   };
+  // linkedom does not track focus: a getter that follows the stubbed focus().
+  Object.defineProperty(document, "activeElement", { get: () => focus.active ?? document.body, configurable: true });
+  // What the probe after a refused stream gets back.
+  const answer = { type: "basic", status: 503 };
   const ES = fakeEventSource();
   const timers = fakeTimers();
   const clock = { ms: NOW * 1000 };
@@ -150,19 +155,23 @@ function page({ layout = layoutFixture(), values = valuesFixture(), services = S
     clearInterval: timers.clearInterval,
     setTimeout: timers.setTimeout,
     clearTimeout: timers.clearTimeout,
+    fetch: async () => ({ ...answer }),
   };
   const root = document.getElementById("groups");
   const setVisibility = (v) => {
     state.visibility = v;
     document.dispatchEvent(new window.Event("visibilitychange", { bubbles: true }));
   };
-  return { document, window, root, ES, timers, clock, deps, focus, setVisibility };
+  return { document, window, root, ES, timers, clock, deps, focus, setVisibility, answer };
 }
 
 const block = (p, id) => JSON.parse(p.document.getElementById(id).textContent);
 const cardEl = (p) => p.root.querySelector('.mm-card[data-service="1"]');
 const valueTexts = (p) => [...cardEl(p).querySelectorAll(".mm-metric-value")].map((el) => el.textContent);
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+/** htmx's event before a swap, with shouldSwap as htmx sets it. */
+const beforeSwap = (p, shouldSwap = true) =>
+  p.document.dispatchEvent(new p.window.CustomEvent("htmx:beforeSwap", { bubbles: true, detail: { shouldSwap } }));
 
 // ---- opening and closing ----------------------------------------------------
 
@@ -227,7 +236,7 @@ test("the_stream_is_closed_when_the_body_is_swapped_and_when_the_root_is_gone", 
   assert.equal(p.ES.all[0].closed, false);
 
   // htmx is about to swap the body (a boosted visit).
-  p.document.dispatchEvent(new p.window.Event("htmx:beforeSwap", { bubbles: true }));
+  beforeSwap(p);
   assert.equal(p.ES.all[0].closed, true);
   assert.equal(p.timers.intervals.size, 0);
 
@@ -242,7 +251,7 @@ test("the_stream_is_closed_when_the_body_is_swapped_and_when_the_root_is_gone", 
   assert.equal(p.timers.intervals.size, 0);
 });
 
-test("a_refused_stream_is_asked_again_later_and_a_reconnecting_one_is_left_alone", () => {
+test("a_refused_stream_is_asked_again_later_and_a_reconnecting_one_is_left_alone", async () => {
   const p = page();
   draw(p.document);
   const live = initLive(p.document, p.deps);
@@ -258,6 +267,7 @@ test("a_refused_stream_is_asked_again_later_and_a_reconnecting_one_is_left_alone
   // A refusal is final for an EventSource (readyState 2).
   first.readyState = 2;
   first.emit("error", "");
+  await tick();
   assert.equal(live.isOpen(), false);
   assert.equal(p.ES.all.length, 1, "not at once");
   assert.equal([...p.timers.timeouts.values()][0].ms, RETRY_MS);
@@ -276,6 +286,75 @@ test("events_from_a_stream_that_was_closed_are_ignored", () => {
   assert.deepEqual(block(p, "mm-values").services[1].values.latency_ms.num, 84);
 });
 
+test("after_a_401_the_stream_is_not_asked_for_again_until_the_page_is_shown_again", async () => {
+  for (const answer of [
+    { type: "basic", status: 401 },
+    { type: "opaqueredirect", status: 0 },
+  ]) {
+    const p = page();
+    draw(p.document);
+    const live = initLive(p.document, p.deps);
+    live.sync();
+    Object.assign(p.answer, answer);
+    p.ES.all[0].readyState = 2;
+    p.ES.all[0].emit("error", "");
+    await tick();
+    assert.equal(p.timers.timeouts.size, 0, "no retry is planned");
+    live.sync();
+    live.tick();
+    assert.equal(p.ES.all.length, 1, "nothing is opened by a sync either");
+
+    // The next visibility change tries again.
+    p.setVisibility("hidden");
+    p.setVisibility("visible");
+    assert.equal(p.ES.all.length, 2);
+  }
+});
+
+test("after_a_401_a_swapped_body_tries_again", async () => {
+  const p = page();
+  draw(p.document);
+  const live = initLive(p.document, p.deps);
+  live.sync();
+  Object.assign(p.answer, { type: "basic", status: 401 });
+  p.ES.all[0].readyState = 2;
+  p.ES.all[0].emit("error", "");
+  await tick();
+  beforeSwap(p);
+  live.sync();
+  assert.equal(p.ES.all.length, 2);
+});
+
+test("a_network_failure_of_the_probe_is_retried_like_a_refusal", async () => {
+  const p = page();
+  draw(p.document);
+  const live = initLive(p.document, {
+    ...p.deps,
+    fetch: async () => {
+      throw new Error("offline");
+    },
+  });
+  live.sync();
+  p.ES.all[0].readyState = 2;
+  p.ES.all[0].emit("error", "");
+  await tick();
+  assert.equal([...p.timers.timeouts.values()][0].ms, RETRY_MS);
+});
+
+test("a_swap_htmx_does_not_make_leaves_the_stream_and_the_timer_alone", () => {
+  const p = page();
+  draw(p.document);
+  const live = initLive(p.document, p.deps);
+  live.sync();
+  beforeSwap(p, false);
+  assert.equal(p.ES.all[0].closed, false);
+  assert.equal(p.timers.intervals.size, 1);
+  p.document.dispatchEvent(new p.window.Event("htmx:beforeSwap", { bubbles: true }));
+  assert.equal(p.ES.all[0].closed, false, "an event without detail is not a swap either");
+  beforeSwap(p, true);
+  assert.equal(p.ES.all[0].closed, true);
+});
+
 // ---- updates ----------------------------------------------------------------
 
 test("an_event_is_merged_and_the_cards_change_in_place_without_moving_focus", () => {
@@ -285,6 +364,9 @@ test("an_event_is_merged_and_the_cards_change_in_place_without_moving_focus", ()
   live.sync();
   const link = cardEl(p);
   assert.deepEqual(valueTexts(p), ["200", "84"]);
+  // The person is standing on the card's link.
+  link.focus();
+  assert.ok(p.document.activeElement === link);
   const focusBefore = p.focus.count;
 
   p.ES.all[0].emit("values", { now: NOW + 5, full: false, services: { 1: entry(450, { status: "warn", fetchedAt: NOW + 2 }) }, removed: [] });
@@ -295,6 +377,8 @@ test("an_event_is_merged_and_the_cards_change_in_place_without_moving_focus", ()
   assert.ok(link.isConnected && link.querySelector(".mm-card-title, .mm-card-text, span") !== null);
   assert.equal(p.root.querySelector(".mm-status").getAttribute("data-status"), "warn");
   assert.equal(p.focus.count, focusBefore, "focus() was never called");
+  assert.ok(p.document.activeElement === link, "focus is still on the link");
+  assert.ok(link.isConnected, "and the link is still in the page");
   assert.equal(block(p, "mm-values").now, NOW + 5);
   assert.equal(block(p, "mm-values").services[1].values.latency_ms.num, 450);
   // The plain card was not touched.
@@ -325,6 +409,64 @@ test("a_removed_service_is_dropped_from_the_values_and_the_services_and_its_card
   assert.deepEqual(block(p, "mm-services"), []);
   assert.ok(p.root.querySelector(".mm-svc-notice")?.textContent.includes(LABELS.service_missing));
   assert.equal(p.root.querySelector(".mm-metric"), null);
+});
+
+const VIEW = { ...SERVICES[0] };
+
+test("a_service_that_comes_back_is_drawn_with_numbers_not_the_missing_notice", () => {
+  const p = page();
+  draw(p.document);
+  const live = initLive(p.document, p.deps);
+  live.sync();
+  p.ES.all[0].emit("values", { now: NOW + 5, full: false, services: {}, removed: [1], services_add: [] });
+  assert.ok(p.root.querySelector(".mm-svc-notice")?.textContent.includes(LABELS.service_missing));
+  assert.deepEqual(block(p, "mm-services"), []);
+
+  // It is visible again: the event carries its view and its entry.
+  p.ES.all[0].emit("values", { now: NOW + 9, full: false, services: { 1: entry(31) }, removed: [], services_add: [VIEW] });
+  assert.deepEqual(
+    block(p, "mm-services").map((s) => s.id),
+    [1],
+  );
+  assert.deepEqual(valueTexts(p), ["200", "31"]);
+  assert.equal(p.root.querySelector(".mm-svc-notice"), null, "no notice");
+});
+
+test("a_service_that_was_hidden_at_load_arrives_with_its_view", () => {
+  // The page was made without the service: no entry, no view.
+  const p = page({ values: { now: NOW, services: {} }, services: [] });
+  draw(p.document);
+  const live = initLive(p.document, p.deps);
+  live.sync();
+  assert.ok(p.root.querySelector(".mm-svc-notice")?.textContent.includes(LABELS.service_missing));
+  p.ES.all[0].emit("values", { now: NOW + 3, full: false, services: { 1: entry(12) }, removed: [], services_add: [VIEW] });
+  assert.deepEqual(valueTexts(p), ["200", "12"]);
+  // The edit form's list sees it too.
+  assert.deepEqual(
+    block(p, "mm-services").map((s) => s.name),
+    ["Blog"],
+  );
+});
+
+test("mergeServices_adds_replaces_removes_and_keeps_the_order_by_name", () => {
+  const list = [
+    { id: 1, name: "Blog" },
+    { id: 3, name: "Zed" },
+  ];
+  const values = { services: {} };
+  const merged = mergeServices(list, values, [3], [{ id: 2, name: "alpha" }, { id: 1, name: "Blog 2" }, null, {}]);
+  assert.deepEqual(
+    merged.map((s) => [s.id, s.name]),
+    [
+      [2, "alpha"],
+      [1, "Blog 2"],
+    ],
+  );
+  assert.equal(list.length, 2, "the list is not changed");
+  assert.deepEqual(
+    mergeServices(list, values, [], undefined).map((s) => s.id),
+    [1, 3],
+  );
 });
 
 test("a_full_event_replaces_what_the_page_had", () => {
@@ -508,13 +650,13 @@ test("wirePage_closes_the_stream_on_beforeSwap_and_opens_it_after_the_settle_whe
     live: p.deps,
   });
   wired.start();
-  p.document.dispatchEvent(new p.window.Event("htmx:beforeSwap", { bubbles: true }));
+  beforeSwap(p);
   assert.equal(p.ES.all[0].closed, true);
   p.document.dispatchEvent(new p.window.Event("htmx:afterSettle", { bubbles: true }));
   assert.equal(p.ES.all.length, 2);
 
   // Boosted navigation to another page: the stream stays closed.
-  p.document.dispatchEvent(new p.window.Event("htmx:beforeSwap", { bubbles: true }));
+  beforeSwap(p);
   p.document.body.innerHTML = "<main><h1>Settings</h1></main>";
   p.document.dispatchEvent(new p.window.Event("htmx:afterSettle", { bubbles: true }));
   assert.equal(p.ES.all.length, 2);
