@@ -240,3 +240,6 @@ too_large = "Svaret er for stort"
 invalid = "Uventet svar"
 other = "Forespørselen feilet"
 secret = "Nøkkelen kan ikke leses – skriv den inn på nytt"
+
+[need]
+http_down = "{name} svarer ikke"

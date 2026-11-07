@@ -19,6 +19,7 @@
 //! [`FetchError`]'s texts are a closed set plus an HTTP status.
 
 pub mod http_kind;
+pub mod poller;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -166,8 +167,9 @@ impl fmt::Debug for FetchCtx {
     }
 }
 
-/// The latest reading of a service.
-#[derive(Debug, Clone, PartialEq)]
+/// The latest reading of a service. Serialised into `service_snapshots` (the
+/// time as RFC 3339).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub status: Status,
     pub values: BTreeMap<String, Value>,

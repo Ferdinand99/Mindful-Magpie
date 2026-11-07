@@ -240,3 +240,6 @@ too_large = "Response too large"
 invalid = "Unexpected answer"
 other = "The request failed"
 secret = "The secret can no longer be read - type it again"
+
+[need]
+http_down = "{name} is not answering"
