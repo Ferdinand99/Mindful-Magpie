@@ -145,12 +145,16 @@ export function checkGroup({ title }) {
   return collect({ title: checkText(title, LIMITS.groupTitle, true) });
 }
 
-/** `values`: `title`, `description`, `url`, `emoji` ("" for none), `colour`, and `service` (`{ id, metrics }` or null). */
+/**
+ * `values`: `title`, `description`, `url`, `emoji` ("" for none), `colour`, and `service` (`{ id, metrics }` or null).
+ * The link may be empty when there is a service, and only then.
+ */
 export function checkCard(values) {
   return collect({
     title: checkText(values.title, LIMITS.title, true),
     description: checkText(values.description, LIMITS.description, false),
-    url: urlProblem(values.url),
+    // A card with a service may have no link of its own: it opens the service's.
+    url: values.service && values.url === "" ? null : urlProblem(values.url),
     emoji: emojiProblem(values.emoji),
     colour: PALETTE.includes(values.colour) ? null : "bad_colour",
     service: serviceProblem(values.service),

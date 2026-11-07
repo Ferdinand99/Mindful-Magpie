@@ -871,3 +871,70 @@ test("a_bound_card_is_a_grid_so_the_text_keeps_the_tile_row", () => {
   assert.doesNotMatch(card, /flex-wrap/);
   assert.match(cssBlock(css, ".mm-svc"), /grid-column: 1 \/ -1/);
 });
+
+// ---- the link of a card with a service -------------------------------------------
+
+const withLink = (link) => [{ ...SERVICES[0], link }];
+const linkCard = (url, extra = {}) => bound(["count"], { url, ...extra });
+
+function drawLinked(card, services, lang = EN) {
+  const p = page();
+  render(p.root, layoutWith(card), { ...lang, services, values: valuesDoc() });
+  return p.root.querySelector(".mm-card");
+}
+
+test("a_bound_card_without_a_link_opens_the_link_of_its_service", () => {
+  const el = drawLinked(linkCard(""), withLink("https://nas.example:8443"));
+  assert.equal(el.tagName, "A");
+  assert.equal(el.getAttribute("href"), "https://nas.example:8443/");
+  assert.equal(el.querySelector(".mm-invalid"), null);
+  // The same card in Norwegian.
+  const nb = drawLinked(linkCard(""), withLink("https://nas.example:8443"), NB);
+  assert.equal(nb.getAttribute("href"), "https://nas.example:8443/");
+});
+
+test("the_cards_own_link_always_wins_over_the_service_link", () => {
+  const el = drawLinked(linkCard("https://own.example/page"), withLink("https://nas.example/"));
+  assert.equal(el.getAttribute("href"), "https://own.example/page");
+  // Also when the own link is bad: the card is invalid, it does not borrow the service's.
+  const bad = drawLinked(linkCard("javascript:alert(1)"), withLink("https://nas.example/"));
+  assert.equal(bad.tagName, "DIV");
+  assert.equal(bad.hasAttribute("href"), false);
+  assert.ok(bad.querySelector(".mm-invalid"));
+});
+
+test("a_bound_card_whose_service_is_gone_has_no_link_and_says_so", () => {
+  const el = drawLinked(linkCard(""), [{ id: 99, name: "Other", kind: "http", interval_s: 60, link: "https://x.example/", metrics: [] }]);
+  assert.equal(el.tagName, "DIV");
+  assert.equal(el.hasAttribute("href"), false);
+  assert.equal(el.querySelector(".mm-svc-notice").textContent, LABELS_EN.service_missing);
+  // Not marked as an invalid link: there is just no link.
+  assert.equal(el.querySelector(".mm-invalid"), null);
+  assert.equal(el.classList.contains("mm-card-invalid"), false);
+  // With its own link a gone service still leaves the link.
+  const own = drawLinked(linkCard("https://own.example/"), []);
+  assert.equal(own.getAttribute("href"), "https://own.example/");
+  assert.equal(own.querySelector(".mm-svc-notice").textContent, LABELS_EN.service_missing);
+});
+
+test("a_service_with_no_usable_link_gives_a_card_without_one", () => {
+  for (const link of ["", undefined, null, "javascript:alert(1)", "ftp://x/", 5]) {
+    const el = drawLinked(linkCard(""), withLink(link));
+    assert.equal(el.tagName, "DIV", String(link));
+    assert.equal(el.hasAttribute("href"), false, String(link));
+    assert.equal(el.querySelector(".mm-invalid"), null, String(link));
+  }
+});
+
+test("a_changed_service_link_redraws_the_card_in_place", () => {
+  const p = page();
+  const layout = layoutWith(linkCard(""));
+  const opts = { ...EN, services: withLink("https://nas.example/"), values: valuesDoc() };
+  render(p.root, layout, opts);
+  assert.equal(p.root.querySelector(".mm-card").getAttribute("href"), "https://nas.example/");
+  const done = updateValues(p.root, layout, { ...opts, services: withLink("https://other.example/") });
+  assert.equal(done, true);
+  assert.equal(p.root.querySelector(".mm-card").getAttribute("href"), "https://other.example/");
+  updateValues(p.root, layout, { ...opts, services: withLink("") });
+  assert.equal(p.root.querySelector(".mm-card").hasAttribute("href"), false);
+});

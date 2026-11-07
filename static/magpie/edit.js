@@ -809,8 +809,10 @@ export function startEditing(root, getLayout, save, opts = {}) {
    * service is no longer in the list (removed, or hidden from this person) gets
    * an extra choice, «Tjenesten finnes ikke lenger», selected: saving as it is
    * keeps the card's binding, and the person may pick another service or None.
+   * `onChoose(service)` is called when the person picks a service (not None, not
+   * the gone one), so the form can offer its name as the title.
    */
-  function serviceField(card) {
+  function serviceField(card, onChoose = () => {}) {
     const bound = card?.service ?? null;
     const gone = bound !== null && !services.some((s) => s.id === bound.id);
     const selectId = uid("mm-f-service");
@@ -885,6 +887,10 @@ export function startEditing(root, getLayout, save, opts = {}) {
     select.addEventListener("change", () => {
       const option = chosen();
       fill(option && bound && String(bound.id) === option.value ? bound.metrics : undefined);
+      if (option && option.value !== "" && !option.hasAttribute("data-gone")) {
+        const picked = services.find((s) => String(s.id) === option.value);
+        if (picked) onChoose(picked);
+      }
     });
 
     wrap.appendChild(labelEl);
@@ -913,16 +919,29 @@ export function startEditing(root, getLayout, save, opts = {}) {
 
   function cardForm({ groupId, card }, trigger, errors) {
     const adding = !card;
+    // «Tjeneste» comes first: choosing one fills in the title when there is none.
+    // A title the person typed is never replaced; one this filled in is, when
+    // another service is chosen.
+    const titleField = field("title", L("field_title"), card?.title ?? "", { kind: "card" });
+    let filledIn = "";
+    const offerTitle = (service) => {
+      const input = titleField.querySelector('input[name="title"]');
+      if (!input) return;
+      if (input.value.trim() === "" || input.value === filledIn) {
+        input.value = service.name;
+        filledIn = service.name;
+      }
+    };
     formSheet({
       title: adding ? L("card_form_add") : L("card_form_edit"),
       kind: "card",
       fields: [
-        field("title", L("field_title"), card?.title ?? "", { kind: "card" }),
+        serviceField(card, offerTitle),
+        titleField,
         field("url", L("field_url"), card?.url ?? "", { help: L("help_url"), inputmode: "url", kind: "url" }),
         field("description", L("field_description"), card?.description ?? "", { optional: true, kind: "card" }),
         field("emoji", L("field_emoji"), card?.icon?.emoji ?? "", { help: L("help_emoji"), optional: true, kind: "card" }),
         colourField(card?.icon?.colour ?? DEFAULT_COLOUR),
-        serviceField(card),
       ],
       read: (form) => ({
         title: valueOf(form, "title").trim(),

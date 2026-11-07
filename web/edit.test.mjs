@@ -2086,10 +2086,10 @@ test("the_card_form_offers_a_labelled_service_select_with_none_first_in_the_tab_
   // Nothing is chosen on a card without a service, and no boxes are shown.
   assert.ok(metricsPicker(dialog).hasAttribute("hidden"));
   assert.equal(boxes(dialog).length, 0);
-  // Reachable by Tab in the order of the form: after the colours, before the buttons.
+  // Reachable by Tab in the order of the form: first, above the title, and before the buttons.
   const order = [...dialog.querySelectorAll("input, select, button, textarea, a[href]")];
-  assert.ok(order.indexOf(dialog.querySelector('[name="title"]')) < order.indexOf(select));
-  assert.ok(order.indexOf(dialog.querySelector('input[name="colour"]')) < order.indexOf(select));
+  assert.ok(order.indexOf(select) < order.indexOf(dialog.querySelector('[name="title"]')));
+  assert.ok(order.indexOf(select) < order.indexOf(dialog.querySelector('input[name="colour"]')));
   assert.ok(order.indexOf(select) < order.indexOf(dialog.querySelector('button[type="submit"]')));
   assert.equal(dialog.querySelector("[tabindex]"), null, "no tabindex: the natural order stands");
   assert.equal(select.hasAttribute("disabled"), false);
@@ -2400,4 +2400,80 @@ test("a_number_the_service_no_longer_has_is_named_in_the_form_and_dropped_on_sav
   t2.start();
   click(act(item(t2.root, "card", "c1"), "edit"));
   assert.equal(metricsPicker(sheet(t2.document)).querySelector('[role="status"]').hasAttribute("hidden"), true);
+});
+
+// ---- the link of a card with a service -----------------------------------------
+
+test("the_service_comes_first_in_the_card_form_above_the_title", () => {
+  const t = setup({ services: SERVICES });
+  t.start();
+  click(act(item(t.root, "card", "c1"), "edit"));
+  const dialog = sheet(t.document);
+  const fields = [...dialog.querySelectorAll("[data-field]")].map((f) => f.getAttribute("data-field"));
+  assert.deepEqual(fields.slice(0, 3), ["service", "title", "url"]);
+  // Also first in the document order, so first by Tab.
+  const order = [...dialog.querySelectorAll("input, select")].map((el) => el.getAttribute("name"));
+  assert.ok(order.indexOf("service") < order.indexOf("title"), order.join());
+  // The link says it is optional with a service.
+  const help = dialog.querySelector('[data-field="url"] .help').textContent;
+  assert.match(help, /^Optional when you choose a service/);
+  assert.match(NB.help_url, /^Valgfri når du velger en tjeneste/);
+});
+
+test("choosing_a_service_fills_an_empty_title_and_never_replaces_a_typed_one", () => {
+  const t = setup({ services: SERVICES });
+  t.start();
+  click(act(item(t.root, "card", "c1"), "edit"));
+  const dialog = sheet(t.document);
+  const title = dialog.querySelector('input[name="title"]');
+
+  // Empty: the service's name is offered, and a second choice replaces what it filled in.
+  title.value = "";
+  chooseService(dialog, "1");
+  assert.equal(title.value, "Blog");
+  chooseService(dialog, "2");
+  assert.equal(title.value, "Big one");
+  // None leaves the title alone.
+  chooseService(dialog, "");
+  assert.equal(title.value, "Big one");
+
+  // A title the person typed is never touched.
+  title.value = "My own name";
+  chooseService(dialog, "1");
+  assert.equal(title.value, "My own name");
+  // Not even after editing what was filled in.
+  title.value = "";
+  chooseService(dialog, "2");
+  assert.equal(title.value, "Big one");
+  title.value = "Big one, edited";
+  chooseService(dialog, "1");
+  assert.equal(title.value, "Big one, edited");
+});
+
+test("a_card_with_a_service_saves_without_a_link_and_a_plain_card_does_not", async () => {
+  const t = setup({ services: SERVICES });
+  const ed = t.start();
+  click(act(item(t.root, "card", "c1"), "edit"));
+  let dialog = sheet(t.document);
+  dialog.querySelector('input[name="url"]').value = "";
+  // Without a service the empty link is refused, at the field.
+  submit(dialog);
+  await tick();
+  assert.equal(dialog.querySelector('input[name="url"]').getAttribute("aria-invalid"), "true");
+  assert.equal(ed.isDirty(), false);
+
+  // With one it is saved empty.
+  chooseService(dialog, "1");
+  submit(dialog);
+  await tick();
+  assert.equal(ed.draft().groups[0].cards[0].url, "");
+  assert.equal(ed.draft().groups[0].cards[0].service.id, 1);
+
+  // A link that is typed is still checked.
+  click(act(item(t.root, "card", "c1"), "edit"));
+  dialog = sheet(t.document);
+  dialog.querySelector('input[name="url"]').value = "ftp://x/";
+  submit(dialog);
+  await tick();
+  assert.equal(dialog.querySelector('input[name="url"]').getAttribute("aria-invalid"), "true");
 });

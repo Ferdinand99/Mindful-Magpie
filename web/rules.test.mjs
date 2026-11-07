@@ -131,3 +131,13 @@ test("service_bindings_are_refused_by_the_same_codes_as_the_server", () => {
   assert.equal(LIMITS.serviceMetrics, 4);
   assert.equal(serviceProblem(null), null);
 });
+
+test("a_card_link_may_be_empty_only_when_the_card_has_a_service", () => {
+  const base = { title: "T", description: "", emoji: "", colour: "teal" };
+  const service = { id: 1, metrics: ["status"] };
+  assert.deepEqual(checkCard({ ...base, url: "", service }), {});
+  assert.deepEqual(checkCard({ ...base, url: "", service: null }), { url: "required" });
+  assert.deepEqual(checkCard({ ...base, url: " ", service }), { url: "required" });
+  assert.deepEqual(checkCard({ ...base, url: "ftp://x/", service }), { url: "bad_scheme" });
+  assert.deepEqual(checkCard({ ...base, url: "https://ok.example/", service }), {});
+});

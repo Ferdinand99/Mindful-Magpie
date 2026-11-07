@@ -380,6 +380,25 @@ function serviceRef(card) {
   return ref;
 }
 
+/** Whether the card has a link of its own typed (an empty one is none). */
+function hasOwnUrl(card) {
+  return typeof card?.url === "string" && card.url !== "";
+}
+
+/**
+ * Where a card opens: its own link when it has one (always wins, even a bad
+ * one: the card is then drawn as invalid), else, for a card with a service, the
+ * service's `link` from `services`. Null when there is nothing to open: a
+ * service that is gone, or has no link.
+ */
+function cardHref(card, services) {
+  if (hasOwnUrl(card)) return safeHref(card.url);
+  const ref = Array.isArray(services) ? serviceRef(card) : null;
+  if (!ref) return null;
+  const service = services.find((s) => isObject(s) && s.id === ref.id);
+  return service ? safeHref(service.link) : null;
+}
+
 /** True when the value is older than three intervals (`fetchedMs`, `nowMs` in ms, `intervalS` in s). */
 function isStale(fetchedMs, nowMs, intervalS) {
   return Number.isFinite(intervalS) && intervalS > 0 && nowMs - fetchedMs > STALE_FACTOR * intervalS * 1000;
@@ -514,11 +533,14 @@ export function tickAges(root, opts = {}) {
 }
 
 function drawCard(doc, card, opts) {
-  const href = safeHref(card?.url);
+  const href = cardHref(card, opts.services);
   const ref = Array.isArray(opts.services) ? serviceRef(card) : null;
+  // A card with a service and no link of its own, whose service has none to
+  // lend (it is gone, or has no address), is not invalid: it is just not a link.
+  const unlinked = !href && ref !== null && !hasOwnUrl(card);
   const el = href
     ? make(doc, "a", "mm-card glass")
-    : make(doc, "div", "mm-card mm-card-invalid glass");
+    : make(doc, "div", unlinked ? "mm-card mm-card-nolink glass" : "mm-card mm-card-invalid glass");
   if (href) {
     el.setAttribute("href", href);
     el.setAttribute("rel", "noreferrer");
@@ -530,7 +552,7 @@ function drawCard(doc, card, opts) {
   if (description !== "") {
     body.appendChild(isolated(doc, "span", "mm-card-desc", description));
   }
-  if (!href) body.appendChild(invalidMarker(doc, opts.labels));
+  if (!href && !unlinked) body.appendChild(invalidMarker(doc, opts.labels));
   el.appendChild(body);
   if (ref) {
     el.setAttribute("class", `${el.getAttribute("class")} mm-bound`);
@@ -584,7 +606,9 @@ export function updateValues(root, layout, opts = {}) {
       handled.add(el);
       if (
         el.getAttribute("data-service") !== String(ref.id) ||
-        el.getAttribute("data-metrics") !== JSON.stringify(ref.metrics)
+        el.getAttribute("data-metrics") !== JSON.stringify(ref.metrics) ||
+        // The service's link changed (or came or went) under a card with no link of its own.
+        (el.getAttribute("href") ?? null) !== (cardHref(card, settings.services) ?? null)
       ) {
         el.parentNode.replaceChild(drawCard(doc, card, settings), el);
         continue;
@@ -624,14 +648,14 @@ function needList(values) {
   return values.needs.filter(isNeed);
 }
 
-/** The address of the first card of the layout that is bound to the service and has an http(s) link. */
-function needHref(layout, serviceId) {
+/** The address of the first card of the layout that is bound to the service and opens an http(s) link. */
+function needHref(layout, serviceId, services) {
   for (const group of Array.isArray(layout?.groups) ? layout.groups : []) {
     for (const card of Array.isArray(group?.cards) ? group.cards : []) {
       if (!card || typeof card !== "object") continue;
       const ref = serviceRef(card);
       if (!ref || ref.id !== serviceId) continue;
-      const href = safeHref(card.url);
+      const href = cardHref(card, services);
       if (href) return href;
     }
   }
@@ -713,7 +737,7 @@ function needsSignature(items, hrefs, opts) {
 function drawNeeds(doc, items, layout, opts, open) {
   const nowMs = toMs(opts.values?.now) ?? Date.now();
   const hrefs = new Map();
-  for (const item of items) hrefs.set(item.service_id, needHref(layout, item.service_id));
+  for (const item of items) hrefs.set(item.service_id, needHref(layout, item.service_id, opts.services));
   const section = make(doc, "section", "mm-needs glass");
   const title = label(opts.labels, "needs");
   section.setAttribute("data-open", open ? "true" : "false");
@@ -975,9 +999,12 @@ function applyBackground(doc, background, opts) {
  * null or absent for a plain link card). Two more options draw them; without
  * `services` a bound card is drawn as a plain one:
  *
- *   - `opts.services`: `[{ id, name, kind, interval_s, metrics: [{ id, label,
- *     format }] }]`, the services the viewer can see. A bound id that is not in
- *     the list gets the notice `service_missing`; the card keeps its link.
+ *   - `opts.services`: `[{ id, name, kind, interval_s, link, metrics: [{ id,
+ *     label, format }] }]`, the services the viewer can see. A bound id that is
+ *     not in the list gets the notice `service_missing`; the card keeps its own
+ *     link, and a card that has none is drawn as a plain element, not a link.
+ *     A card with a service and an empty `url` opens the service's `link`; the
+ *     card's own `url` always wins.
  *   - `opts.values`: `{ now, services: { "<id>": { name, kind, interval_s,
  *     status, values: { "<metric>": { num, text } }, fetched_at,
  *     error_label? } } }`. `now` and `fetched_at` are ISO 8601 strings or epoch
