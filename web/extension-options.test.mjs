@@ -172,10 +172,18 @@ test("saveConnection clears the cache when the server changes, keeps it when it 
   await saveConnection(first.deps, { serverUrl: "http://new:1", token: TOKEN });
   assert.equal("last" in first.store, false);
 
-  const same = makeEnv({ stored: { serverUrl: "http://h:1", token: "old", last: GOOD } });
+  const same = makeEnv({ stored: { serverUrl: "http://h:1", token: TOKEN, last: GOOD } });
   await saveConnection(same.deps, { serverUrl: "http://h:1/", token: TOKEN });
   assert.deepEqual(same.store.last, GOOD);
   assert.equal(same.store.token, TOKEN);
+});
+
+test("saveConnection clears the cache when only the token changes", async () => {
+  const env = makeEnv({ stored: { serverUrl: "http://h:1", token: "old", last: GOOD } });
+  await saveConnection(env.deps, { serverUrl: "http://h:1/", token: TOKEN });
+  assert.equal("last" in env.store, false);
+  assert.equal(env.store.token, TOKEN);
+  assert.equal(env.store.serverUrl, "http://h:1");
 });
 
 test("saveConnection refuses non-http(s) urls and never touches storage", async () => {

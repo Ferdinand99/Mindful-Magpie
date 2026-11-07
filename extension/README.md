@@ -11,9 +11,19 @@ the shared renderer of the start page replaces it in a later task.
 
 1. In Firefox open `about:debugging#/runtime/this-firefox`.
 2. Choose "Load Temporary Add-on" and pick `manifest.json` in this folder (or a zip of this folder).
-3. The options page opens in a tab: enter the address of your Magpie and a read token (Magpie,
-   Settings, API tokens). "Test tilkobling" checks the connection; "Lagre" saves only when the
-   test succeeds.
+3. The options page opens in a tab: enter the address of your Magpie and press "Koble til Magpie".
+   Firefox opens the Magpie consent page; after "Godkjenn" the extension gets a read-scoped token
+   by itself (needs a Magpie server with the connect flow).
+4. Fallback under "Avansert": paste a read token (Magpie, Settings, API tokens). "Test tilkobling"
+   checks the connection; "Lagre" saves only when the test succeeds.
+
+## Connect flow
+
+`connect.js` implements the "Koble til Magpie" flow: PKCE (S256) verifier and challenge, a random
+`state`, the consent url `{server}/connect/extension?...`, the redirect check and the code
+exchange at `POST {server}/api/v1/extension/token`. The flow runs in
+`browser.identity.launchWebAuthFlow`, so the manifest asks for the `identity` permission. The code,
+verifier and token never appear in an error or a status text.
 
 ## Rules
 
@@ -30,7 +40,9 @@ the shared renderer of the start page replaces it in a later task.
 ## Layout
 
 - `state.js`: view logic, response handling and the fetch (pure, tested).
-- `options-core.js`: address check, permission request, connection test and save (tested).
+- `connect.js`: the connect flow's pure functions (tested).
+- `options-core.js`: address check, permission request, connection test, save and connect (tested).
+- `newtab-core.js`: the new-tab start-up sequence with injected dependencies (tested).
 - `placeholder.js`: placeholder drawing and status line (tested).
 - `newtab.*`, `options.*`, `shell.css`: the pages.
 - Tests: `web/extension-*.test.mjs`, run with `npm ci && node --test` in `web/`.

@@ -7,6 +7,16 @@
 // - Nothing is saved unless the endpoint answered with a valid layout document.
 // - The token is never part of a message, a URL or a log line.
 import { fetchData } from "./state.js";
+import {
+  challengeS256,
+  ConnectError,
+  connectUrl,
+  deviceName,
+  exchangeCode,
+  makeState,
+  makeVerifier,
+  parseRedirect,
+} from "./connect.js";
 
 export const messages = {
   "invalid-url": "Adressen må være en http:// eller https://-adresse til Magpie.",
@@ -16,6 +26,14 @@ export const messages = {
   network: "Fikk ikke kontakt med Magpie på den adressen.",
   tested: "Tilkoblingen virker.",
   saved: "Lagret. Tilkoblingen virker.",
+  connected: "Koblet til ✓",
+  cancelled: "Tilkoblingen ble avbrutt, eller Magpie svarte ikke.",
+  declined: "Du avslo tilgangen i Magpie.",
+  "state-mismatch": "Svaret fra Magpie hørte ikke til denne tilkoblingen. Prøv igjen.",
+  "no-code": "Magpie ga ikke noen tilgangskode. Prøv igjen.",
+  rejected: "Magpie avviste tilgangskoden. Den kan ha utløpt. Prøv igjen.",
+  server: "Magpie svarte med en feil. Prøv igjen senere.",
+  storage: "Kunne ikke lagre innstillingene.",
 };
 
 // Returns { ok: true, serverUrl, pattern } or { ok: false }. serverUrl is the address without
@@ -64,16 +82,81 @@ async function finishCheck(request, fetchImpl, parsed, token) {
   return fail(result.kind);
 }
 
-// Tests the connection and saves the settings only when the test succeeds. The cache belongs to
-// one server, so it is dropped when the server changes.
+// Saves server and token. The cache belongs to one server and one token, so it is dropped when
+// either changes.
+async function persist(storage, serverUrl, token) {
+  const previous = await storage.local.get(["serverUrl", "token"]);
+  if (previous.serverUrl !== serverUrl || previous.token !== token) {
+    await storage.local.remove("last");
+  }
+  await storage.local.set({ serverUrl, token });
+}
+
+// Tests the connection and saves the settings only when the test succeeds.
 export async function saveConnection(deps, input) {
   const checked = await checkConnection(deps, input);
   if (!checked.ok) return checked;
-  const { storage } = deps;
-  const { serverUrl: previous } = await storage.local.get("serverUrl");
-  if (previous !== checked.serverUrl) {
-    await storage.local.remove("last");
-  }
-  await storage.local.set({ serverUrl: checked.serverUrl, token: input.token.trim() });
+  await persist(deps.storage, checked.serverUrl, input.token.trim());
   return { ok: true, kind: "saved", message: messages.saved };
+}
+
+// The "Koble til Magpie" button. Like checkConnection it asks for the host permission before any
+// other await, inside the click. serverUrl comes from the address field (the options page fills
+// it with the saved address). The code, verifier and token never leave this function except as
+// the request body and the stored token.
+export function connectMagpie(deps, { serverUrl }) {
+  const parsed = parseServerUrl(serverUrl);
+  if (!parsed.ok) return Promise.resolve(fail("invalid-url"));
+  const request = deps.permissions.request({ origins: [parsed.pattern] });
+  return finishConnect(request, deps, parsed);
+}
+
+const redirectKinds = { state_mismatch: "state-mismatch", denied: "declined", no_code: "no-code" };
+
+async function finishConnect(request, { storage, fetchImpl, identity, runtime }, parsed) {
+  let granted = false;
+  try {
+    granted = await request;
+  } catch {
+    granted = false;
+  }
+  if (!granted) return fail("denied");
+
+  let platformInfo = null;
+  try {
+    platformInfo = await runtime.getPlatformInfo();
+  } catch {
+    platformInfo = null;
+  }
+  const verifier = makeVerifier();
+  const state = makeState();
+  const url = connectUrl(
+    parsed.serverUrl,
+    identity.getRedirectURL(),
+    state,
+    await challengeS256(verifier),
+    deviceName(platformInfo),
+  );
+
+  let redirected;
+  try {
+    redirected = await identity.launchWebAuthFlow({ url, interactive: true });
+  } catch {
+    return fail("cancelled");
+  }
+  let code;
+  try {
+    ({ code } = parseRedirect(redirected, state));
+  } catch (error) {
+    return fail(error instanceof ConnectError ? redirectKinds[error.code] : "no-code");
+  }
+
+  const exchanged = await exchangeCode(fetchImpl, parsed.serverUrl, code, verifier);
+  if (!exchanged.ok) return fail(exchanged.kind);
+  try {
+    await persist(storage, parsed.serverUrl, exchanged.token);
+  } catch {
+    return fail("storage");
+  }
+  return { ok: true, kind: "connected", message: messages.connected };
 }

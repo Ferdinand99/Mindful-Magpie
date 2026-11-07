@@ -16,13 +16,20 @@
       <label for="serverUrl">Adresse til Magpie
         <input id="serverUrl" type="url" placeholder="https://magpie.example.org" required>
       </label>
-      <label for="token">Lese-token (Innstillinger → API-tokens i Magpie)
-        <input id="token" type="password" autocomplete="off" spellcheck="false" required>
-      </label>
       <div class="actions">
-        <button id="test" type="button">Test tilkobling</button>
-        <button id="save" type="submit" class="primary">Lagre</button>
+        <button id="connect" type="button" class="primary">Koble til Magpie</button>
       </div>
+      <details class="advanced">
+        <summary>Avansert</summary>
+        <p class="hint">Lim inn et lese-token selv i stedet for å koble til. Adressen over brukes også her.</p>
+        <label for="token">Lese-token (Innstillinger → API-tokens i Magpie)
+          <input id="token" type="password" autocomplete="off" spellcheck="false">
+        </label>
+        <div class="actions">
+          <button id="test" type="button">Test tilkobling</button>
+          <button id="save" type="submit">Lagre</button>
+        </div>
+      </details>
       <p id="result" class="result" role="status"></p>
     </form>
   </main>
