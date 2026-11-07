@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Mindful Magpie",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Your Mindful Magpie start page as the new tab page.",
   "icons": {
     "48": "icons/icon-48.png",
@@ -16,8 +16,11 @@
   "browser_specific_settings": {
     "gecko": {
       "id": "mindful-magpie@hedgerow.tools",
-      "strict_min_version": "128.0",
+      "strict_min_version": "140.0",
       "data_collection_permissions": { "required": ["none"] }
+    },
+    "gecko_android": {
+      "strict_min_version": "142.0"
     }
   }
 }
