@@ -35,6 +35,10 @@ pub enum CtxError {
     /// be entered again.
     #[error("the stored secret can't be opened ({0})")]
     SecretUnreadable(OpenError),
+    /// The service's settings can't be used (a pin that is not a fingerprint,
+    /// or one on an address that is not https).
+    #[error("the service's settings can't be used")]
+    Config,
     #[error(transparent)]
     Db(#[from] DbError),
 }
@@ -203,7 +207,8 @@ fn encode(input: &ServiceInput) -> (String, Option<String>, String) {
         .map(str::trim)
         .filter(|u| !u.is_empty())
         .map(str::to_string);
-    let settings = serde_json::to_string(&input.settings).unwrap_or_else(|_| "{}".into());
+    let settings = serde_json::to_string(&super::canonical_settings(&input.settings))
+        .unwrap_or_else(|_| "{}".into());
     (input.name.trim().to_string(), url, settings)
 }
 
@@ -354,13 +359,15 @@ impl CtxError {
     pub fn fetch_error(&self) -> FetchError {
         match self {
             CtxError::SecretUnreadable(_) => FetchError::SecretUnreadable,
+            CtxError::Config => FetchError::Config,
             CtxError::Db(_) => FetchError::Other,
         }
     }
 }
 
-/// What a fetch of `service` needs: the shared client, its settings with the
-/// address added as `"url"`, and its secret, opened.
+/// What a fetch of `service` needs: its client (the shared one, or the one
+/// that accepts only its pinned certificate), its settings with the address
+/// added as `"url"`, and its secret, opened.
 pub async fn fetch_ctx(core: &Core, service: &Service) -> Result<FetchCtx, CtxError> {
     let secret = if service.has_secret {
         open_secret(core, service.id).await?
@@ -371,9 +378,11 @@ pub async fn fetch_ctx(core: &Core, service: &Service) -> Result<FetchCtx, CtxEr
     if let Some(url) = &service.url {
         settings.insert("url".into(), Json::String(url.clone()));
     }
+    let settings = Json::Object(settings);
+    let http = crate::integrations::client_for(&settings).map_err(|_| CtxError::Config)?;
     Ok(FetchCtx {
-        http: crate::integrations::client().clone(),
-        settings: Json::Object(settings),
+        http,
+        settings,
         secret,
     })
 }

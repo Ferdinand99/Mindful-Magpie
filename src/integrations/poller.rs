@@ -611,7 +611,11 @@ impl Job {
                 return (Snapshot::failed(&err.fetch_error()), true);
             }
         };
-        ctx.http = self.http.clone();
+        // The client the poller was started with, unless the service is pinned:
+        // then it keeps its own, which accepts only its certificate.
+        if !matches!(super::pin::from_settings(&ctx.settings), Ok(Some(_))) {
+            ctx.http = self.http.clone();
+        }
         let kind = self.kind;
         let fetch = tokio::spawn(async move { kind.fetch(&ctx).await });
         let _stop = AbortOnDrop(fetch.abort_handle());

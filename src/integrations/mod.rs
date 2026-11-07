@@ -14,6 +14,11 @@
 //! [`MAX_REDIRECTS`] redirects, each checked again. Bodies are read with
 //! [`read_capped`].
 //!
+//! A service with a self-signed certificate carries a pin (see [`pin`]) and is
+//! fetched with the client [`client_for`] gives for its settings: the same
+//! client, except that TLS accepts only the pinned certificate. There is no way
+//! to switch certificate checks off.
+//!
 //! **Secrets** live in [`FetchCtx::secret`] only. Its `Debug` hides it, and
 //! nothing here puts a secret, a settings value or a URL into an error text:
 //! [`FetchError`]'s texts are a closed set plus an HTTP status.
@@ -21,6 +26,7 @@
 pub mod api;
 pub mod http_kind;
 pub mod kk;
+pub mod pin;
 pub mod poller;
 pub mod vv;
 pub mod ww_kind;
@@ -292,6 +298,10 @@ pub enum FetchError {
     Timeout,
     #[error("connection failed")]
     Connect,
+    /// TLS did not accept the server's certificate: it is not the pinned one,
+    /// or (without a pin) it is not trusted.
+    #[error("certificate not accepted")]
+    Cert,
     #[error("too many redirects")]
     Redirects,
     #[error("redirect not allowed")]
@@ -324,6 +334,7 @@ impl FetchError {
             FetchError::Forbidden => "fetch_err.forbidden",
             FetchError::Timeout => "fetch_err.timeout",
             FetchError::Connect => "fetch_err.connect",
+            FetchError::Cert => "fetch_err.cert",
             FetchError::Redirects => "fetch_err.redirects",
             FetchError::RedirectScheme => "fetch_err.redirect_scheme",
             FetchError::TooLarge => "fetch_err.too_large",
@@ -345,6 +356,7 @@ pub fn error_text_key(text: &str) -> Option<&'static str> {
         FetchError::Forbidden,
         FetchError::Timeout,
         FetchError::Connect,
+        FetchError::Cert,
         FetchError::Redirects,
         FetchError::RedirectScheme,
         FetchError::TooLarge,
@@ -380,6 +392,9 @@ pub fn classify(err: &reqwest::Error) -> FetchError {
             Some(RedirectError::TooMany) => return FetchError::Redirects,
             Some(RedirectError::Scheme) => return FetchError::RedirectScheme,
             None => {}
+        }
+        if pin::is_certificate_error(e) {
+            return FetchError::Cert;
         }
         source = e.source();
     }
@@ -424,17 +439,27 @@ fn redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
-/// A client for integrations that gives up after `timeout` (in all). Tests
-/// use short ones; everything else uses [`client`].
-pub fn build_client(timeout: Duration) -> reqwest::Client {
-    vole_kit::tls_roots::http_client()
+/// What every integration client has in common: who it says it is, no proxy
+/// (it would connect for us and skip the guarded resolver), the guarded
+/// resolver, the redirect rules and the timeouts. [`build_client`] and the
+/// pinned clients (see [`pin`]) differ only in the TLS they start from.
+pub(crate) fn guarded(
+    builder: reqwest::ClientBuilder,
+    timeout: Duration,
+) -> reqwest::ClientBuilder {
+    builder
         .user_agent(crate::product::USER_AGENT)
-        // A proxy would connect for us and skip the guarded resolver.
         .no_proxy()
         .dns_resolver(Arc::new(GuardedResolver))
         .redirect(redirect_policy())
         .connect_timeout(timeout.min(Duration::from_secs(5)))
         .timeout(timeout)
+}
+
+/// A client for integrations that gives up after `timeout` (in all). Tests
+/// use short ones; everything else uses [`client`].
+pub fn build_client(timeout: Duration) -> reqwest::Client {
+    guarded(vole_kit::tls_roots::http_client(), timeout)
         .build()
         .expect("the HTTP client for integrations can be built")
 }
@@ -444,6 +469,26 @@ pub fn build_client(timeout: Duration) -> reqwest::Client {
 pub fn client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| build_client(TIMEOUT))
+}
+
+/// The client for a service with these settings (which carry its address as
+/// `"url"`): the shared one, or, when the settings hold a pin, the one that
+/// accepts only that certificate. A pin that is not a fingerprint, or one on
+/// an address that is not `https`, is [`FetchError::Config`]: it never falls
+/// back to the shared client.
+pub fn client_for(settings: &Json) -> Result<reqwest::Client, FetchError> {
+    let Some(fingerprint) = pin::from_settings(settings)? else {
+        return Ok(client().clone());
+    };
+    let https = settings
+        .get("url")
+        .and_then(Json::as_str)
+        .and_then(|url| url::Url::parse(url.trim()).ok())
+        .is_some_and(|url| url.scheme() == "https");
+    if !https {
+        return Err(FetchError::Config);
+    }
+    pin::pinned_client(&fingerprint)
 }
 
 /// The body of `response`, at most [`MAX_BODY`] bytes: past that it stops

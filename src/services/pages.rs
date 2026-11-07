@@ -33,12 +33,12 @@ use vole_kit::state::Core;
 
 use super::store::{self, StoreError};
 use super::{
-    FieldError, SecretChange, Service, ServiceEvent, ServiceInput, Visibility, same_origin,
-    without_userinfo,
+    CERT_FIELD, FieldError, SecretChange, Service, ServiceEvent, ServiceInput, Visibility,
+    same_origin, without_userinfo,
 };
 use crate::Magpie;
 use crate::integrations::{
-    self, FetchCtx, FetchError, FieldKind, Format, Integration, Snapshot, Status, Value, api,
+    self, FetchCtx, FetchError, FieldKind, Format, Integration, Snapshot, Status, Value, api, pin,
 };
 
 /// The most a service form is allowed to send.
@@ -116,6 +116,14 @@ fn parse(form: &Raw, kind: &'static dyn Integration) -> Parsed {
                 }),
             },
         }
+    }
+
+    // The pinned certificate's fingerprint: a field every service has. It is
+    // checked (and stored in its usual spelling) with the rest of the input.
+    let pin_text = form.get(CERT_FIELD).trim().to_string();
+    typed.insert(CERT_FIELD, pin_text.clone());
+    if !pin_text.is_empty() {
+        settings.insert(CERT_FIELD.to_string(), Json::String(pin_text));
     }
 
     let secret = if !kind.fields().iter().any(|f| f.secret) {
@@ -277,6 +285,9 @@ struct FormView {
     interval_min: u64,
     visibility: Visibility,
     settings: Vec<SettingView>,
+    /// The pinned certificate's fingerprint as typed, and what is wrong with it.
+    cert_value: String,
+    cert_error: String,
     secret: Option<SecretView>,
     has_secret: bool,
     /// The stored secret can't be opened any more.
@@ -322,27 +333,31 @@ impl Shown {
 
     fn of(service: &Service) -> Shown {
         let settings = service.settings.as_object();
+        let mut shown: BTreeMap<&'static str, String> = service
+            .integration()
+            .map(|kind| {
+                kind.fields()
+                    .iter()
+                    .filter(|f| !f.secret)
+                    .map(|f| {
+                        let value = match settings.and_then(|s| s.get(f.key)) {
+                            Some(Json::String(text)) => text.clone(),
+                            Some(Json::Number(n)) => n.to_string(),
+                            _ => String::new(),
+                        };
+                        (f.key, value)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(Json::String(pin)) = settings.and_then(|s| s.get(CERT_FIELD)) {
+            shown.insert(CERT_FIELD, pin.clone());
+        }
         Shown {
             name: service.name.clone(),
             url: service.url.clone().unwrap_or_default(),
             interval: service.interval_s.to_string(),
-            settings: service
-                .integration()
-                .map(|kind| {
-                    kind.fields()
-                        .iter()
-                        .filter(|f| !f.secret)
-                        .map(|f| {
-                            let value = match settings.and_then(|s| s.get(f.key)) {
-                                Some(Json::String(text)) => text.clone(),
-                                Some(Json::Number(n)) => n.to_string(),
-                                _ => String::new(),
-                            };
-                            (f.key, value)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
+            settings: shown,
             visibility: service.visibility,
             users: service.users.clone(),
             errors: Vec::new(),
@@ -426,6 +441,8 @@ async fn form_view(
         interval_default: kind.default_interval().as_secs(),
         interval_min: kind.min_interval().as_secs(),
         users: user_choices(core, &shown.users).await?,
+        cert_value: shown.settings.get(CERT_FIELD).cloned().unwrap_or_default(),
+        cert_error: error(CERT_FIELD),
         name_error: error("name"),
         url_error: error("url"),
         interval_error: error("interval"),
@@ -464,6 +481,8 @@ fn chooser() -> FormView {
         interval_min: 0,
         visibility: Visibility::Admin,
         settings: Vec::new(),
+        cert_value: String::new(),
+        cert_error: String::new(),
         secret: None,
         has_secret: false,
         secret_unreadable: false,
@@ -710,6 +729,18 @@ struct TestResult {
     /// Why, in words that hold no secret, header or address.
     reason: Option<String>,
     rows: Vec<TestRow>,
+    /// The certificate the server presented, when TLS did not accept it.
+    presented: Option<Presented>,
+}
+
+/// A certificate fingerprint offered for pinning.
+struct Presented {
+    /// 64 lowercase hex characters, what the "use" button fills in.
+    plain: String,
+    /// As `openssl` writes it, for reading.
+    shown: String,
+    hint: &'static str,
+    button: &'static str,
 }
 
 fn headline(status: &str) -> &'static str {
@@ -790,6 +821,7 @@ fn unknown(reason: String) -> TestResult {
         headline: headline("unknown"),
         reason: Some(reason),
         rows: Vec::new(),
+        presented: None,
     }
 }
 
@@ -812,6 +844,7 @@ fn describe(kind: &'static dyn Integration, outcome: Result<Snapshot, FetchError
                 headline: headline(status),
                 reason: snapshot.error.as_deref().map(reason_text),
                 rows,
+                presented: None,
             }
         }
         // The settings can't be used: nothing was tried.
@@ -821,6 +854,7 @@ fn describe(kind: &'static dyn Integration, outcome: Result<Snapshot, FetchError
             headline: headline("bad"),
             reason: Some(reason_text(&err.to_string())),
             rows: Vec::new(),
+            presented: None,
         },
     }
 }
@@ -861,6 +895,12 @@ async fn test(State(core): State<Core>, user: CurrentUser, body: Bytes) -> ApiRe
                             )))
                             .into_response());
                         }
+                        Err(store::CtxError::Config) => {
+                            return Ok(HtmlTemplate(unknown(reason_text(
+                                &FetchError::Config.to_string(),
+                            )))
+                            .into_response());
+                        }
                         Err(store::CtxError::Db(err)) => return Err(ApiError::internal(err)),
                     }
                 }
@@ -873,17 +913,44 @@ async fn test(State(core): State<Core>, user: CurrentUser, body: Bytes) -> ApiRe
     if let Some(url) = &input.url {
         settings.insert("url".into(), Json::String(url.clone()));
     }
+    let settings = Json::Object(settings);
     // Fetches the kind remembered as too old are asked again.
     if let Some(url) = &input.url {
         api::forget_all_for(url);
     }
+    // The pin, if any, decides the client (it was checked above).
+    let Ok(http) = integrations::client_for(&settings) else {
+        let reason = reason_text(&FetchError::Config.to_string());
+        return Ok(HtmlTemplate(unknown(reason)).into_response());
+    };
     let ctx = FetchCtx {
-        http: integrations::client().clone(),
-        settings: Json::Object(settings),
+        http,
+        settings,
         secret,
     };
     let outcome = kind.fetch(&ctx).await;
-    let result = describe(kind, outcome);
+    // TLS refused the certificate: show the one the server presents, so the
+    // admin can pin it. A second, separate look that sends nothing at all.
+    let refused = match &outcome {
+        Err(FetchError::Cert) => true,
+        Ok(snapshot) => snapshot.error.as_deref() == Some(FetchError::Cert.to_string().as_str()),
+        Err(_) => false,
+    };
+    let presented = if refused {
+        match input.url.as_deref().map(|u| url::Url::parse(u.trim())) {
+            Some(Ok(url)) => pin::presented(&url).await,
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let mut result = describe(kind, outcome);
+    result.presented = presented.map(|plain| Presented {
+        shown: pin::display(&plain),
+        plain,
+        hint: i18n::t("service.pin_presented"),
+        button: i18n::t("service.pin_use"),
+    });
     // Only what happened, never the address, the settings or the secret.
     tracing::info!(admin = %user.username, kind = kind.kind(), status = result.status, "service tested");
     Ok(HtmlTemplate(result).into_response())
