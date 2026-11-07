@@ -60,6 +60,12 @@ body:has(.main.start) .topbar-inner {
 .date::first-letter {
   text-transform: uppercase;
 }
+/* On an uploaded picture the muted grey of the date falls to about 3:1 on a
+   pale photo even under the scrim: lighten it and give it a soft shadow. */
+html:root:has(.mm-root)[data-bg="image"] .date {
+  color: rgba(245, 245, 247, 0.9);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+}
 
 /* "Needs you": one glass row of alerts; hidden while nothing needs you. */
 .needs {
