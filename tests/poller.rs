@@ -414,12 +414,12 @@ async fn store_snapshot(app: &App, id: i64, snapshot: &Snapshot) {
         .unwrap();
 }
 
-fn down_need(name: &str) -> Need {
+fn down_need() -> Need {
     Need {
         key: DOWN_KEY.into(),
         level: Level::Bad,
         label_key: "need.http_down".into(),
-        params: [("name".to_string(), name.to_string())].into(),
+        params: Default::default(),
         score: 1.0,
         since: None,
     }
@@ -885,7 +885,8 @@ async fn two_bad_fetches_in_a_row_make_a_need_and_a_good_one_clears_it() {
     assert_eq!(need.key, DOWN_KEY);
     assert_eq!(need.label_key, "need.http_down");
     assert_eq!(need.level, Level::Bad);
-    assert_eq!(need.params.get("name").map(String::as_str), Some("Needy"));
+    // The text is the kind's; the page shows the service's name beside it.
+    assert!(need.params.is_empty(), "{:?}", need.params);
 
     set_mode("t_need", Mode::Ok);
     wait_calls("t_need", 3).await;
@@ -937,7 +938,11 @@ async fn unusable_settings_or_secret_need_an_admin_not_the_site() {
         assert_eq!(s.needs.len(), 1);
         assert_eq!(s.needs[0].key, CONFIG_KEY);
         assert_eq!(s.needs[0].label_key, "need.service_config");
-        assert_eq!(s.needs[0].params.get("name").map(String::as_str), Some(tag));
+        assert!(
+            s.needs[0].params.is_empty(),
+            "{tag}: {:?}",
+            s.needs[0].params
+        );
         drop(poller);
     }
     // For the http kind too: not "down".
@@ -977,7 +982,7 @@ async fn a_need_that_is_showing_survives_a_restart() {
     // What a poller left behind: bad, with the need showing.
     let mut stored = Snapshot::failed(&FetchError::Connect);
     stored.fetched_at = Timestamp::from_second(1_700_000_000).unwrap();
-    stored.needs.push(down_need("Keeper"));
+    stored.needs.push(down_need());
     store_snapshot(&app, id, &stored).await;
 
     let poller = start_with(&app, stub_as_http_kinds, 0);
@@ -1035,10 +1040,7 @@ async fn a_need_that_is_showing_survives_an_update_of_an_unrelated_field() {
     let s = wait_snapshot(&poller, id, |s| s.fetched_at > shown.fetched_at).await;
     assert_eq!(s.needs.len(), 1, "the need did not go: {s:?}");
     assert_eq!(s.needs[0].key, DOWN_KEY);
-    assert_eq!(
-        s.needs[0].params.get("name").map(String::as_str),
-        Some("After")
-    );
+    assert!(s.needs[0].params.is_empty(), "{:?}", s.needs[0].params);
     assert_eq!(calls("t_keep_upd").len(), 3);
 }
 

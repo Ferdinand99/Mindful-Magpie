@@ -577,6 +577,8 @@ export function updateValues(root, layout, opts = {}) {
 // ---- «Trenger deg» -----------------------------------------------------------------
 
 const NEED_LEVELS = ["warn", "bad"];
+const NEEDS_TITLE_ID = "mm-needs-title";
+const NEEDS_ACKED_ID = "mm-needs-acked";
 
 function isNeed(item) {
   return (
@@ -619,8 +621,10 @@ function separator(doc) {
 function needButton(doc, className, text, template, item) {
   const button = make(doc, "button", className, text);
   button.setAttribute("type", "button");
-  // The name holds the visible word and says which need it is for.
-  if (template !== "") button.setAttribute("aria-label", template.split("{text}").join(item.label));
+  // The name holds the visible word and says which service and need it is for.
+  if (template !== "") {
+    button.setAttribute("aria-label", template.split("{name}").join(item.service_name).split("{text}").join(item.label));
+  }
   return button;
 }
 
@@ -680,10 +684,15 @@ function drawNeeds(doc, items, layout, opts, open) {
   for (const item of items) hrefs.set(item.service_id, needHref(layout, item.service_id));
   const section = make(doc, "section", "mm-needs glass");
   const title = label(opts.labels, "needs");
-  if (title !== "") section.setAttribute("aria-label", title);
   section.setAttribute("data-open", open ? "true" : "false");
   section.setAttribute("data-sig", needsSignature(items, hrefs, opts));
-  section.appendChild(make(doc, "h2", "mm-needs-title", title));
+  const heading = make(doc, "h2", "mm-needs-title", title);
+  // The row is named by its visible heading (there is one row on a page, so the ids are fixed).
+  if (title !== "") {
+    heading.setAttribute("id", NEEDS_TITLE_ID);
+    section.setAttribute("aria-labelledby", NEEDS_TITLE_ID);
+  }
+  section.appendChild(heading);
   const showing = items.filter((i) => i.acked !== true);
   const hidden = items.filter((i) => i.acked === true);
   if (showing.length > 0) section.appendChild(needItems(doc, "mm-needs-list", showing, hrefs, opts, nowMs));
@@ -696,10 +705,12 @@ function drawNeeds(doc, items, layout, opts, open) {
     );
     toggle.setAttribute("type", "button");
     toggle.setAttribute("aria-expanded", open ? "true" : "false");
+    toggle.setAttribute("aria-controls", NEEDS_ACKED_ID);
     const hint = label(opts.labels, "needs_show_acked");
     if (hint !== "") toggle.setAttribute("title", hint);
     section.appendChild(toggle);
     const list = needItems(doc, "mm-needs-list mm-needs-acked", hidden, hrefs, opts, nowMs);
+    list.setAttribute("id", NEEDS_ACKED_ID);
     if (!open) list.setAttribute("hidden", "");
     section.appendChild(list);
   }
@@ -733,21 +744,41 @@ function focusMark(doc, section) {
   const item = active.closest?.(".mm-need");
   const kind = ["mm-need-chip", "mm-need-ack", "mm-need-unack", "mm-needs-toggle"].find((c) => active.classList.contains(c));
   if (!kind) return null;
-  return { kind, service: item?.getAttribute("data-service"), key: item?.getAttribute("data-key") };
+  const shown = [...section.querySelectorAll(".mm-needs-list:not(.mm-needs-acked) .mm-need")];
+  return {
+    kind,
+    service: item?.getAttribute("data-service"),
+    key: item?.getAttribute("data-key"),
+    // Where it stood among the chips that need the person, for when it is gone.
+    index: item ? shown.indexOf(item) : -1,
+  };
 }
 
-function giveFocusBack(section, mark) {
+/**
+ * Gives the focus back to what it stood on, in the new row (`section`, null when
+ * the row is gone). When that is gone (the need went, or was acknowledged
+ * elsewhere), the focus goes where a press of its button would have sent it: the
+ * chip that took its place, the one before it, the toggle, and when the row has
+ * nothing left the first link of the page. It is never left to fall on the body.
+ */
+function giveFocusBack(root, section, mark) {
   if (!mark) return;
   let target = null;
-  if (mark.kind === "mm-needs-toggle") {
+  if (section && mark.kind === "mm-needs-toggle") {
     target = section.querySelector(".mm-needs-toggle");
-  } else {
+  } else if (section) {
     for (const li of section.querySelectorAll(".mm-need")) {
       if (li.getAttribute("data-service") === mark.service && li.getAttribute("data-key") === mark.key) {
         target = li.querySelector(`.${mark.kind}`);
       }
     }
   }
+  if (!target && section) {
+    const shown = [...section.querySelectorAll(".mm-needs-list:not(.mm-needs-acked) .mm-need")];
+    const near = shown[mark.index] ?? shown[mark.index - 1];
+    target = near?.querySelector("a.mm-need-chip") ?? near?.querySelector("button") ?? section.querySelector(".mm-needs-toggle");
+  }
+  if (!target) target = root.querySelector("a[href], button");
   target?.focus?.();
 }
 
@@ -766,8 +797,10 @@ function updateNeeds(root, layout, settings) {
   const old = child(root, "mm-needs");
   let live = child(root, "mm-needs-live");
   if (items.length === 0) {
+    const gone = focusMark(doc, old);
     if (old) old.parentNode.removeChild(old);
     if (live) live.textContent = "";
+    giveFocusBack(root, null, gone);
     return;
   }
   const fresh = drawNeeds(doc, items, layout, settings, old?.getAttribute("data-open") === "true");
@@ -785,9 +818,9 @@ function updateNeeds(root, layout, settings) {
   }
   live.textContent = items
     .filter((i) => i.acked !== true && !before.has(`${i.service_id}:${i.key}`))
-    .map((i) => i.label)
+    .map((i) => `${i.service_name}: ${i.label}`)
     .join(". ");
-  giveFocusBack(fresh, mark);
+  giveFocusBack(root, fresh, mark);
 }
 
 /**
@@ -941,9 +974,11 @@ function applyBackground(doc, background, opts) {
  * Acknowledged ones are behind the toggle «N kvittert» (`.mm-needs-toggle`, wired with
  * toggleAckedNeeds()) with an undo button each (`.mm-need-unack`, canAck only). The
  * row is absent when there is no need at all. Labels: `needs`, `need_ack`,
- * `need_ack_for` (with `{text}`), `need_unack`, `need_unack_for`, `needs_acked`
+ * `need_ack_for` (with `{name}` and `{text}`), `need_unack`, `need_unack_for` (the same), `needs_acked`
  * (with `{n}`) and `needs_show_acked`. updateValues() brings the row up to date in
- * place and announces new needs in the live region; focus is never moved.
+ * place and announces new needs in the live region ("service: text"); focus is never
+ * moved, except that focus that stood in the row and has lost its place (the need went)
+ * goes to the next chip, the toggle or the first link, never to the body.
  */
 export function render(root, layout, opts = {}) {
   const doc = root.ownerDocument;

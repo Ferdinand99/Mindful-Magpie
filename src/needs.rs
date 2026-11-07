@@ -6,18 +6,24 @@
 //! document from), and for the `config` need (a service whose settings or
 //! secret can't be used) only an admin's: it asks for something only an admin
 //! can do. A need shows nothing but the translated label of its fixed text
-//! key (see [`label_of`]) with the service's name filled in; no other text of
-//! a snapshot reaches a page.
+//! key (see [`label_of`]), without the service's name (the row shows it beside
+//! the text), with a numeric `count` parameter filled in; no other text of a
+//! snapshot reaches a page.
 //!
 //! **The rule.** An acknowledgement hides a need for that user and nobody
-//! else. The need shows again when
+//! else, until the need gets worse. It shows again when
 //!
 //! - its level has risen (warn to bad),
 //! - its score has risen above the score it had when it was acknowledged,
 //! - it began after the acknowledgement (see [`Need::since`]), or
-//! - it went and came back: the poller deletes the acknowledgements of a need
-//!   that is gone from a service's latest snapshot ([`clear_gone`]), so a need
-//!   that returns has none.
+//! - it went and came back.
+//!
+//! An acknowledgement that has stopped hiding is spent, for good: the poller
+//! deletes the acknowledgements of a need that is gone from a service's latest
+//! snapshot and of one that is now worse than when it was acknowledged
+//! ([`clear_spent`]), so a need that got worse and then eased stays shown, and
+//! one that returns has none. ([`hides`] states the same rule for a snapshot
+//! the poller has not yet looked at.)
 //!
 //! The level and the score of an acknowledgement are read from the server's
 //! latest snapshot when it is made, never from the request. A need that is
@@ -71,7 +77,7 @@ pub struct NeedView {
     /// The need's key within the service (what an acknowledgement refers to).
     pub key: String,
     pub level: Level,
-    /// The need's text in the request's language, the service's name in it.
+    /// The need's text in the request's language, without the service's name.
     pub label: String,
     /// Unix seconds: when the need began.
     pub since: i64,
@@ -105,24 +111,44 @@ fn parse_level(text: &str) -> Option<Level> {
     }
 }
 
-/// The need's text: its label key's translation with the service's name. The
-/// key is read from stored data, so only the fixed `need.*` texts are used;
-/// anything else reads as the general text of a need.
-fn label_of(need: &Need, service_name: &str) -> String {
+/// The `count` parameter of a need if it is a plain number (digits, a point,
+/// a minus sign; short): the only parameter a text may use, so nothing else a
+/// snapshot holds can reach a page.
+fn count_of(need: &Need) -> Option<&str> {
+    need.params.get("count").map(String::as_str).filter(|c| {
+        c.len() <= 20
+            && c.bytes()
+                .all(|b| b.is_ascii_digit() || b == b'.' || b == b'-')
+            && c.parse::<f64>().is_ok_and(f64::is_finite)
+    })
+}
+
+/// The need's text: its label key's translation with its `count`. The key is
+/// read from stored data, so only the fixed `need.*` texts are used; anything
+/// else reads as the general text of a need. The service's name is not in it.
+fn label_of(need: &Need) -> String {
     let lang = i18n::current();
     let text = need
         .label_key
         .strip_prefix("need.")
         .and_then(|_| i18n::lookup(lang, &need.label_key))
         .or_else(|| i18n::lookup(lang, "need.other"))
-        .unwrap_or("{name}");
-    i18n::interpolate(text, &[("name", service_name)])
+        .unwrap_or("");
+    i18n::interpolate(text, &[("count", count_of(need).unwrap_or(""))])
+        .trim()
+        .to_string()
 }
 
 /// Whether `ack` still hides `need` (see the module for the rule).
 fn hides(need: &Need, ack: &Ack) -> bool {
+    // A score that is no number counts as 0, as it does when it is stored.
+    let score = if need.score.is_finite() {
+        need.score
+    } else {
+        0.0
+    };
     need.level <= ack.level
-        && need.score <= ack.score
+        && score <= ack.score
         && need.since.is_none_or(|since| since <= ack.acked_at)
 }
 
@@ -149,7 +175,7 @@ pub fn needs_for(
                 service_name: service.name.clone(),
                 key: need.key.clone(),
                 level: need.level,
-                label: label_of(need, &service.name),
+                label: label_of(need),
                 since: need.since.unwrap_or(snapshot.fetched_at).as_second(),
                 acked,
             });
@@ -237,6 +263,8 @@ pub async fn ack(
     score: f64,
 ) -> Result<(), DbError> {
     let (key, at) = (key.to_string(), Timestamp::now().to_string());
+    // A column that is `NOT NULL`: a score that is no number is no score.
+    let score = if score.is_finite() { score } else { 0.0 };
     db::interact(&core.db, move |c| {
         c.execute(
             "INSERT INTO acks (user_id, service_id, need_key, level, score, acked_at)
@@ -264,16 +292,31 @@ pub async fn unack(core: &Core, user_id: i64, service_id: i64, key: &str) -> Res
     .await
 }
 
-/// Deletes everybody's acknowledgements of the service's needs that are not
-/// among `keys`, the need keys of its latest snapshot: the poller calls it when
-/// a need has gone, so that one that comes back is shown again.
-pub async fn clear_gone(core: &Core, service_id: i64, keys: Vec<String>) -> Result<(), DbError> {
+/// Deletes everybody's acknowledgements of the service's needs that its latest
+/// snapshot has spent: those of a need that is not among `needs` (`key`,
+/// `level`, `score` of each), so that one that comes back is shown again, and
+/// those of a need whose level is higher or whose score is above what was
+/// acknowledged. The poller calls it when the needs change.
+pub async fn clear_spent(
+    core: &Core,
+    service_id: i64,
+    needs: Vec<(String, Level, f64)>,
+) -> Result<(), DbError> {
     db::interact(&core.db, move |c| {
-        let marks = vec!["?"; keys.len()].join(", ");
+        let marks = vec!["?"; needs.len()].join(", ");
         let sql = format!("DELETE FROM acks WHERE service_id = ?1 AND need_key NOT IN ({marks})");
         let mut args: Vec<&dyn rusqlite::ToSql> = vec![&service_id];
-        args.extend(keys.iter().map(|k| k as &dyn rusqlite::ToSql));
-        c.execute(&sql, args.as_slice()).map(|_| ())
+        args.extend(needs.iter().map(|(k, _, _)| k as &dyn rusqlite::ToSql));
+        c.execute(&sql, args.as_slice())?;
+        for (key, level, score) in &needs {
+            let score = if score.is_finite() { *score } else { 0.0 };
+            c.execute(
+                "DELETE FROM acks WHERE service_id = ?1 AND need_key = ?2
+                   AND ((level = 'warn' AND ?3 = 'bad') OR score < ?4)",
+                params![service_id, key, level_text(*level), score],
+            )?;
+        }
+        Ok(())
     })
     .await
 }
@@ -416,6 +459,34 @@ mod tests {
         let mut later = need("d", Level::Warn, 88.0);
         later.since = Some(Timestamp::now() + jiff::SignedDuration::from_secs(5));
         assert!(!hides(&later, &acked));
+    }
+
+    #[test]
+    fn only_a_plain_number_is_taken_as_the_count() {
+        let with = |count: &str| {
+            let mut n = need("d", Level::Warn, 1.0);
+            n.params.insert("count".into(), count.into());
+            n
+        };
+        assert_eq!(count_of(&with("3")), Some("3"));
+        assert_eq!(count_of(&with("12.5")), Some("12.5"));
+        assert_eq!(count_of(&with("-1")), Some("-1"));
+        for bad in [
+            "",
+            "inf",
+            "NaN",
+            "1e5",
+            "<b>3</b>",
+            "3 nede",
+            "--",
+            "123456789012345678901",
+        ] {
+            assert_eq!(count_of(&with(bad)), None, "{bad:?}");
+        }
+        // Any other parameter is ignored.
+        let mut other = need("d", Level::Warn, 1.0);
+        other.params.insert("name".into(), "Blog".into());
+        assert_eq!(count_of(&other), None);
     }
 
     #[test]

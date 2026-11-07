@@ -38,9 +38,10 @@
 //! it is the first event or the set has changed (a service was hidden or
 //! deleted: drop the ids not in it), and `services_add`, the views (the
 //! `#mm-services` shape: id, name, kind, interval, metrics with labels) of
-//! the visible services this stream has not sent one of yet (all of them in
-//! the first event), so that a service that became visible after the page was
-//! made can be offered and drawn; both are built from the visibility list
+//! the visible services this stream has not sent one of yet or whose view has
+//! changed since (a rename; all of them in the first event), so that a service
+//! that became visible after the page was made can be offered and drawn, and
+//! one that was renamed is offered under its new name; both are built from the visibility list
 //! alone, so they never name a hidden service. `needs` is the document's
 //! list, sent when it is the first event or it has changed (also when only an
 //! acknowledgement did). The server remembers what it sent, so a
@@ -306,11 +307,11 @@ struct Open {
     changes: Changes<()>,
     /// What the client has: each entry as it was sent.
     sent: HashMap<i64, String>,
-    /// The ids of the services the user could see at the last wake, that is, the
-    /// services this stream has sent a view of (`services_add`); an id leaves
-    /// it when the service is hidden or deleted, so a view is sent again if it
-    /// comes back.
-    viewed: BTreeSet<i64>,
+    /// The services the user could see at the last wake, each with the view this
+    /// stream sent of it (`services_add`, serialised); an id leaves it when the
+    /// service is hidden or deleted, so a view is sent again if it comes back,
+    /// and a view that changed (a rename) is sent again.
+    viewed: BTreeMap<i64, String>,
     /// The needs list as last sent, serialised.
     sent_needs: String,
     first: bool,
@@ -387,19 +388,36 @@ impl Open {
         removed.sort_unstable();
         // The views the client has not been given: the services list it holds
         // (the page's `#mm-services`) may lack a service that has become visible.
-        let now_visible: BTreeSet<i64> = visible.iter().map(|s| s.id).collect();
-        let add: Vec<ServiceView> = visible
+        let views: Vec<(i64, ServiceView, String)> = visible
             .iter()
-            .filter(|s| full || !self.viewed.contains(&s.id))
-            .map(view_of)
+            .map(|s| {
+                let view = view_of(s);
+                let text = serde_json::to_string(&view).unwrap_or_default();
+                (s.id, view, text)
+            })
             .collect();
-        let visible_changed = full || self.viewed != now_visible;
+        let add: Vec<&ServiceView> = views
+            .iter()
+            .filter(|(id, _, text)| full || self.viewed.get(id) != Some(text))
+            .map(|(_, view, _)| view)
+            .collect();
+        let now_visible: BTreeSet<i64> = views.iter().map(|(id, _, _)| *id).collect();
+        let visible_changed = full || !self.viewed.keys().copied().eq(now_visible.iter().copied());
         let needs_text = serde_json::to_string(&doc.needs).unwrap_or_default();
         let needs_changed = full || self.sent_needs != needs_text;
-        self.viewed = now_visible;
+        self.viewed = views
+            .iter()
+            .map(|(id, _, text)| (*id, text.clone()))
+            .collect();
         self.sent = current;
         self.sent_needs = needs_text;
-        if !full && entries.is_empty() && removed.is_empty() && !visible_changed && !needs_changed {
+        if !full
+            && entries.is_empty()
+            && removed.is_empty()
+            && add.is_empty()
+            && !visible_changed
+            && !needs_changed
+        {
             return Turn::Nothing;
         }
         let mut data = serde_json::json!({
@@ -410,7 +428,7 @@ impl Open {
             "services_add": add,
         });
         if visible_changed {
-            data["services_visible"] = serde_json::json!(self.viewed);
+            data["services_visible"] = serde_json::json!(now_visible);
         }
         if needs_changed {
             data["needs"] = serde_json::json!(doc.needs);
@@ -438,8 +456,7 @@ async fn live_values(
         return live::busy();
     };
     let id = user.id;
-    let instance = Arc::as_ptr(&magpie.shutdown) as usize;
-    let Some(user_slot) = UserSlot::acquire(instance, id) else {
+    let Some(user_slot) = UserSlot::acquire(magpie.instance, id) else {
         tracing::warn!(user = id, "too many live value streams for one user");
         return live::busy();
     };
@@ -470,7 +487,7 @@ async fn live_values(
         session_version,
         changes: Changes::all(wake_rx).quiet(QUIET),
         sent: HashMap::new(),
-        viewed: BTreeSet::new(),
+        viewed: BTreeMap::new(),
         sent_needs: String::new(),
         first: true,
         lagged,

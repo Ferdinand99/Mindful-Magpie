@@ -36,7 +36,7 @@ function need(over = {}) {
     service_name: "Blog",
     key: "down",
     level: "bad",
-    label: "Blog is not answering",
+    label: "not answering",
     since: NOW - 120,
     acked: false,
     ...over,
@@ -99,7 +99,7 @@ test("the_row_is_absent_when_there_is_nothing_to_show", () => {
 });
 
 test("the_row_sits_before_the_groups_and_chips_read_service_text_age", () => {
-  const { root } = draw([need(), need({ service_id: 2, service_name: "Wiki", key: "disk", level: "warn", label: "Wiki: disk almost full", since: NOW - 3 * 3600 })]);
+  const { root } = draw([need(), need({ service_id: 2, service_name: "Wiki", key: "disk", level: "warn", label: "disk almost full", since: NOW - 3 * 3600 })]);
   const section = row(root);
   assert.ok(section, "the row is there");
   const first = [...root.children].find((el) => el.classList.contains("mm-needs") || el.classList.contains("mm-group"));
@@ -107,11 +107,11 @@ test("the_row_sits_before_the_groups_and_chips_read_service_text_age", () => {
   assert.equal(section.querySelector(".mm-needs-title").textContent, EN.labels.needs);
   const items = chips(root);
   assert.equal(items.length, 2);
-  assert.equal(items[0].querySelector(".mm-need-chip").textContent, "Blog · Blog is not answering · 2 min. ago");
-  assert.equal(items[1].querySelector(".mm-need-chip").textContent, "Wiki · Wiki: disk almost full · 3 hr. ago");
+  assert.equal(items[0].querySelector(".mm-need-chip").textContent, "Blog · not answering · 2 min. ago");
+  assert.equal(items[1].querySelector(".mm-need-chip").textContent, "Wiki · disk almost full · 3 hr. ago");
   // The same in Norwegian.
-  const nb = draw([need({ label: "Blog svarer ikke" })], { lang: NB });
-  assert.match(chips(nb.root)[0].querySelector(".mm-need-chip").textContent, /^Blog · Blog svarer ikke · for 2 min siden$/);
+  const nb = draw([need({ label: "svarer ikke" })], { lang: NB });
+  assert.match(chips(nb.root)[0].querySelector(".mm-need-chip").textContent, /^Blog · svarer ikke · for 2 min siden$/);
 });
 
 test("the_shape_tells_the_level_as_well_as_the_colour", () => {
@@ -142,7 +142,7 @@ test("a_chip_opens_the_bound_cards_address_in_the_same_tab", () => {
 
 test("a_chip_without_a_usable_card_address_is_text", () => {
   // No card is bound to the service, or its address is not http(s).
-  const unbound = draw([need({ service_id: 5, service_name: "Gone", label: "Gone is not answering" })]);
+  const unbound = draw([need({ service_id: 5, service_name: "Gone", label: "not answering" })]);
   const el = chips(unbound.root)[0].querySelector(".mm-need-chip");
   assert.equal(el.tagName, "SPAN");
   assert.equal(el.getAttribute("href"), null);
@@ -168,7 +168,7 @@ test("hostile_names_and_texts_stay_text", () => {
 });
 
 test("each_chip_has_a_kvitter_button_after_it_and_the_order_is_chips_then_their_buttons", () => {
-  const { root } = draw([need(), need({ service_id: 2, service_name: "Wiki", key: "disk", level: "warn", label: "Wiki: disk" })]);
+  const { root } = draw([need(), need({ service_id: 2, service_name: "Wiki", key: "disk", level: "warn", label: "disk" })]);
   const tab = [...row(root).querySelectorAll("a, button")].map((el) => [el.tagName, el.className.split(" ")[0], el.getAttribute("data-key") ?? el.closest(".mm-need")?.getAttribute("data-key")]);
   assert.deepEqual(tab, [
     ["A", "mm-need-chip", "down"],
@@ -179,7 +179,7 @@ test("each_chip_has_a_kvitter_button_after_it_and_the_order_is_chips_then_their_
   const button = row(root).querySelector(".mm-need-ack");
   assert.equal(button.getAttribute("type"), "button");
   assert.equal(button.textContent, EN.labels.need_ack);
-  assert.equal(button.getAttribute("aria-label"), "Acknowledge: Blog is not answering");
+  assert.equal(button.getAttribute("aria-label"), "Acknowledge Blog: not answering");
   assert.ok(button.getAttribute("aria-label").startsWith(button.textContent), "the name holds the visible text");
   const nb = draw([need()], { lang: NB });
   assert.equal(nb.root.querySelector(".mm-need-ack").textContent, "Kvitter");
@@ -198,7 +198,7 @@ test("without_canAck_there_is_no_kvitter_button", () => {
 });
 
 test("acknowledged_needs_are_hidden_behind_a_toggle_with_a_count", () => {
-  const { root } = draw([need(), need({ service_id: 2, service_name: "Wiki", key: "disk", level: "warn", label: "Wiki: disk", acked: true })]);
+  const { root } = draw([need(), need({ service_id: 2, service_name: "Wiki", key: "disk", level: "warn", label: "disk", acked: true })]);
   assert.equal(chips(root).length, 1, "only the one that still needs you");
   const toggle = row(root).querySelector(".mm-needs-toggle");
   assert.equal(toggle.tagName, "BUTTON");
@@ -209,7 +209,7 @@ test("acknowledged_needs_are_hidden_behind_a_toggle_with_a_count", () => {
   const hidden = row(root).querySelector(".mm-needs-acked");
   assert.ok(hidden.hasAttribute("hidden"));
   assert.equal(hidden.querySelectorAll(".mm-need").length, 1);
-  assert.equal(hidden.querySelector(".mm-need-chip").textContent.startsWith("Wiki · Wiki: disk"), true);
+  assert.equal(hidden.querySelector(".mm-need-chip").textContent.startsWith("Wiki · disk"), true);
   // The toggle shows and hides them.
   toggleAckedNeeds(toggle);
   assert.equal(toggle.getAttribute("aria-expanded"), "true");
@@ -264,12 +264,12 @@ test("the_live_region_starts_empty_and_a_new_need_is_announced_without_moving_fo
   assert.equal(updateValues(p.root, l, { ...opts, values: values([need()]) }), true);
   assert.ok(row(p.root));
   assert.equal(p.root.querySelector(".mm-needs-live"), live, "the same region");
-  assert.equal(live.textContent, "Blog is not answering");
+  assert.equal(live.textContent, "Blog: not answering");
   // Nothing new in the next update: the same row stays, and the text is not touched again.
   const section = row(p.root);
   updateValues(p.root, l, { ...opts, values: values([need()]) });
   assert.equal(row(p.root), section, "same element when nothing changed");
-  assert.equal(live.textContent, "Blog is not answering");
+  assert.equal(live.textContent, "Blog: not answering");
   // Another change (an acknowledgement) announces nothing new.
   updateValues(p.root, l, { ...opts, values: values([need({ acked: true })]) });
   assert.equal(live.textContent, "");
@@ -284,31 +284,42 @@ test("the_live_region_starts_empty_and_a_new_need_is_announced_without_moving_fo
   assert.equal(q.root.querySelector(".mm-needs-live").textContent, "");
 });
 
+/** Makes `target` the document's active element and records the focus calls. */
+function trackFocus(p, target) {
+  const calls = [];
+  Object.defineProperty(p.document, "activeElement", { get: () => target, configurable: true });
+  const proto = p.document.defaultView.Element.prototype;
+  const original = proto.focus;
+  proto.focus = function () {
+    calls.push(this.closest?.(".mm-need")?.getAttribute("data-key") ?? this.className);
+  };
+  return {
+    calls,
+    restore: () => {
+      // Not an own property left behind that hides the element's own method.
+      if (original === undefined) delete proto.focus;
+      else proto.focus = original;
+    },
+  };
+}
+
 test("a_live_update_keeps_the_focus_on_a_chip_that_stays", () => {
   const p = page();
   const opts = { ...EN, services: SERVICES, canAck: true };
   const l = layout([blog, wiki]);
-  render(p.root, l, { ...opts, values: values([need(), need({ service_id: 2, service_name: "Wiki", key: "disk", label: "Wiki: disk" })]) });
-  const calls = [];
-  const second = chips(p.root)[1].querySelector(".mm-need-ack");
+  render(p.root, l, { ...opts, values: values([need(), need({ service_id: 2, service_name: "Wiki", key: "disk", label: "disk" })]) });
   // The reader stands on the second Kvitter button; a new need arrives before it.
-  Object.defineProperty(p.document, "activeElement", { get: () => p.root.querySelector(".mm-need-ack[data-focus]"), configurable: true });
-  second.setAttribute("data-focus", "");
-  const proto = Object.getPrototypeOf(second);
-  const original = proto.focus;
-  proto.focus = function () {
-    calls.push(this.closest(".mm-need")?.getAttribute("data-key"));
-  };
+  const t = trackFocus(p, chips(p.root)[1].querySelector(".mm-need-ack"));
   try {
     updateValues(p.root, l, {
       ...opts,
-      values: values([need(), need({ service_id: 2, service_name: "Wiki", key: "disk", label: "Wiki: disk" }), need({ key: "cert", level: "warn", label: "cert" })]),
+      values: values([need(), need({ service_id: 2, service_name: "Wiki", key: "disk", label: "disk" }), need({ key: "cert", level: "warn", label: "cert" })]),
     });
   } finally {
-    proto.focus = original;
+    t.restore();
   }
   // It is given back to the same button of the rebuilt row, and to nothing else.
-  assert.deepEqual(calls, ["disk"]);
+  assert.deepEqual(t.calls, ["disk"]);
 });
 
 test("update_values_replaces_the_row_in_place_and_leaves_the_cards", () => {
@@ -356,4 +367,92 @@ test("render_css_styles_the_row_and_hides_the_live_region_visually", () => {
     assert.ok(css.includes(selector), `${selector} in render.css`);
   }
   assert.ok(!/style\s*=/.test(readFileSync(new URL("../static/magpie/render.js", import.meta.url), "utf8").replace(/\/\/.*$/gm, "").replace(/setAttribute\("style"/g, "")), "no style attributes");
+});
+
+test("the_row_is_named_by_its_heading_and_the_toggle_controls_the_acknowledged_list", () => {
+  const { root } = draw([need(), need({ service_id: 2, key: "b", label: "b", acked: true })]);
+  const section = row(root);
+  const heading = section.querySelector(".mm-needs-title");
+  assert.ok(heading.getAttribute("id"), "the heading has an id");
+  assert.equal(section.getAttribute("aria-labelledby"), heading.getAttribute("id"));
+  assert.equal(section.getAttribute("aria-label"), null, "not named twice");
+  const toggle = section.querySelector(".mm-needs-toggle");
+  const list = section.querySelector(".mm-needs-acked");
+  assert.ok(list.getAttribute("id"));
+  assert.equal(toggle.getAttribute("aria-controls"), list.getAttribute("id"));
+  assert.equal(root.ownerDocument.querySelectorAll(`[id="${heading.getAttribute("id")}"]`).length, 1);
+});
+
+test("the_buttons_name_the_service_as_well_as_the_text", () => {
+  const { root } = draw([need({ service_name: "Wiki", service_id: 2 }), need({ key: "x", label: "slow", acked: true })]);
+  assert.equal(root.querySelector(".mm-need-ack").getAttribute("aria-label"), "Acknowledge Wiki: not answering");
+  assert.equal(root.querySelector(".mm-need-unack").getAttribute("aria-label"), "Undo the acknowledgement of Blog: slow");
+  const nb = draw([need()], { lang: NB });
+  assert.equal(nb.root.querySelector(".mm-need-ack").getAttribute("aria-label"), "Kvitter Blog: not answering");
+  assert.equal(nb.root.querySelector(".mm-need-ack").textContent, "Kvitter");
+});
+
+test("a_focused_chip_that_goes_gives_its_focus_to_the_next_chip_or_the_toggle_never_the_body", () => {
+  const two = [need(), need({ service_id: 2, service_name: "Wiki", key: "disk", label: "disk" })];
+  const opts = { ...EN, services: SERVICES, canAck: true };
+  const l = layout([blog, wiki]);
+
+  // The second need goes: the focus (on its Kvitter button) goes to the chip before it.
+  let p = page();
+  render(p.root, l, { ...opts, values: values(two) });
+  let t = trackFocus(p, chips(p.root)[1].querySelector(".mm-need-ack"));
+  try {
+    updateValues(p.root, l, { ...opts, values: values([two[0]]) });
+  } finally {
+    t.restore();
+  }
+  assert.deepEqual(t.calls, ["down"]);
+
+  // The first goes: the next one takes its place.
+  p = page();
+  render(p.root, l, { ...opts, values: values(two) });
+  t = trackFocus(p, chips(p.root)[0].querySelector(".mm-need-chip"));
+  try {
+    updateValues(p.root, l, { ...opts, values: values([two[1]]) });
+  } finally {
+    t.restore();
+  }
+  assert.deepEqual(t.calls, ["disk"]);
+
+  // The only one is acknowledged elsewhere: the toggle.
+  p = page();
+  render(p.root, l, { ...opts, values: values([two[0]]) });
+  t = trackFocus(p, chips(p.root)[0].querySelector(".mm-need-ack"));
+  try {
+    updateValues(p.root, l, { ...opts, values: values([{ ...two[0], acked: true }]) });
+  } finally {
+    t.restore();
+  }
+  assert.deepEqual(t.calls, ["mm-needs-toggle"]);
+
+  // The row goes altogether: the first link of the page, not the body.
+  p = page();
+  render(p.root, l, { ...opts, values: values([two[0]]) });
+  t = trackFocus(p, chips(p.root)[0].querySelector(".mm-need-chip"));
+  try {
+    updateValues(p.root, l, { ...opts, values: values([]) });
+  } finally {
+    t.restore();
+  }
+  assert.equal(t.calls.length, 1, "one call, to a link of the page");
+});
+
+test("focus_outside_the_row_is_never_touched_by_an_update", () => {
+  const p = page();
+  const opts = { ...EN, services: SERVICES, canAck: true };
+  const l = layout([blog, wiki]);
+  render(p.root, l, { ...opts, values: values([need()]) });
+  const t = trackFocus(p, p.document.getElementById("keep"));
+  try {
+    updateValues(p.root, l, { ...opts, values: values([]) });
+    updateValues(p.root, l, { ...opts, values: values([need()]) });
+  } finally {
+    t.restore();
+  }
+  assert.deepEqual(t.calls, []);
 });

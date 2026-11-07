@@ -35,6 +35,9 @@ use vole_kit::state::Core;
 
 pub use product::{VERSION, install};
 
+/// The next [`Magpie::instance`].
+static NEXT_INSTANCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
 /// Why Magpie could not start.
 pub type StartError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -58,6 +61,9 @@ pub struct Magpie {
     /// The latest snapshot of every service (see [`integrations::poller`]).
     /// Idle until the server starts the poller; pages only read from it.
     pub poller: integrations::poller::PollerHandle,
+    /// Tells this running Magpie from the others of one process (the tests'):
+    /// what the per-user stream cap is counted under (see [`values`]).
+    pub instance: usize,
     /// Announces the id of a user who acknowledged a need or took an
     /// acknowledgement back, so that their open streams (see [`values`])
     /// send the new list. With no stream a send is dropped.
@@ -135,6 +141,7 @@ pub async fn start_with(
         backgrounds,
         service_events: tokio::sync::broadcast::channel(64).0,
         poller: integrations::poller::PollerHandle::idle(),
+        instance: NEXT_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ack_events: tokio::sync::broadcast::channel(64).0,
         shutdown: Arc::new(tokio::sync::watch::channel(false).0),
     })

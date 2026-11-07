@@ -38,7 +38,7 @@
 //! an address or a secret: log lines carry the service id, the kind and a
 //! [`FetchError`] text, which is a fixed set.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -560,22 +560,23 @@ impl Job {
         }
     }
 
-    /// Deletes everybody's acknowledgements of the needs that are gone from
-    /// `snapshot` (an acknowledgement is of one run of a need: one that comes
-    /// back is shown again). Only when a need has gone since the snapshot
-    /// before it, or when there is none to compare with.
+    /// Deletes everybody's acknowledgements that `snapshot` has spent: those of
+    /// a need that is gone (one that comes back is shown again) and those of a
+    /// need that is now worse than when it was acknowledged (its level rose or
+    /// its score is higher). An acknowledgement is spent once it stops hiding,
+    /// for good: a need that got worse and then eased stays shown. Only when
+    /// the needs differ from the snapshot before it (their keys, levels or
+    /// scores), or when there is none to compare with.
     async fn clear_acks(&self, snapshot: &Snapshot, before: Option<&Snapshot>) {
-        let gone = before.is_none_or(|before| {
-            before
-                .needs
-                .iter()
-                .any(|n| snapshot.needs.iter().all(|m| m.key != n.key))
-        });
-        if !gone {
+        if before.is_some_and(|before| need_marks(before) == need_marks(snapshot)) {
             return;
         }
-        let keys = snapshot.needs.iter().map(|n| n.key.clone()).collect();
-        if let Err(err) = crate::needs::clear_gone(&self.core, self.service.id, keys).await {
+        let needs = snapshot
+            .needs
+            .iter()
+            .map(|n| (n.key.clone(), n.level, n.score))
+            .collect();
+        if let Err(err) = crate::needs::clear_spent(&self.core, self.service.id, needs).await {
             tracing::warn!(service_id = self.service.id, %err, "poller can't clear acknowledgements");
         }
     }
@@ -659,10 +660,19 @@ impl Job {
 /// one the same need had in the reading before, else the time of this reading.
 /// A need that was not in the reading before begins now, also when it was
 /// there earlier and went.
+///
+/// Also makes the needs safe to store and compare: a `since` after the reading
+/// is cut back to the reading (a kind's clock, or a made-up date, must not make
+/// an acknowledgement stop hiding), and a score that is not a finite number
+/// becomes 0.
 fn date_needs(snapshot: &mut Snapshot, before: Option<&Snapshot>) {
     let fetched_at = snapshot.fetched_at;
     for need in &mut snapshot.needs {
-        if need.since.is_some() {
+        if !need.score.is_finite() {
+            need.score = 0.0;
+        }
+        if let Some(since) = need.since {
+            need.since = Some(since.min(fetched_at));
             continue;
         }
         let carried = before.and_then(|b| {
@@ -673,6 +683,16 @@ fn date_needs(snapshot: &mut Snapshot, before: Option<&Snapshot>) {
         });
         need.since = Some(carried.unwrap_or(fetched_at));
     }
+}
+
+/// What `clear_acks` compares between two readings: each need's key, level
+/// and score (as bits, so the comparison is exact).
+fn need_marks(snapshot: &Snapshot) -> Vec<(&str, Level, u64)> {
+    snapshot
+        .needs
+        .iter()
+        .map(|n| (n.key.as_str(), n.level, n.score.to_bits()))
+        .collect()
 }
 
 /// Whether the reading failed because the settings or the secret can't be
@@ -695,7 +715,7 @@ fn bad_need(service: &Service, snapshot: &Snapshot) -> Option<Need> {
         key: key.to_string(),
         level: Level::Bad,
         label_key: label_key.to_string(),
-        params: [("name".to_string(), service.name.clone())].into(),
+        params: BTreeMap::new(),
         // Constant: the service is down or it is not, so an acknowledgement
         // is not undone by the next fetch.
         score: 1.0,

@@ -73,7 +73,6 @@ function snapshot(over = {}) {
       note: { num: null, text: "all fine" },
       count: { num: 1234567, text: null },
     },
-    needs: [],
     fetched_at: ago(120),
     ...over,
   };

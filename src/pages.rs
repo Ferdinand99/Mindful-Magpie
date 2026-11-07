@@ -132,6 +132,7 @@ fn labels() -> BTreeMap<&'static str, &'static str> {
         "need_unack",
         "need_unack_for",
         "need_ack_failed",
+        "need_gone",
         "needs_acked",
         "needs_show_acked",
         "status_ok",

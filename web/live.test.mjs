@@ -64,7 +64,6 @@ function entry(latency, { fetchedAt = NOW - 30, status = "ok", name = "Blog" } =
     interval_s: 60,
     status,
     values: { status: { num: 200, text: null }, latency_ms: { num: latency, text: null } },
-    needs: [],
     fetched_at: fetchedAt,
   };
 }
@@ -730,11 +729,11 @@ const NEED = {
   service_name: "Blog",
   key: "down",
   level: "bad",
-  label: "Blog is not answering",
+  label: "not answering",
   since: NOW - 120,
   acked: false,
 };
-const NEED2 = { ...NEED, key: "disk", level: "warn", label: "Blog: disk almost full" };
+const NEED2 = { ...NEED, key: "disk", level: "warn", label: "disk almost full" };
 
 const needsPage = (needs, extra = {}) => page({ values: { ...valuesFixture(), needs }, ...extra });
 const chipKeys = (p) => [...p.root.querySelectorAll(".mm-needs-list:not(.mm-needs-acked) .mm-need")].map((li) => li.getAttribute("data-key"));
@@ -755,7 +754,7 @@ test("an_event_brings_a_need_into_the_row_in_place_and_announces_it_without_movi
   const before = p.focus.count;
   p.ES.all[0].emit("values", { now: NOW + 3, full: false, services: {}, removed: [], needs: [NEED] });
   assert.deepEqual(chipKeys(p), ["down"]);
-  assert.equal(p.root.querySelector(".mm-needs-live").textContent, "Blog is not answering");
+  assert.equal(p.root.querySelector(".mm-needs-live").textContent, "Blog: not answering");
   assert.equal(p.focus.count, before, "no focus call");
   assert.deepEqual(block(p, "mm-values").needs, [NEED], "the page's data block follows");
   // An event without a needs list leaves the row alone.
@@ -840,7 +839,16 @@ test("undo_posts_to_unack_and_a_failed_ack_is_said_in_the_live_region", async ()
   await tick();
   assert.equal(failing.calls.length, 1);
   assert.deepEqual(chipKeys(q), ["down"]);
-  assert.equal(q.root.querySelector(".mm-needs-live").textContent, LABELS.need_ack_failed);
+  // A need that is gone is said so, not "try again".
+  assert.equal(q.root.querySelector(".mm-needs-live").textContent, LABELS.need_gone);
+  assert.equal(LABELS.need_gone, "This has already cleared");
+  // Any other refusal asks for another try.
+  const busy = needsPage([NEED]);
+  draw(busy.document);
+  needsDeps(busy, { status: 500, json: async () => ({}) });
+  busy.root.querySelector("button.mm-need-ack").dispatchEvent(new busy.window.Event("click", { bubbles: true }));
+  await tick();
+  assert.equal(busy.root.querySelector(".mm-needs-live").textContent, LABELS.need_ack_failed);
   // A network failure too.
   const r = needsPage([NEED]);
   draw(r.document);
@@ -881,4 +889,18 @@ test("wirePage_wires_the_needs_buttons", async () => {
   await tick();
   assert.deepEqual(calls, ["/start/needs/ack"]);
   assert.equal(chipKeys(p).length, 0);
+});
+
+test("a_renamed_service_that_no_card_uses_is_offered_under_its_new_name", () => {
+  const wiki = { id: 2, name: "Wiki", kind: "http", interval_s: 60, metrics: [] };
+  const p = page({ services: [SERVICES[0], wiki] });
+  draw(p.document);
+  const live = initLive(p.document, p.deps);
+  live.sync();
+  // The stream sends the changed view again (an unbound service has no entry to carry its name).
+  p.ES.all[0].emit("values", { now: NOW + 5, full: false, services: {}, removed: [], services_add: [{ ...wiki, name: "Handbook" }] });
+  assert.deepEqual(
+    block(p, "mm-services").map((s) => s.name),
+    ["Blog", "Handbook"],
+  );
 });

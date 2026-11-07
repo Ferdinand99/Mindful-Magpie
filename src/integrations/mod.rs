@@ -257,6 +257,9 @@ pub struct Need {
     pub key: String,
     pub level: Level,
     pub label_key: String,
+    /// Values for the placeholders of the label's text. Only `count` is read
+    /// (a number, for texts such as "{count} down"); the service's name is not
+    /// a parameter, the page shows it beside the text. Never external text.
     #[serde(default)]
     pub params: BTreeMap<String, String>,
     /// Higher is worse.

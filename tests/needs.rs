@@ -138,7 +138,12 @@ fn need(key: &str, level: Level, score: f64, name: &str) -> Need {
         } else {
             "need.http_down".into()
         },
-        params: [("name".to_string(), name.to_string())].into(),
+        // The page shows the service's name beside the text; `name` stays a
+        // parameter of this helper for the calls' sake.
+        params: {
+            let _ = name;
+            Default::default()
+        },
         score,
         since: None,
     }
@@ -322,7 +327,7 @@ async fn needs_are_listed_with_a_translated_label_and_their_age() {
     assert_eq!(list[0]["level"], "bad");
     assert_eq!(list[0]["service_id"], w.blog);
     assert_eq!(list[0]["service_name"], "Blog");
-    assert_eq!(list[0]["label"], "Blog is not answering");
+    assert_eq!(list[0]["label"], "not answering");
     assert_eq!(list[0]["acked"], false);
     // The need began with the reading that first had it.
     assert_eq!(list[0]["since"], 1_760_000_000);
@@ -331,7 +336,7 @@ async fn needs_are_listed_with_a_translated_label_and_their_age() {
 
     // In Norwegian, from the same data.
     let nb = embed_in(&mut bob, "nb").await;
-    assert_eq!(nb["needs"][0]["label"], "Blog svarer ikke");
+    assert_eq!(nb["needs"][0]["label"], "svarer ikke");
 }
 
 #[tokio::test]
@@ -350,7 +355,7 @@ async fn a_need_carries_no_text_but_the_services_name() {
     let text = list[0].to_string();
     assert!(!text.contains("onerror"), "{text}");
     assert!(!text.contains("need.no_such_text"), "{text}");
-    assert!(!list[0]["label"].as_str().unwrap().is_empty());
+    assert_eq!(list[0]["label"], "needs attention");
 }
 
 #[tokio::test]
@@ -530,6 +535,8 @@ async fn a_need_that_began_after_the_ack_shows_again() {
 // A need that goes and comes back (the poller clears acks)
 
 static MODE: AtomicU8 = AtomicU8::new(0);
+/// The tests that run a poller with `Flaky` share `MODE`: one at a time.
+static MODE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct Flaky;
 static NO_FIELDS: [Field; 0] = [];
@@ -561,6 +568,20 @@ impl Integration for Flaky {
             match MODE.load(Ordering::SeqCst) {
                 1 => s.needs.push(need("disk", Level::Warn, 88.0, "Blog")),
                 2 => s.needs.push(need("other", Level::Warn, 10.0, "Blog")),
+                3 => s.needs.push(need("disk", Level::Warn, 92.0, "Blog")),
+                4 => s.needs.push(need("disk", Level::Bad, 88.0, "Blog")),
+                // A kind's date in the future, and a score that is no number.
+                5 => {
+                    let mut n = need("late", Level::Warn, f64::NAN, "Blog");
+                    n.since = Some(Timestamp::now() + jiff::SignedDuration::from_secs(86_400));
+                    s.needs.push(n);
+                }
+                // A kind's date in the past: kept.
+                6 => {
+                    let mut n = need("early", Level::Warn, 5.0, "Blog");
+                    n.since = Some(Timestamp::now() - jiff::SignedDuration::from_secs(3_600));
+                    s.needs.push(n);
+                }
                 _ => {}
             }
             Ok(s)
@@ -598,6 +619,7 @@ async fn wait_poller(
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_need_that_goes_and_comes_back_shows_again() {
+    let _mode = MODE_LOCK.lock().await;
     let w = world().await;
     let mut bob = w.viewer("bob").await;
     let mut cy = w.viewer("cy").await;
@@ -1030,4 +1052,192 @@ async fn the_cap_on_a_users_streams_is_per_app_so_tests_of_one_user_number_do_no
     let res = request_live(&bob_b).await;
     assert_eq!(res.status(), StatusCode::OK);
     open.push(res);
+}
+
+// ---------------------------------------------------------------------------
+// An acknowledgement is spent once it stops hiding
+
+fn flaky_poller(w: &World) -> PollerHandle {
+    Poller::start_with(
+        w.app.magpie.core.clone(),
+        integrations::client().clone(),
+        &w.app.magpie.service_events,
+        Options {
+            kinds: flaky_kinds,
+            spread: Duration::ZERO,
+        },
+    )
+}
+
+/// Waits for a reading after `after` that has the need `key` with `level` and `score`.
+async fn wait_need(
+    poller: &PollerHandle,
+    w: &World,
+    after: Option<Timestamp>,
+    key: &str,
+    level: Level,
+    score: f64,
+) -> std::sync::Arc<Snapshot> {
+    let key = key.to_string();
+    let s = wait_poller(poller, w.blog, after, move |s| {
+        s.needs
+            .iter()
+            .any(|n| n.key == key && n.level == level && n.score == score)
+    })
+    .await;
+    // The page reads another handle: give it what the poller has.
+    w.app
+        .magpie
+        .poller
+        .set_snapshot_for_tests(w.blog, (*s).clone());
+    s
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_need_that_got_worse_and_then_eased_stays_shown() {
+    let _mode = MODE_LOCK.lock().await;
+    let w = world().await;
+    let mut bob = w.viewer("bob").await;
+    tokio::time::pause();
+    MODE.store(1, Ordering::SeqCst);
+    let poller = flaky_poller(&w);
+
+    // Acknowledged at 88; the next reading is the same: it stays hidden.
+    let s1 = wait_need(&poller, &w, None, "disk", Level::Warn, 88.0).await;
+    assert_eq!(ack(&mut bob, w.blog, "disk").await.status, StatusCode::OK);
+    let s2 = wait_need(&poller, &w, Some(s1.fetched_at), "disk", Level::Warn, 88.0).await;
+    assert_eq!(w.acks().await, 1, "an unchanged need keeps the ack");
+    assert_eq!(needs_of(&mut bob).await[0]["acked"], true);
+
+    // The score rises to 92: the ack is spent.
+    MODE.store(3, Ordering::SeqCst);
+    let s3 = wait_need(&poller, &w, Some(s2.fetched_at), "disk", Level::Warn, 92.0).await;
+    assert_eq!(
+        w.acks().await,
+        0,
+        "the ack of a need that got worse is deleted"
+    );
+    assert_eq!(needs_of(&mut bob).await[0]["acked"], false);
+
+    // It eases to 88 again: still shown, the ack does not come back.
+    MODE.store(1, Ordering::SeqCst);
+    let s4 = wait_need(&poller, &w, Some(s3.fetched_at), "disk", Level::Warn, 88.0).await;
+    assert_eq!(needs_of(&mut bob).await[0]["acked"], false);
+
+    // The same for the level: acknowledged at warn, it turns bad, then warn again.
+    assert_eq!(ack(&mut bob, w.blog, "disk").await.status, StatusCode::OK);
+    assert_eq!(needs_of(&mut bob).await[0]["acked"], true);
+    MODE.store(4, Ordering::SeqCst);
+    let s5 = wait_need(&poller, &w, Some(s4.fetched_at), "disk", Level::Bad, 88.0).await;
+    assert_eq!(w.acks().await, 0);
+    assert_eq!(needs_of(&mut bob).await[0]["acked"], false);
+    MODE.store(1, Ordering::SeqCst);
+    wait_need(&poller, &w, Some(s5.fetched_at), "disk", Level::Warn, 88.0).await;
+    assert_eq!(
+        needs_of(&mut bob).await[0]["acked"],
+        false,
+        "still shown after it eased"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_poller_cuts_a_future_date_back_and_makes_a_score_that_is_no_number_zero() {
+    let _mode = MODE_LOCK.lock().await;
+    let w = world().await;
+    tokio::time::pause();
+    MODE.store(5, Ordering::SeqCst);
+    let poller = flaky_poller(&w);
+    let s = wait_poller(&poller, w.blog, None, |s| !s.needs.is_empty()).await;
+    assert_eq!(s.needs[0].key, "late");
+    assert_eq!(
+        s.needs[0].since,
+        Some(s.fetched_at),
+        "no later than the reading"
+    );
+    assert_eq!(s.needs[0].score, 0.0);
+
+    MODE.store(6, Ordering::SeqCst);
+    let s = wait_poller(&poller, w.blog, Some(s.fetched_at), |s| {
+        s.needs.iter().any(|n| n.key == "early")
+    })
+    .await;
+    let since = s.needs[0].since.unwrap();
+    assert!(
+        since < s.fetched_at,
+        "a date before the reading is the kind's to give"
+    );
+}
+
+#[tokio::test]
+async fn a_score_that_is_no_number_is_stored_as_zero_and_still_hides() {
+    let w = world().await;
+    let mut bob = w.viewer("bob").await;
+    w.set(w.blog, vec![need("odd", Level::Warn, f64::NAN, "Blog")]);
+    assert_eq!(ack(&mut bob, w.blog, "odd").await.status, StatusCode::OK);
+    let stored: f64 = w
+        .app
+        .magpie
+        .core
+        .with_conn(|c| c.query_row("SELECT score FROM acks", [], |r| r.get(0)))
+        .await
+        .unwrap();
+    assert_eq!(stored, 0.0);
+    assert_eq!(needs_of(&mut bob).await[0]["acked"], true);
+    // And straight through the table function.
+    let bob_id = user_id(&w.app, "bob").await;
+    mindful_magpie::needs::ack(
+        &w.app.magpie.core,
+        bob_id,
+        w.blog,
+        "inf",
+        Level::Bad,
+        f64::INFINITY,
+    )
+    .await
+    .unwrap();
+    let acks = mindful_magpie::needs::acks_of(&w.app.magpie.core, bob_id)
+        .await
+        .unwrap();
+    assert_eq!(acks[&(w.blog, "inf".to_string())].score, 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// A rename reaches the picker
+
+#[tokio::test]
+async fn a_renamed_service_that_no_card_uses_is_sent_again_with_its_new_name() {
+    let w = world().await;
+    let bob = w.viewer("bob").await;
+    let wiki = service(&w.app, "Wiki", Visibility::All, &[]).await;
+    let mut live = open_live(&bob).await;
+    live.event().await;
+    tokio::time::pause();
+    store::update(
+        &w.app.magpie.core,
+        wiki,
+        &input("Handbook", Visibility::All, &[]),
+    )
+    .await
+    .unwrap();
+    w.app
+        .magpie
+        .service_events
+        .send(ServiceEvent::Updated(wiki))
+        .ok();
+    let update = live.event().await;
+    let added: Vec<(i64, String)> = update["services_add"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| {
+            (
+                v["id"].as_i64().unwrap(),
+                v["name"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(added, vec![(wiki, "Handbook".to_string())]);
+    // The set of visible services did not change.
+    assert!(update.get("services_visible").is_none(), "{update}");
+    live.nothing().await;
 }

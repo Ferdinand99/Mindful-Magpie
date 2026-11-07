@@ -716,7 +716,8 @@ export const NEEDS_UNACK_URL = "/start/needs/unack";
  * the acknowledged ones. The server answers with the person's new list; it goes
  * through `deps.apply` (initLive's, which writes `#mm-values` and updates the row
  * in place) at once, and the person's other tabs get it from their streams. A
- * refusal or a failure changes nothing and is said in the row's live region.
+ * refusal or a failure changes nothing and is said in the row's live region
+ * («already cleared» when the need is gone, else «try again»).
  *
  * The one place focus is moved: the person pressed the button, so it is given to
  * what took its place (the next chip, or the toggle when none is left), not left on
@@ -729,10 +730,10 @@ export function initNeeds(doc, deps = {}) {
   const request = deps.fetch ?? ((...args) => (win?.fetch ?? globalThis.fetch)(...args));
   let busy = false;
 
-  function fail() {
+  function fail(key) {
     const labels = readJson(doc, "mm-labels") ?? {};
     const live = doc.querySelector("#groups .mm-needs-live");
-    if (live) live.textContent = typeof labels.need_ack_failed === "string" ? labels.need_ack_failed : "";
+    if (live) live.textContent = typeof labels[key] === "string" ? labels[key] : "";
   }
 
   /** Gives the focus to what took the place of the need the person pressed the button of. */
@@ -777,10 +778,11 @@ export function initNeeds(doc, deps = {}) {
         deps.apply({ full: false, services: {}, removed: [], needs: body.needs });
         refocus(index, key, service, acknowledged);
       } else {
-        fail();
+        // 404: the need is gone (it cleared, or the service is no longer the person's).
+        fail(response.status === 404 ? "need_gone" : "need_ack_failed");
       }
     } catch {
-      fail();
+      fail("need_ack_failed");
     } finally {
       busy = false;
       button.removeAttribute("aria-disabled");
