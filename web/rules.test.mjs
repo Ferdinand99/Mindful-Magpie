@@ -105,7 +105,7 @@ test("parsePath_reads_server_paths", () => {
   assert.equal(parsePath("background.name").kind, "background");
 });
 
-// Service bindings mirror `validate` in src/layout/model.rs (Plan 4, task 3b).
+// Service bindings mirror `validate` in src/layout/model.rs.
 test("a_card_without_a_service_or_with_one_to_four_metrics_passes", () => {
   assert.deepEqual(checkCard({ ...ok, service: null }), {});
   assert.deepEqual(checkCard({ ...ok, service: undefined }), {});

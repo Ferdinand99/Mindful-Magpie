@@ -15,8 +15,10 @@
 > links and services. Today it has first-run setup, sign-in, users and roles, two-factor sign-in and passkeys, API
 > tokens, and a start page you build yourself in the browser, in the Hedgerow design: groups of link cards, bookmark
 > pills, a clock and one of four backgrounds or your own picture, with an edit mode on the page (drag and drop, or
-> the keyboard). A Firefox extension (`extension/`) shows the same page in the new tab. Widgets, the status row and
-> the apps follow. It is part of the Hedgerow family and is built on
+> the keyboard). A Firefox extension (`extension/`) shows the same page in the new tab. An admin sets up
+> services under Settings → Services (a website check, «Nettside», for now); a card can show a service's live
+> numbers, which stay current through an event stream, and the «Trenger deg» row lists what needs you, with
+> acknowledgements. More kinds of service follow. It is part of the Hedgerow family and is built on
 > [vole-kit](https://github.com/Ferdinand99/Vigilant-Vole), the shared kit that brings sign-in, users, setup,
 > translations and the design system. Nothing is released yet. The spike that settled the new-tab approach is in
 > [`docs/spike-findings.md`](docs/spike-findings.md).
@@ -35,7 +37,9 @@ The first start logs a setup link (`/setup?token=...`); open it to create the fi
 the released image on `http://localhost:3010`, and has a commented `build: .` line to use your own build.
 
 The image is a single static binary on Alpine. Data lives in `/data` (the database `magpie.sqlite`, the session key
-and pre-migration backups). The container starts as root only to hand `/data` to its `magpie` user; set `PUID` and
+and pre-migration backups). The session key also seals the keys of your services, so back up `/data` as a
+whole: a database restored without its session key keeps the services but can no longer read their keys (you
+type them again). The container starts as root only to hand `/data` to its `magpie` user; set `PUID` and
 `PGID` to run as another uid and gid.
 
 | Flag | Variable | Default | What |
@@ -63,6 +67,10 @@ startup). Without `MM_TRUST_PROXY=1` Magpie sees every request as coming from th
 keyed to the proxy's address, so one person's failed attempts lock out everyone (the same goes for the rate limit of the
 browser extension's token endpoint, which is per client address), and Magpie cannot tell that the
 request came in over HTTPS, so it sends no HSTS header.
+
+The live numbers and the «Trenger deg» row reach the page through a server-sent event stream (`/start/live`),
+so the proxy must not buffer that response: turn proxy buffering off (nginx: `proxy_buffering off;` for the
+location, or for the whole site). With buffering on, the page still works but updates late or in bursts.
 
 ## Develop
 

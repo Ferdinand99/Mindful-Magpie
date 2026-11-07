@@ -947,7 +947,7 @@ function applyBackground(doc, background, opts) {
  *     format }] }]`, the services the viewer can see. A bound id that is not in
  *     the list gets the notice `service_missing`; the card keeps its link.
  *   - `opts.values`: `{ now, services: { "<id>": { name, kind, interval_s,
- *     status, values: { "<metric>": { num, text } }, needs, fetched_at,
+ *     status, values: { "<metric>": { num, text } }, fetched_at,
  *     error_label? } } }`. `now` and `fetched_at` are ISO 8601 strings or epoch
  *     seconds; ages count from `now`, never from the clock, so a page can draw
  *     the same thing twice. A service with no entry shows `service_waiting`.

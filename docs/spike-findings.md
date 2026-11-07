@@ -1,7 +1,7 @@
 # Spike findings
 
 A spike before the real build: does a Firefox extension's new-tab page behave like a start page should, with the
-address bar keeping focus and the page loading fast from a self-hosted server? The owner tested it on 2026-11-07.
+address bar keeping focus and the page loading fast from a self-hosted server? It was tested on 2026-11-07.
 
 ## Windows PC, Firefox
 
@@ -22,7 +22,7 @@ address bar keeping focus and the page loading fast from a self-hosted server? T
 - The new-tab page must never move focus: no `autofocus`, no `.focus()`. The start page of the server follows the
   same rule (a test guards it).
 
-## Deferred to phase 9
+## Not covered by the spike
 
-The offline and unauthorised-state checks and the Mac checks were not done in the spike. By the owner's decision they
-move to phase 9 (the extension and its browsers), where they are tested against the real extension.
+The offline and unauthorised-state checks and the Mac checks were not done in the spike. They are left to the tests of the
+real extension and its browsers.

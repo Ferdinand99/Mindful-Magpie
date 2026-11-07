@@ -543,7 +543,7 @@ test("odd_values_and_services_do_not_throw", () => {
   }
 });
 
-// ---- fix round 1 ----
+// ---- edge cases: rounding, signs, clocks and repeated metrics ----
 
 test("bytes_decide_the_decimal_after_rounding", () => {
   assert.equal(formatValue(num(10209), "bytes", "en"), "10 KiB", "9.97 KiB rounds to 10");
