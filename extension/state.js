@@ -10,7 +10,7 @@ export const statusText = {
   cached: "Oppdaterer …",
   offline: "Frakoblet – viser sist lagrede",
   unauthorized: "Ugyldig token – se innstillingene",
-  empty: "Ikke koblet til – åpne innstillingene",
+  empty: "Ikke koblet til",
 };
 
 // A payload is usable only if it has the layout document's shape; anything else is treated as

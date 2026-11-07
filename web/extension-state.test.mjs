@@ -179,7 +179,7 @@ test("status texts are the four Norwegian lines and carry no secrets", () => {
   assert.equal(statusText.fresh, "Oppdatert");
   assert.equal(statusText.offline, "Frakoblet – viser sist lagrede");
   assert.equal(statusText.unauthorized, "Ugyldig token – se innstillingene");
-  assert.equal(statusText.empty, "Ikke koblet til – åpne innstillingene");
+  assert.equal(statusText.empty, "Ikke koblet til");
   assert.equal(typeof statusText.cached, "string");
   for (const text of Object.values(statusText)) assert.equal(text.includes("Bearer"), false);
 });

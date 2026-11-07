@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { parseHTML } from "linkedom";
-import { renderPlaceholder, renderStatus } from "../extension/placeholder.js";
+import { renderStatus } from "../extension/status.js";
 import { statusText } from "../extension/state.js";
 import { start } from "../extension/newtab-core.js";
 
@@ -12,38 +12,6 @@ const newDoc = () =>
 const layout = (groups) => ({ version: 1, background: { kind: "preset", name: "dusk" }, groups, bookmarks: [] });
 const card = (title) => ({ id: title, title, description: "", url: "https://x.example", icon: { colour: "mint" } });
 const read = (name) => readFileSync(new URL(`../extension/${name}`, import.meta.url), "utf8");
-
-test("placeholder lists group titles and card titles", () => {
-  const doc = newDoc();
-  const root = doc.getElementById("body");
-  renderPlaceholder(root, layout([
-    { id: "g1", title: "Work", cards: [card("Wiki"), card("Mail")] },
-    { id: "g2", title: "Home", cards: [card("Router")] },
-  ]));
-  assert.deepEqual([...root.querySelectorAll("h2")].map((e) => e.textContent), ["Work", "Home"]);
-  assert.deepEqual([...root.querySelectorAll("li")].map((e) => e.textContent), ["Wiki", "Mail", "Router"]);
-});
-
-test("placeholder renders titles as text only", () => {
-  const doc = newDoc();
-  const root = doc.getElementById("body");
-  const evil = '<script>window.pwned=1</script><img src=x onerror="pwned=2">';
-  renderPlaceholder(root, layout([{ id: "g", title: evil, cards: [card(evil)] }]));
-  assert.equal(root.querySelectorAll("script, img").length, 0);
-  assert.equal(root.querySelector("h2").textContent, evil);
-  assert.equal(root.querySelector("li").textContent, evil);
-  assert.equal(root.querySelector("a"), null);
-});
-
-test("placeholder with no data or no groups renders nothing and replaces earlier content", () => {
-  const doc = newDoc();
-  const root = doc.getElementById("body");
-  renderPlaceholder(root, layout([{ id: "g", title: "Old", cards: [] }]));
-  renderPlaceholder(root, null);
-  assert.equal(root.childNodes.length, 0);
-  renderPlaceholder(root, layout([]));
-  assert.equal(root.childNodes.length, 0);
-});
 
 test("status line shows the Norwegian text for each status", () => {
   const doc = newDoc();
@@ -55,22 +23,34 @@ test("status line shows the Norwegian text for each status", () => {
   }
 });
 
-test("empty status is a link that opens the options page on click", () => {
+test("the not-connected status has a «Koble til Magpie» button that opens the options page", () => {
   const doc = newDoc();
   const el = doc.getElementById("status");
   let opened = 0;
   renderStatus(el, "empty", () => { opened += 1; });
-  const link = el.querySelector("a");
-  assert.ok(link);
-  assert.equal(link.textContent, statusText.empty);
+  assert.equal(el.textContent.startsWith(statusText.empty), true);
+  const button = el.querySelector("button");
+  assert.ok(button);
+  assert.equal(button.getAttribute("type"), "button");
+  assert.equal(button.textContent, "Koble til Magpie");
+  assert.equal(el.querySelector("a"), null);
   let prevented = false;
   const event = doc.createEvent("Event");
   event.initEvent("click", true, true);
   const original = event.preventDefault.bind(event);
   event.preventDefault = () => { prevented = true; original(); };
-  link.dispatchEvent(event);
+  button.dispatchEvent(event);
   assert.equal(opened, 1);
   assert.equal(prevented, true);
+});
+
+test("no other status has a button, and a redraw replaces the button", () => {
+  const doc = newDoc();
+  const el = doc.getElementById("status");
+  renderStatus(el, "empty", () => {});
+  renderStatus(el, "fresh", () => {});
+  assert.equal(el.querySelector("button"), null);
+  assert.equal(el.textContent, statusText.fresh);
 });
 
 test("new-tab page keeps address-bar focus: no inputs, no autofocus, no inline script or style, no focus()", () => {
@@ -82,7 +62,7 @@ test("new-tab page keeps address-bar focus: no inputs, no autofocus, no inline s
   for (const s of doc.querySelectorAll("script")) {
     assert.ok(s.getAttribute("src"), "script must be external");
   }
-  for (const file of ["newtab.js", "newtab-core.js", "placeholder.js"]) {
+  for (const file of ["newtab.js", "newtab-core.js", "newtab-view.js", "status.js", "background.js", "labels.js"]) {
     assert.equal(/\.focus\s*\(/.test(read(file)), false, `${file} must not call focus()`);
   }
 });
@@ -98,7 +78,10 @@ test("manifest meets the shell requirements", () => {
   assert.deepEqual(m.options_ui, { page: "options.html", open_in_tab: true });
   assert.deepEqual(m.permissions, ["storage", "identity"]);
   assert.deepEqual(m.optional_host_permissions, ["*://*/*"]);
-  assert.equal(m.content_security_policy.extension_pages, "script-src 'self'; object-src 'self';");
+  assert.equal(
+    m.content_security_policy.extension_pages,
+    "script-src 'self'; object-src 'self'; img-src 'self' blob:;",
+  );
   assert.equal(m.content_security_policy.extension_pages.includes("upgrade-insecure-requests"), false);
   assert.deepEqual(Object.keys(m.icons).sort(), ["128", "48", "96"]);
   assert.equal(m.host_permissions, undefined);

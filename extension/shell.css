@@ -1,13 +1,9 @@
 /* The look of the extension pages: the Hedgerow dark theme with the soft colour fields of the
-   start page (static/magpie.css, html:has(.wall)) behind glass cards. The colours are the dark
-   values of the family design system. */
+   start page (static/magpie.css, html:has(.wall)) behind glass cards. The design tokens (--bg,
+   --text, --muted, --line, --r-lg ...) come from vendor/tokens.css, the kit's values; the pages
+   always use the dark ones. The start page itself is drawn by vendor/render.css. */
 :root {
   color-scheme: dark;
-  --bg: #0b0b0d;
-  --text: #f5f5f7;
-  --muted: #a1a1a6;
-  --line: rgba(255, 255, 255, 0.08);
-  --r-lg: 18px;
   --mint: #63e6e2;
 }
 
@@ -49,37 +45,15 @@ body {
   color: var(--muted);
   font-size: 0.9rem;
 }
-.status a {
+.status .connect {
+  margin-inline-start: 0.5rem;
+  padding: 0.25rem 0.75rem;
   color: var(--text);
-  text-decoration: underline;
-}
-
-.body {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr));
-  gap: 1rem;
-}
-.body section {
-  background: rgba(28, 28, 31, 0.55);
+  background: rgba(255, 255, 255, 0.08);
   border: 1px solid var(--line);
-  border-radius: var(--r-lg);
-  padding: 1rem 1.25rem;
-  -webkit-backdrop-filter: saturate(180%) blur(24px);
-  backdrop-filter: saturate(180%) blur(24px);
-}
-.body h2 {
-  margin: 0 0 0.5rem;
-  font-size: 1rem;
-  color: var(--mint);
-}
-.body ul {
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-.body li {
-  padding: 0.2rem 0;
-  overflow-wrap: anywhere;
+  border-radius: 10px;
+  font: inherit;
+  cursor: pointer;
 }
 
 /* Options page */
@@ -113,7 +87,7 @@ body {
 }
 .card input:focus-visible,
 .card button:focus-visible,
-.status a:focus-visible {
+.status .connect:focus-visible {
   outline: 2px solid #8b7dff;
   outline-offset: 2px;
 }

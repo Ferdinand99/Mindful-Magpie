@@ -1,5 +1,6 @@
 // The start-up sequence of the new-tab page without any page code, so node --test can drive it
-// with fakes. storage is browser.storage, draw(view) paints the status line and the body.
+// with fakes. storage is browser.storage, draw(view, { serverUrl, token }) paints the status line
+// and the body; the connection is for what the body fetches itself (image backgrounds).
 //
 // A storage failure never leaves the page blank: a failed read draws the "not connected" state, a
 // failed write is ignored because the page is already drawn.
@@ -13,12 +14,13 @@ export async function start({ storage, fetchImpl, draw }) {
     stored = {};
   }
   const cached = isValidData(stored.last) ? stored.last : null;
+  const conn = { serverUrl: stored.serverUrl, token: stored.token };
   // First paint from the cache, before any network.
-  draw(nextView(cached, undefined));
+  draw(nextView(cached, undefined), conn);
 
   const result = await fetchData(fetchImpl, stored.serverUrl, stored.token);
   const view = nextView(cached, result);
-  draw(view);
+  draw(view, conn);
   if (view.status === "fresh") {
     try {
       await storage.local.set({ last: view.data });
