@@ -359,6 +359,101 @@ async fn a_request_without_the_image_field_is_a_bad_request() {
         .unwrap();
     let res = web.send(req).await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    // A body that is not multipart gets the same JSON answer, not plain text.
+    assert_eq!(res.json(), json!({ "error": "bad_request" }));
+
+    // Nor does a multipart type without a boundary.
+    let req = Request::post("/start/background")
+        .header(header::ORIGIN, format!("http://{HOST}"))
+        .header("hx-request", "true")
+        .header(header::CONTENT_TYPE, "multipart/form-data")
+        .body(Body::from("x"))
+        .unwrap();
+    let res = web.send(req).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    assert_eq!(res.json(), json!({ "error": "bad_request" }));
+}
+
+#[tokio::test]
+async fn a_failed_upload_never_removes_the_picture_there_was() {
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    let uid = user_id(&app, "ada").await;
+    let old = png(b"the one to keep");
+    let id = upload_ok(&mut web, &old).await;
+
+    // The database stops answering for the table (the upsert and the read of
+    // the row after it both fail, as they do under a broken or busy database).
+    app.exec("ALTER TABLE backgrounds RENAME TO backgrounds_away".into())
+        .await;
+    let res = upload(&mut web, &png(b"a new one")).await;
+    assert_eq!(
+        res.status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{}",
+        res.body
+    );
+    // The old file is still there: nothing was pruned on a guess.
+    assert!(
+        files_of(&app, uid).contains(&format!("{id}.png")),
+        "{:?}",
+        files_of(&app, uid)
+    );
+
+    // The table is back: the old picture is still the user's, and serves.
+    app.exec("ALTER TABLE backgrounds_away RENAME TO backgrounds".into())
+        .await;
+    let img = image_as(&app, &web, &id).await;
+    assert_eq!(img.status, StatusCode::OK);
+    assert_eq!(img.body, old);
+
+    // The new file the failed upload left is the sweep's to remove.
+    let app = {
+        drop(web);
+        app.restart().await
+    };
+    assert_eq!(files_of(&app, uid), vec![format!("{id}.png")]);
+}
+
+#[tokio::test]
+async fn an_upload_whose_client_went_away_still_finishes() {
+    let app = App::new().await;
+    let uid = add_user(&app, "ada", "admin").await;
+    let data = png(b"stored although nobody waits");
+    let id = mindful_magpie::layout::background::image_id(&data);
+
+    // Start the upload and drop it at its first wait, as a closing
+    // connection does with the handler.
+    let mut upload = Box::pin(app.magpie.backgrounds.store(
+        &app.magpie.core,
+        uid,
+        mindful_magpie::layout::Kind::Png,
+        axum::body::Bytes::from(data.clone()),
+    ));
+    tokio::select! {
+        biased;
+        _ = &mut upload => panic!("finished without waiting"),
+        () = std::future::ready(()) => {}
+    }
+    drop(upload);
+
+    // It completes on its own: the row and the file agree, nothing is left over.
+    let mut waited = 0;
+    while app.count("SELECT COUNT(*) FROM backgrounds").await == 0 {
+        assert!(waited < 100, "the upload never finished");
+        waited += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    app.magpie
+        .backgrounds
+        .reconcile(&app.magpie.core)
+        .await
+        .unwrap();
+    assert_eq!(files_of(&app, uid), vec![format!("{id}.png")]);
+    assert_eq!(
+        std::fs::read(dir_of(&app, uid).join(format!("{id}.png"))).unwrap(),
+        data
+    );
 }
 
 #[tokio::test]

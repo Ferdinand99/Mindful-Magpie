@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use askama::Template;
 use axum::body::Bytes;
+use axum::extract::multipart::MultipartRejection;
 use axum::extract::{DefaultBodyLimit, Extension, Multipart, Path, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::Next;
@@ -339,8 +340,13 @@ async fn upload_background(
     State(core): State<Core>,
     Extension(magpie): Extension<Magpie>,
     user: CurrentUser,
-    mut multipart: Multipart,
+    multipart: Result<Multipart, MultipartRejection>,
 ) -> ApiResult<Response> {
+    // A body that is not multipart (or has no boundary) gets the same JSON
+    // answer as the other bad requests, not axum's plain text.
+    let Ok(mut multipart) = multipart else {
+        return Ok(error_json(StatusCode::BAD_REQUEST, "bad_request"));
+    };
     let data = loop {
         match multipart.next_field().await {
             Ok(Some(field)) if field.name() == Some("image") => match field.bytes().await {
@@ -361,7 +367,7 @@ async fn upload_background(
     };
     let id = magpie
         .backgrounds
-        .store(&core, user.id, kind, &data)
+        .store(&core, user.id, kind, data)
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(json!({ "id": id })).into_response())

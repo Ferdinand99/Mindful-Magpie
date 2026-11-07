@@ -24,7 +24,9 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use axum::body::Bytes;
 use rusqlite::{OptionalExtension as _, TransactionBehavior, params};
 use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncWriteExt as _;
@@ -103,6 +105,8 @@ pub enum BackgroundError {
     Db(#[from] DbError),
     #[error("background file: {0}")]
     Io(#[from] io::Error),
+    #[error("the background task did not finish: {0}")]
+    Task(#[from] tokio::task::JoinError),
 }
 
 /// The file's name inside the user's directory.
@@ -114,7 +118,7 @@ fn file_name(id: &str, kind: Kind) -> String {
 #[derive(Debug)]
 pub struct Backgrounds {
     root: PathBuf,
-    lock: Mutex<()>,
+    lock: Arc<Mutex<()>>,
 }
 
 impl Backgrounds {
@@ -122,7 +126,7 @@ impl Backgrounds {
     pub fn new(data_dir: &Path) -> Backgrounds {
         Backgrounds {
             root: data_dir.join("backgrounds"),
-            lock: Mutex::new(()),
+            lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -132,45 +136,24 @@ impl Backgrounds {
 
     /// Keeps `data` (a picture of `kind`) as the user's background and returns
     /// its id. The previous picture is gone once this returns.
+    ///
+    /// The work runs in a task of its own that holds the lock: a client that
+    /// goes away (which drops this future) cannot stop it between the write
+    /// and the commit, where a sweep could otherwise remove the new file.
     pub async fn store(
         &self,
         core: &Core,
         user_id: i64,
         kind: Kind,
-        data: &[u8],
+        data: Bytes,
     ) -> Result<String, BackgroundError> {
-        let _guard = self.lock.lock().await;
-        let id = image_id(data);
-        let name = file_name(&id, kind);
-        let dir = self.user_dir(user_id);
-        write_atomically(&dir, &name, data).await?;
-
-        let (row_id, mime) = (id.clone(), kind.mime());
-        let size = i64::try_from(data.len()).unwrap_or(i64::MAX);
-        let now = jiff::Timestamp::now().to_string();
-        let stored = db::interact(&core.db, move |c| {
-            c.execute(
-                "INSERT INTO backgrounds (user_id, id, mime, bytes, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(user_id) DO UPDATE SET
-                     id = excluded.id, mime = excluded.mime,
-                     bytes = excluded.bytes, created_at = excluded.created_at",
-                params![user_id, row_id, mime, size, now],
-            )
-        })
-        .await;
-        // Whether or not the row is in, what the row names is the one file to
-        // keep: after a failure that is the previous picture.
-        let keep = match &stored {
-            Ok(_) => Some(name),
-            Err(_) => self.row_file(core, user_id).await,
-        };
-        match keep {
-            Some(keep) => prune(&dir, &keep).await,
-            None => remove_dir(&dir).await,
-        }
-        stored?;
-        Ok(id)
+        let guard = Arc::clone(&self.lock).lock_owned().await;
+        let (core, dir) = (core.clone(), self.user_dir(user_id));
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            store_locked(&core, &dir, user_id, kind, &data).await
+        });
+        task.await?
     }
 
     /// The user's picture when `id` is its id: its kind and bytes. `None` when
@@ -203,53 +186,16 @@ impl Backgrounds {
     /// goes back to the default preset (and its version moves on, so a tab
     /// with the old copy gets a conflict). Returns the layout's stored version
     /// (0 when none is stored).
+    ///
+    /// Like [`Backgrounds::store`], it finishes in a task of its own.
     pub async fn remove(&self, core: &Core, user_id: i64) -> Result<u64, BackgroundError> {
-        let _guard = self.lock.lock().await;
-        let version = db::interact(&core.db, move |c| {
-            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute(
-                "DELETE FROM backgrounds WHERE user_id = ?1",
-                params![user_id],
-            )?;
-            let row: Option<(i64, String)> = tx
-                .query_row(
-                    "SELECT version, doc FROM layouts WHERE user_id = ?1",
-                    params![user_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            let Some((version, doc)) = row else {
-                tx.commit()?;
-                return Ok(0);
-            };
-            let mut version = u64::try_from(version).unwrap_or_default();
-            // A layout that cannot be read is left as it is (the page offers
-            // to start over); one on a preset keeps the preset.
-            if let Ok(mut layout) = serde_json::from_str::<Layout>(&doc)
-                && matches!(layout.background, Background::Image { .. })
-            {
-                version += 1;
-                layout.version = version;
-                layout.background = Layout::default().background;
-                let doc = serde_json::to_string(&layout)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-                tx.execute(
-                    "UPDATE layouts SET version = ?2, doc = ?3, updated_at = ?4
-                     WHERE user_id = ?1",
-                    params![
-                        user_id,
-                        i64::try_from(version).unwrap_or(i64::MAX),
-                        doc,
-                        jiff::Timestamp::now().to_string()
-                    ],
-                )?;
-            }
-            tx.commit()?;
-            Ok(version)
-        })
-        .await?;
-        remove_dir(&self.user_dir(user_id)).await;
-        Ok(version)
+        let guard = Arc::clone(&self.lock).lock_owned().await;
+        let (core, dir) = (core.clone(), self.user_dir(user_id));
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            remove_locked(&core, &dir, user_id).await
+        });
+        task.await?
     }
 
     /// Removes the files no row accounts for: the directory of a user who has
@@ -302,12 +248,110 @@ impl Backgrounds {
         }
         Ok(())
     }
+}
 
-    /// The file the user's row names, if there is a row.
-    async fn row_file(&self, core: &Core, user_id: i64) -> Option<String> {
-        let (id, mime) = meta(core, user_id).await.ok().flatten()?;
-        Some(file_name(&id, Kind::from_mime(&mime)?))
+/// The body of [`Backgrounds::store`], with the lock held.
+async fn store_locked(
+    core: &Core,
+    dir: &Path,
+    user_id: i64,
+    kind: Kind,
+    data: &[u8],
+) -> Result<String, BackgroundError> {
+    let id = image_id(data);
+    let name = file_name(&id, kind);
+    write_atomically(dir, &name, data).await?;
+
+    let (row_id, mime) = (id.clone(), kind.mime());
+    let size = i64::try_from(data.len()).unwrap_or(i64::MAX);
+    let now = jiff::Timestamp::now().to_string();
+    let stored = db::interact(&core.db, move |c| {
+        c.execute(
+            "INSERT INTO backgrounds (user_id, id, mime, bytes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 id = excluded.id, mime = excluded.mime,
+                 bytes = excluded.bytes, created_at = excluded.created_at",
+            params![user_id, row_id, mime, size, now],
+        )
+    })
+    .await;
+    // What the row names is the one file to keep. After a failed upsert that
+    // is the previous picture, or nothing when there was none. When the row
+    // cannot be read either (a busy or broken database), nothing is known
+    // about what to keep, so nothing is removed: the next sweep decides.
+    let keep = match &stored {
+        Ok(_) => Ok(Some(name)),
+        Err(_) => row_file(core, user_id).await,
+    };
+    match keep {
+        Ok(Some(keep)) => prune(dir, &keep).await,
+        Ok(None) => remove_dir(dir).await,
+        Err(err) => {
+            tracing::warn!(
+                user = user_id,
+                "leaving the background files to the sweep: {err}"
+            );
+        }
     }
+    stored?;
+    Ok(id)
+}
+
+/// The body of [`Backgrounds::remove`], with the lock held.
+async fn remove_locked(core: &Core, dir: &Path, user_id: i64) -> Result<u64, BackgroundError> {
+    let version = db::interact(&core.db, move |c| {
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM backgrounds WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        let row: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT version, doc FROM layouts WHERE user_id = ?1",
+                params![user_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((version, doc)) = row else {
+            tx.commit()?;
+            return Ok(0);
+        };
+        let mut version = u64::try_from(version).unwrap_or_default();
+        // A layout that cannot be read is left as it is (the page offers
+        // to start over); one on a preset keeps the preset.
+        if let Ok(mut layout) = serde_json::from_str::<Layout>(&doc)
+            && matches!(layout.background, Background::Image { .. })
+        {
+            version += 1;
+            layout.version = version;
+            layout.background = Layout::default().background;
+            let doc = serde_json::to_string(&layout)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            tx.execute(
+                "UPDATE layouts SET version = ?2, doc = ?3, updated_at = ?4
+                     WHERE user_id = ?1",
+                params![
+                    user_id,
+                    i64::try_from(version).unwrap_or(i64::MAX),
+                    doc,
+                    jiff::Timestamp::now().to_string()
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(version)
+    })
+    .await?;
+    remove_dir(dir).await;
+    Ok(version)
+}
+
+/// The file the user's row names: `Ok(None)` when there is no row (or it names
+/// a type Magpie does not keep), an error when the row could not be read.
+async fn row_file(core: &Core, user_id: i64) -> Result<Option<String>, DbError> {
+    let row = meta(core, user_id).await?;
+    Ok(row.and_then(|(id, mime)| Some(file_name(&id, Kind::from_mime(&mime)?))))
 }
 
 /// The user's row: id and mime type.
