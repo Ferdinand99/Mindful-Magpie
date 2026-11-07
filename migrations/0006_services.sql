@@ -3,8 +3,10 @@
 -- service sealed with vole_kit::crypto (purpose magpie.service.secret) and is
 -- never read back into a page. `visibility` says who sees the service: every
 -- signed-in user, admins only, or admins plus the users in `service_users`.
+-- AUTOINCREMENT: an id is never used again, because acknowledgements, stored
+-- snapshots and live streams refer to a service by its id.
 CREATE TABLE services (
-    id         INTEGER PRIMARY KEY,
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
     kind       TEXT NOT NULL,
     name       TEXT NOT NULL,
     url        TEXT,

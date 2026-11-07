@@ -243,3 +243,4 @@ secret = "Nøkkelen kan ikke leses – skriv den inn på nytt"
 
 [need]
 http_down = "{name} svarer ikke"
+service_config = "{name} må settes opp på nytt"

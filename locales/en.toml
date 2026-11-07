@@ -243,3 +243,4 @@ secret = "The secret can no longer be read - type it again"
 
 [need]
 http_down = "{name} is not answering"
+service_config = "{name} needs to be set up again"
