@@ -3,6 +3,10 @@
 
 #![allow(dead_code)]
 
+pub mod locale;
+pub mod log;
+pub mod stub;
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
