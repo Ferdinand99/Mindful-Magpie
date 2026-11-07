@@ -1,8 +1,9 @@
 # Mindful Magpie for Firefox
 
-A Firefox extension (Manifest V3, Firefox 128 or newer) that replaces the new tab page with your
+A Firefox extension (Manifest V3, Firefox 140 or newer) that replaces the new tab page with your
 Mindful Magpie start page. It keeps the last layout in `browser.storage.local`, so a new tab
 paints at once, and then fetches `GET {server}/api/v1/me/start` with a read-scoped API token.
+Cards that are bound to a service also show its live numbers (see "Service values").
 
 The new tab draws the layout with the same renderer as the web start page (`static/magpie/render.js`
 and `render.css`), copied into `extension/vendor/` by `web/build-extension.mjs`. Links open in the
@@ -41,6 +42,35 @@ Never edit them by hand. After a change to the renderer (or to `web/kit-tokens.c
 `npm run build:extension` in `web/` and commit the result. CI runs the script and fails on any
 difference (`git diff --exit-code`), and `web/extension-vendor.test.mjs` checks the same.
 
+## Service values
+
+Cards bound to a service show its numbers, status dot and age, as on the web
+start page. `/api/v1/me/start` carries the service catalogue (`services`); `GET
+{server}/api/v1/me/values` carries the numbers. Both are fetched with the same token.
+
+- A new tab draws the cached layout, catalogue and values at once, then fetches the layout and the
+  values together. While the tab is visible the values are fetched again every 30 seconds (an
+  `EventSource` cannot send the token, so there is no stream); a hidden tab does not fetch.
+- A refresh uses the renderer's `updateValues`, which keeps the card elements, so the address bar
+  keeps focus. The renderer counts ages from the server's clock (`values.now`); the extension keeps
+  the offset between that clock and the device clock and moves ages on with it.
+- When the values fetch fails, the cached numbers stay and the status line reads «Frakoblet – viser
+  sist lagrede»; the renderer dims numbers that are older than three intervals. A 401 or 403 reads
+  «Ugyldig token – se innstillingene» and stops the refresh until the next new tab.
+- A server from before the values API answers 404: the page is drawn without numbers and the server
+  is asked again after five minutes at the earliest.
+- The extension cannot acknowledge anything: its token is read-only, and a card with numbers
+  opens its link like any other card.
+
+## Privacy and storage
+
+`browser.storage.local` holds the server address, the token, the last layout, the service catalogue
+that came with it (service names and metric labels), the last service values (names, numbers and
+status) and the clock offset. The storage is private to the extension and is not synced. All of it
+is dropped when the server address or the token changes. The extension sends nothing anywhere
+except to the configured server, and it collects no data (`data_collection_permissions` is
+`none`).
+
 ## Image backgrounds
 
 The renderer points `--mm-bg-image` at `{origin}/start/background/{id}`. An extension page cannot
@@ -63,12 +93,14 @@ fails, the background is the `hedgerow` preset.
 
 ## Layout
 
-- `state.js`: view logic, response handling and the fetch (pure, tested).
+- `state.js`: view logic, response handling and the fetches of the layout and the values (pure,
+  tested).
 - `connect.js`: the connect flow's pure functions (tested).
 - `options-core.js`: address check, permission request, connection test, save and connect (tested).
-- `newtab-core.js`: the new-tab start-up sequence with injected dependencies (tested).
-- `newtab-view.js`: draws the status line and the layout with the vendored renderer, and the image
-  background (tested).
+- `newtab-core.js`: the new-tab start-up and 30 s values refresh with injected dependencies
+  (tested).
+- `newtab-view.js`: draws the status line and the layout with the vendored renderer, updates the
+  numbers in place, and the image background (tested).
 - `status.js`: the status line, with the «Koble til Magpie» button when not connected (tested).
 - `background.js`: fetches an image background with the token (tested).
 - `labels.js`: the renderer's interface strings, English and Norwegian (tested against the server's).
@@ -83,7 +115,7 @@ unlisted channel (addons.mozilla.org, "On your own"): it is not in the public ca
 
 To release a new version:
 
-1. Change `version` in `extension/manifest.json` (for example `0.1.0` to `0.2.0`) and merge it to
+1. Change `version` in `extension/manifest.json` (for example `0.2.0` to `0.3.0`) and merge it to
    `main`. Mozilla refuses to sign a version twice, so every release needs a new number.
 2. Tag the commit `extension-vX.Y.Z` (the same number) and push the tag.
    `.github/workflows/extension.yml` then lints, builds, signs and publishes. It fails when the tag

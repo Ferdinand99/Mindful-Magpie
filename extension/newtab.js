@@ -11,5 +11,17 @@ document.addEventListener("DOMContentLoaded", () => {
     openOptions: () => browser.runtime.openOptionsPage(),
     objectUrl: { create: (blob) => URL.createObjectURL(blob), revoke: (url) => URL.revokeObjectURL(url) },
   });
-  start({ storage: browser.storage, fetchImpl: fetch, draw });
+  // The values refresh runs only while the tab is visible (see newtab-core.js).
+  const visibility = {
+    isHidden: () => document.hidden,
+    onChange: (callback) => document.addEventListener("visibilitychange", callback),
+  };
+  start({
+    storage: browser.storage,
+    fetchImpl: fetch,
+    draw,
+    update: draw.update,
+    tick: draw.tick,
+    visibility,
+  });
 });

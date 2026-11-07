@@ -71,9 +71,9 @@ test("manifest meets the shell requirements", () => {
   const m = JSON.parse(read("manifest.json"));
   assert.equal(m.manifest_version, 3);
   assert.equal(m.name, "Mindful Magpie");
-  assert.equal(m.version, "0.2.0");
+  assert.equal(m.version, "0.3.0");
   assert.equal(m.browser_specific_settings.gecko.id, "mindful-magpie@hedgerow.tools");
-  assert.equal(m.browser_specific_settings.gecko.strict_min_version, "128.0");
+  assert.equal(m.browser_specific_settings.gecko.strict_min_version, "140.0");
   assert.equal(m.chrome_url_overrides.newtab, "newtab.html");
   assert.deepEqual(m.options_ui, { page: "options.html", open_in_tab: true });
   assert.deepEqual(m.permissions, ["storage", "identity"]);

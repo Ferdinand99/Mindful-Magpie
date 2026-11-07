@@ -84,12 +84,12 @@ async function finishCheck(request, fetchImpl, parsed, token) {
   return fail(result.kind);
 }
 
-// Saves server and token. The cache belongs to one server and one token, so it is dropped when
-// either changes.
+// Saves server and token. The cache (layout, service values and the old-server back-off) belongs to
+// one server and one token, so it is dropped when either changes.
 async function persist(storage, serverUrl, token) {
   const previous = await storage.local.get(["serverUrl", "token"]);
   if (previous.serverUrl !== serverUrl || previous.token !== token) {
-    await storage.local.remove("last");
+    await storage.local.remove(["last", "lastValues", "valuesMissing"]);
   }
   await storage.local.set({ serverUrl, token });
 }
