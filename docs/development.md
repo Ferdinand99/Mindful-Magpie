@@ -25,7 +25,8 @@ src/
 templates/            # Magpie's pages (extend kit/layout.html)
 static/               # favicon, icons, web manifest, magpie.css, clock.js
 static/magpie/        # the start page scripts (ES modules: render.js is the shared renderer, edit.js is edit mode with ops.js and rules.js) and render.css
-web/                  # JavaScript tests (node --test, linkedom): renderer, layout operations, edit mode; dev-only
+web/                  # JavaScript tests (node --test, linkedom): renderer, layout operations, edit mode; build-extension.mjs and kit-tokens.css; dev-only
+extension/            # the Firefox extension; extension/vendor/ is generated from static/magpie/ and web/kit-tokens.css
 migrations/           # Magpie's migrations
 locales/              # Magpie's strings (en, nb)
 tests/                # boot.rs, auth.rs, start.rs, layout.rs, layout_http.rs, api_start.rs, background.rs, connect.rs; common/ builds an in-process app on a temporary data directory
@@ -82,12 +83,45 @@ scripts/test-notices-fail.sh # proves the check stops on a licence that is not a
 A new licence must be added to `accepted` in `about.toml` on purpose. The image carries the file and `LICENSE` in
 `/usr/share/doc/mindful-magpie/`.
 
+## Signing the extension
+
+`extension/` is the Firefox extension. `web/` holds its test tooling, including the pinned `web-ext`. CI runs
+`npx web-ext lint --source-dir ../extension --self-hosted` in the `Web tests` job on every pull
+request. Run the same commands on the build host:
+
+```bash
+cd web && npm ci
+node --test
+npm run build:extension       # copy the shared renderer into extension/vendor/ (commit the result)
+npx web-ext lint --source-dir ../extension --self-hosted
+npx web-ext build --source-dir ../extension --artifacts-dir /tmp/out   # a zip, not signed
+```
+
+`extension/vendor/` holds copies of `static/magpie/render.js` and `render.css` plus the kit tokens they need
+(`web/kit-tokens.css`), because the add-on package must hold all its code. Change the renderer, then run
+`npm run build:extension` and commit `extension/vendor/`. The `web` job in `ci.yml` runs the script and fails on any
+difference (`git diff --exit-code`).
+
+Signing happens only in `extension.yml`, never on a workstation. To release: bump `version` in
+`extension/manifest.json`, merge, then push the tag `extension-vX.Y.Z` (same number). The workflow checks the
+manifest version against the tag, builds, signs on the unlisted channel with the secrets `AMO_JWT_ISSUER` and
+`AMO_JWT_SECRET`, and attaches `mindful-magpie-X.Y.Z.xpi` to the release `extension-vX.Y.Z`. That release is not
+marked as latest, so the app release stays the latest one. The sign job runs only for a tag or on `main`, and the
+signing secrets go in as `WEB_EXT_API_KEY` and `WEB_EXT_API_SECRET` in the environment of the sign step. A manual run
+stops before signing when the tag already exists on another commit. The "Build (check only)" step only proves that
+the package builds. Mozilla signs a version once: when signing itself fails after the upload was accepted, bump the
+version and tag again. When only the release job fails, re-run that job alone ("Re-run failed jobs"): it uses the
+signed file from the first run's artifact and does not sign again. Install: download the `.xpi` and drag it into a
+Firefox window (opening the URL in Firefox can also work, but a browser may only download the file).
+
 ## CI and releases
 
-- `ci.yml`: format, clippy with `-D warnings` and tests; the `web` job (`npm ci` and `node --test` in `web/`); the notices check; on pull requests a Docker build for
+- `ci.yml`: format, clippy with `-D warnings` and tests; the `web` job (`npm ci`, `node --test` in `web/`, the vendored-renderer check and `web-ext lint`); the notices check; on pull requests a Docker build for
   linux/amd64 and linux/arm64 (nothing is pushed).
 - `audit.yml`: RustSec advisories (`cargo deny check advisories`) on dependency changes and weekly.
 - `release-please.yml`: keeps a release pull request open on `main` (version and changelog from Conventional
   Commits). Merging it tags `vX.Y.Z`, creates the release and calls `docker-publish.yml`. The first release is 0.1.0.
 - `docker-publish.yml`: publishes the multi-arch image `ghcr.io/ferdinand99/mindful-magpie` (`:X.Y.Z`, `:X.Y`, `:X`,
   `:latest`) on release tags only, never from `main`.
+- `extension.yml`: on a tag `extension-vX.Y.Z` (or a manual run), signs the Firefox extension with Mozilla and
+  attaches the `.xpi` to a release (see "Signing the extension").

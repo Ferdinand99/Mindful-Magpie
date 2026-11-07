@@ -4,9 +4,11 @@
   "type": "module",
   "description": "Test tooling for the Mindful Magpie browser extension and start page scripts. Nothing here ships.",
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "build:extension": "node build-extension.mjs"
   },
   "devDependencies": {
-    "linkedom": "^0.18.12"
+    "linkedom": "^0.18.12",
+    "web-ext": "10.8.0"
   }
 }
