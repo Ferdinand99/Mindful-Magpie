@@ -21,6 +21,10 @@
     <p class="clock" id="clock" data-tz="{{ timezone }}" data-lang="{{ ctx.lang }}">{{ time }}</p>
     <p class="date" id="date">{{ date }}</p>
   </div>
+  {#- Hidden until the page script has run: without scripts the button would do nothing. -#}
+  <div class="start-actions" hidden>
+    <button type="button" class="btn btn-secondary" id="mm-edit" aria-pressed="false">{{ m::icon("pencil") }}<span>{{ tr("start.edit") }}</span></button>
+  </div>
 </div>
 
 {#- "Needs you": a row of alerts, shown only when something needs attention. -#}

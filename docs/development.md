@@ -24,8 +24,8 @@ src/
   layout/             # the start page layout: model and validation, per-user versioned storage
 templates/            # Magpie's pages (extend kit/layout.html)
 static/               # favicon, icons, web manifest, magpie.css, clock.js
-static/magpie/        # the start page scripts (ES modules: render.js is the shared renderer) and render.css
-web/                  # JavaScript tests (node --test, linkedom); dev-only
+static/magpie/        # the start page scripts (ES modules: render.js is the shared renderer, edit.js is edit mode with ops.js and rules.js) and render.css
+web/                  # JavaScript tests (node --test, linkedom): renderer, layout operations, edit mode; dev-only
 migrations/           # Magpie's migrations
 locales/              # Magpie's strings (en, nb)
 tests/                # boot.rs, auth.rs, start.rs, layout.rs, layout_http.rs, api_start.rs, connect.rs; common/ builds an in-process app on a temporary data directory
@@ -45,10 +45,10 @@ Builds and tests run in Docker on a build host (a shared Docker daemon), not on 
 cargo commands that run inside a Rust 1.99 container with clippy and rustfmt installed.
 
 ```bash
-cargo test --locked                                  # 105 tests: boot, auth and users, start page, layout, extension API and connect flow
+cargo test --locked                                  # 108 tests: boot, auth and users, start page, layout, extension API and connect flow
 cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --all --check
-cd web && npm ci && node --test                     # the renderer's tests (node:22 container; linkedom stands in for the DOM)
+cd web && npm ci && node --test                     # the renderer, operations and edit mode tests (node:22 container; linkedom stands in for the DOM)
 docker build -t magpie:dev .
 docker run --rm magpie:dev --help     # every flag and its MM_ variable
 ```

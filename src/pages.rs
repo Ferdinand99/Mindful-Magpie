@@ -71,15 +71,103 @@ fn json_for_html(value: &impl serde::Serialize) -> String {
         .replace("<!--", "\\u003c!--")
 }
 
-/// The interface strings the page script needs to draw the layout, in the
-/// request's language. A `{title}` in a text is filled in by the script.
+/// One entry of the labels map: the key the scripts use and its text in the
+/// request's language (`start.<key>` in the locale files).
+macro_rules! label_map {
+    ($($key:literal),* $(,)?) => {
+        BTreeMap::from([$(($key, i18n::t(concat!("start.", $key)))),*])
+    };
+}
+
+/// The interface strings the page scripts need, in the request's language: the
+/// renderer's (`render.js`) and edit mode's (the same keys as `LABEL_KEYS` in
+/// `edit.js`; a test keeps the two lists in step). A `{name}` in a text is
+/// filled in by the script.
 fn labels() -> BTreeMap<&'static str, &'static str> {
-    BTreeMap::from([
-        ("empty", i18n::t("start.empty")),
-        ("invalid_link", i18n::t("start.invalid_link")),
-        ("group_label", i18n::t("start.group_label")),
-        ("bookmarks_label", i18n::t("start.bookmarks_label")),
-    ])
+    label_map!(
+        "empty",
+        "invalid_link",
+        "group_label",
+        "bookmarks_label",
+        "edit_toolbar",
+        "edit_done",
+        "edit_cancel",
+        "edit_saving",
+        "add_group",
+        "add_bookmark",
+        "add_card",
+        "rename_group",
+        "edit_item",
+        "move_item",
+        "delete_item",
+        "drag_hint",
+        "dialog_save",
+        "dialog_cancel",
+        "dialog_close",
+        "group_form_add",
+        "group_form_rename",
+        "card_form_add",
+        "card_form_edit",
+        "bookmark_form_add",
+        "bookmark_form_edit",
+        "field_group_name",
+        "field_title",
+        "field_url",
+        "field_description",
+        "field_emoji",
+        "field_colour",
+        "optional",
+        "help_url",
+        "help_emoji",
+        "move_title",
+        "move_up",
+        "move_down",
+        "move_first",
+        "move_last",
+        "move_to_group",
+        "confirm_delete_group",
+        "confirm_delete_group_text",
+        "confirm_delete",
+        "confirm_discard",
+        "confirm_discard_text",
+        "confirm_discard_yes",
+        "confirm_keep",
+        "confirm_leave",
+        "confirm_leave_text",
+        "confirm_leave_yes",
+        "conflict",
+        "reload",
+        "save_failed",
+        "invalid_summary",
+        "summary_more",
+        "summary_group",
+        "summary_card",
+        "summary_bookmark",
+        "summary_line",
+        "limit_groups",
+        "limit_cards",
+        "limit_bookmarks",
+        "err_required",
+        "err_too_long",
+        "err_bad_url",
+        "err_bad_scheme",
+        "err_bad_emoji",
+        "err_bad_colour",
+        "err_generic",
+        "colour_red",
+        "colour_orange",
+        "colour_yellow",
+        "colour_green",
+        "colour_mint",
+        "colour_teal",
+        "colour_cyan",
+        "colour_blue",
+        "colour_indigo",
+        "colour_purple",
+        "colour_pink",
+        "colour_brown",
+        "colour_gray",
+    )
 }
 
 /// The time zone, the clock and the date for the page: now, in the site's

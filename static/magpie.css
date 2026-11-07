@@ -104,6 +104,227 @@ body:has(.main.start) .topbar-inner {
   flex: 1 1 18rem;
 }
 
+/* Edit mode ------------------------------------------------------------------
+   edit.js draws the page with the renderer and adds the controls below. The
+   sheets (forms, move menu, confirm) are the kit's .sheet. */
+.start-actions {
+  margin-inline-start: auto;
+}
+/* The Edit button while edit mode is open: the kit's inverted pill. */
+#mm-edit[aria-pressed="true"] {
+  --btn-bg: var(--text);
+  --btn-fg: var(--on-inverse);
+  --btn-hover: color-mix(in srgb, var(--text) 84%, var(--bg));
+}
+
+.mm-edit-host {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+.mm-edit-bar {
+  position: sticky;
+  top: calc(var(--topbar-h) + var(--safe-top) + var(--sp-2));
+  z-index: var(--z-sticky);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2) var(--sp-4);
+  padding: var(--sp-2) var(--sp-3);
+}
+.mm-edit-adds,
+.mm-edit-ends {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+.mm-edit-alert {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2) var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  border-color: var(--bad-text);
+}
+.mm-edit-alert p {
+  margin: 0;
+  font-weight: 500;
+}
+.mm-edit-problems {
+  display: flex;
+  flex-direction: column;
+  flex-basis: 100%;
+  align-items: flex-start;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.mm-edit-problems .btn {
+  height: auto;
+  min-height: 0;
+  padding-block: var(--sp-1);
+  text-align: start;
+  white-space: normal;
+}
+
+/* A group: its heading with the group's controls beside it. */
+.mm-edit-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-block-end: var(--sp-3);
+}
+.mm-edit-head .mm-group-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+}
+.mm-edit-actions {
+  display: flex;
+  flex: none;
+  gap: 2px;
+}
+.mm-grip {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 32px;
+  color: var(--muted);
+  cursor: grab;
+  touch-action: none;
+}
+.mm-grip:active {
+  cursor: grabbing;
+}
+.mm-edit-foot {
+  margin-block-start: var(--sp-3);
+}
+/* An empty group still takes a drop. */
+[data-editing] .mm-cards:empty {
+  min-height: 4.5rem;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--r-lg);
+}
+
+/* A card: the card, and its controls under it. A bookmark pill: the pill and
+   its controls beside it. */
+.mm-edit-item {
+  position: relative;
+  min-width: 0;
+}
+.mm-edit-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  cursor: grab;
+}
+.mm-edit-card > .mm-card {
+  flex: 1 1 auto;
+}
+.mm-edit-bookmark {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  max-width: 100%;
+  cursor: grab;
+}
+.mm-edit-controls {
+  display: flex;
+  justify-content: flex-end;
+  gap: 2px;
+}
+[data-editing] a.mm-card:hover {
+  transform: none;
+}
+.mm-dragging {
+  opacity: 0.45;
+}
+/* Where a drop would land: a brand line before or after the target, or a frame
+   around the group's grid. */
+.mm-drop-before {
+  box-shadow: -3px 0 0 var(--brand);
+}
+.mm-drop-after {
+  box-shadow: 3px 0 0 var(--brand);
+}
+/* The line sits on the other side in a right-to-left page. */
+[dir="rtl"] .mm-drop-before { /* rtl-ok: a shadow offset has no logical form */
+  box-shadow: 3px 0 0 var(--brand);
+}
+[dir="rtl"] .mm-drop-after { /* rtl-ok: a shadow offset has no logical form */
+  box-shadow: -3px 0 0 var(--brand);
+}
+.mm-group.mm-drop-before {
+  box-shadow: 0 -3px 0 var(--brand);
+}
+.mm-group.mm-drop-after {
+  box-shadow: 0 3px 0 var(--brand);
+}
+.mm-cards.mm-drop-end {
+  outline: 2px solid var(--brand);
+  outline-offset: 4px;
+  border-radius: var(--r-lg);
+}
+
+/* Colour picker: 13 round swatches, a radio group (arrow keys work). */
+.mm-swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+.mm-swatch {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  cursor: pointer;
+}
+.mm-swatch-dot {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--pal-gray);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12);
+}
+.mm-swatch:has(input:checked) {
+  box-shadow: 0 0 0 2px var(--card-raised), 0 0 0 4px var(--text);
+}
+.mm-swatch:has(input:focus-visible) {
+  outline: 2px solid var(--brand);
+  outline-offset: 3px;
+}
+.mm-swatch-dot[data-colour="red"] { background: var(--pal-red); }
+.mm-swatch-dot[data-colour="orange"] { background: var(--pal-orange); }
+.mm-swatch-dot[data-colour="yellow"] { background: var(--pal-yellow); }
+.mm-swatch-dot[data-colour="green"] { background: var(--pal-green); }
+.mm-swatch-dot[data-colour="mint"] { background: var(--pal-mint); }
+.mm-swatch-dot[data-colour="teal"] { background: var(--pal-teal); }
+.mm-swatch-dot[data-colour="cyan"] { background: var(--pal-cyan); }
+.mm-swatch-dot[data-colour="blue"] { background: var(--pal-blue); }
+.mm-swatch-dot[data-colour="indigo"] { background: var(--pal-indigo); }
+.mm-swatch-dot[data-colour="purple"] { background: var(--pal-purple); }
+.mm-swatch-dot[data-colour="pink"] { background: var(--pal-pink); }
+.mm-swatch-dot[data-colour="brown"] { background: var(--pal-brown); }
+.mm-swatch-dot[data-colour="gray"] { background: var(--pal-gray); }
+
+/* The move menu: one button per move. */
+.mm-move-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.mm-move-list .btn {
+  justify-content: flex-start;
+  height: auto;
+  min-height: 40px;
+  padding-block: var(--sp-2);
+  text-align: start;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 /* The consent page of the browser extension (/connect/extension) ----------- */
 .connect {
   max-width: 34rem;

@@ -426,3 +426,101 @@ async fn start_page_embeds_the_labels_for_the_renderer() {
         }
     }
 }
+
+#[tokio::test]
+async fn start_page_has_the_edit_button() {
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    for (lang, label) in [("en", "Edit"), ("nb", "Rediger")] {
+        let res = start_page(&mut web, lang).await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        // A kit pill button with the pencil icon and aria-pressed.
+        let at = res.body.find(r#"id="mm-edit""#).expect("no edit button");
+        let start = res.body[..at].rfind("<button").unwrap();
+        let end = res.body[at..].find("</button>").unwrap() + at;
+        let button = &res.body[start..end];
+        assert!(button.contains(r#"type="button""#), "{button}");
+        assert!(button.contains(r#"aria-pressed="false""#), "{button}");
+        assert!(button.contains(r#"class="btn btn-secondary""#), "{button}");
+        assert!(button.contains("icons.svg#pencil"), "{button}");
+        assert!(
+            button.contains(&format!("<span>{label}</span>")),
+            "{lang}: {button}"
+        );
+        assert!(!button.contains("autofocus"), "{button}");
+        // Without scripts the button would do nothing: it starts hidden, and the
+        // page script shows it.
+        let wrapper = &res.body[res.body[..start].rfind("<div").unwrap()..start];
+        assert!(
+            wrapper.contains("start-actions") && wrapper.contains("hidden"),
+            "{wrapper}"
+        );
+    }
+}
+
+/// The keys `edit.js` lists in `LABEL_KEYS`.
+fn edit_label_keys() -> Vec<String> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("static/magpie");
+    let source = std::fs::read_to_string(dir.join("edit.js")).unwrap();
+    let list = source
+        .split("export const LABEL_KEYS = [")
+        .nth(1)
+        .and_then(|rest| rest.split("];").next())
+        .expect("edit.js lists no LABEL_KEYS");
+    list.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect()
+}
+
+#[tokio::test]
+async fn start_page_labels_cover_every_string_edit_mode_uses() {
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    let keys = edit_label_keys();
+    assert!(keys.len() > 60, "only {} keys found", keys.len());
+    let mut texts = Vec::new();
+    for lang in ["en", "nb"] {
+        let res = start_page(&mut web, lang).await;
+        let labels = json_block(&res.body, "mm-labels");
+        for key in &keys {
+            let text = labels[key.as_str()].as_str().unwrap_or_default();
+            assert!(
+                !text.is_empty() && !text.starts_with("start."),
+                "{lang}: no text for {key}"
+            );
+        }
+        texts.push(labels);
+    }
+    // The two languages really differ (a key copied untranslated would not).
+    for key in ["edit_done", "conflict", "reload", "save_failed", "add_card"] {
+        assert_ne!(texts[0][key], texts[1][key], "{key} is not translated");
+    }
+    assert_eq!(texts[1]["conflict"], "Siden er endret i en annen fane");
+    assert_eq!(texts[1]["reload"], "Last inn på nytt");
+    assert_eq!(texts[1]["save_failed"], "Kunne ikke lagre – prøv igjen");
+    assert_eq!(texts[1]["edit_done"], "Ferdig");
+    assert_eq!(texts[1]["add_card"], "Legg til kort");
+    // A text with a placeholder keeps it for the script to fill in.
+    assert!(texts[0]["edit_item"].as_str().unwrap().contains("{title}"));
+    assert!(texts[1]["err_too_long"].as_str().unwrap().contains("{max}"));
+}
+
+#[tokio::test]
+async fn edit_mode_scripts_are_served() {
+    let app = App::new().await;
+    for path in [
+        "/static/magpie/ops.js",
+        "/static/magpie/rules.js",
+        "/static/magpie/edit.js",
+    ] {
+        let res = app.get(path).await;
+        assert_eq!(res.status, StatusCode::OK, "{path}: {}", res.body);
+        assert!(
+            res.header("content-type").contains("javascript"),
+            "{path} content-type: {}",
+            res.header("content-type")
+        );
+    }
+}
