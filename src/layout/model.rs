@@ -117,12 +117,48 @@ pub struct FieldError {
     pub code: &'static str,
 }
 
-/// Whether `value` is `scheme://` followed by a host, not by more slashes.
+/// Whether `value` is `scheme://` followed by a host: the `//` must come right
+/// after the scheme's colon (not from a later `://`, say in the query), and
+/// more slashes must not follow it.
 fn plain_authority(value: &str) -> bool {
     value
-        .split_once("://")
-        .is_some_and(|(_, rest)| !rest.starts_with(['/', '\\']))
+        .split_once(':')
+        .and_then(|(_, rest)| rest.strip_prefix("//"))
+        .is_some_and(|host| !host.starts_with(['/', '\\']))
 }
+
+/// Characters of Unicode category Cf (format): invisible, and a few reverse
+/// the text or glue it together.
+fn is_format(c: char) -> bool {
+    matches!(c,
+        '\u{ad}' | '\u{600}'..='\u{605}' | '\u{61c}' | '\u{6dd}' | '\u{70f}'
+        | '\u{890}'..='\u{891}' | '\u{8e2}' | '\u{180e}' | '\u{200b}'..='\u{200f}'
+        | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}'
+        | '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{110bd}' | '\u{110cd}'
+        | '\u{13430}'..='\u{1343f}' | '\u{1bca0}'..='\u{1bca3}'
+        | '\u{1d173}'..='\u{1d17a}' | '\u{e0001}' | '\u{e0020}'..='\u{e007f}')
+}
+
+/// The invisible parts real emoji are built from: the zero width joiner, the
+/// variation selectors and the tag characters of subdivision flags.
+fn is_emoji_glue(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200d}' | '\u{fe0e}' | '\u{fe0f}' | '\u{e0020}'..='\u{e007f}'
+    )
+}
+
+/// Whether `emoji` has no whitespace, control or format characters (except
+/// the glue that emoji sequences need) and at least one character that shows.
+fn is_visible_symbol(emoji: &str) -> bool {
+    emoji
+        .chars()
+        .all(|c| !c.is_whitespace() && !c.is_control() && (!is_format(c) || is_emoji_glue(c)))
+        && emoji.chars().any(|c| !is_emoji_glue(c))
+}
+
+/// The most problems [`validate`] returns.
+const MAX_ERRORS: usize = 100;
 
 struct Checker {
     errors: Vec<FieldError>,
@@ -131,6 +167,9 @@ struct Checker {
 
 impl Checker {
     fn err(&mut self, path: impl Into<String>, code: &'static str) {
+        if self.errors.len() >= MAX_ERRORS {
+            return;
+        }
         self.errors.push(FieldError {
             path: path.into(),
             code,
@@ -189,15 +228,18 @@ impl Checker {
             self.err(format!("{path}.colour"), "bad_colour");
         }
         if let Some(emoji) = &icon.emoji
-            && (emoji.len() > MAX_EMOJI_BYTES || emoji.graphemes(true).count() != 1)
+            && (emoji.len() > MAX_EMOJI_BYTES
+                || emoji.graphemes(true).count() != 1
+                || !is_visible_symbol(emoji))
         {
             self.err(format!("{path}.emoji"), "bad_emoji");
         }
     }
 }
 
-/// Checks a layout against the size limits and shapes. Returns every problem
-/// found, so a form can mark all of them at once.
+/// Checks a layout against the size limits and shapes. Returns the problems
+/// found (at most 100), so a form can mark them at once. A document over a
+/// count limit (`too_many`) is not checked further.
 ///
 /// Until backgrounds with images arrive, an image background is refused
 /// (`bad_image`): the check needs the database, which this function never
@@ -225,6 +267,10 @@ pub fn validate(layout: &Layout) -> Result<(), Vec<FieldError>> {
     }
     if layout.bookmarks.len() > MAX_BOOKMARKS {
         c.err("bookmarks", "too_many");
+    }
+    // Over a limit: say so and stop, rather than walk a huge document.
+    if c.errors.iter().any(|e| e.code == "too_many") {
+        return Err(c.errors);
     }
 
     for (gi, group) in layout.groups.iter().enumerate() {

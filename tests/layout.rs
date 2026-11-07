@@ -126,6 +126,12 @@ async fn two_saves_at_once_with_the_same_version_do_not_both_win() {
     );
     let wins = [&ra, &rb].iter().filter(|r| r.is_ok()).count();
     assert_eq!(wins, 1, "{ra:?} {rb:?}");
+    // The loser is told the version that won.
+    let loser = if ra.is_ok() { &rb } else { &ra };
+    assert!(
+        matches!(loser, Err(SaveError::Conflict { current: 1 })),
+        "{loser:?}"
+    );
     assert_eq!(
         layout::load(&app.magpie.core, ada).await.unwrap().version,
         1
@@ -246,6 +252,11 @@ fn validation_refuses_malformed_links() {
         "https:example.com",
         "https:\\example.com",
         "https://\\example.com",
+        // The `://` is not right after the scheme: a later one in the query
+        // must not pass for it.
+        "https:example.com/?q=://",
+        "https:/example.com/?q=://",
+        "https:///example.com/?q=://",
         "http://exa mple.com",
         " https://example.com",
         "https://example.com\n",
@@ -442,6 +453,17 @@ fn validation_icons() {
         "ab",
         "",
         " 🙂",
+        // Nothing to see: whitespace, control and format characters.
+        " ",
+        "\n",
+        "\t",
+        "\u{a0}",
+        "\u{200b}",
+        "\u{200d}",
+        "\u{202e}",
+        "\u{feff}",
+        "\u{2060}",
+        "\u{7f}",
         "a\u{300}\u{301}".repeat(2).as_str(),
     ] {
         expect(
@@ -539,4 +561,54 @@ fn the_document_shape_is_the_one_the_client_sends() {
     // The wire form of a preset keeps the `kind` tag.
     let v = serde_json::to_value(&l).unwrap();
     assert_eq!(v["background"]["kind"], "preset");
+}
+
+#[test]
+fn too_many_stops_the_item_checks() {
+    // 31 groups, every title blank: only the count is reported, the items
+    // are not walked.
+    let mut l = sample();
+    l.groups = (0..31)
+        .map(|i| Group {
+            id: format!("g{i}"),
+            title: String::new(),
+            cards: vec![],
+        })
+        .collect();
+    assert_eq!(codes(&l), vec![("groups".to_string(), "too_many")]);
+
+    // Same for bookmarks.
+    let mut l = sample();
+    l.bookmarks = (0..101)
+        .map(|i| Bookmark {
+            id: format!("b{i}"),
+            title: String::new(),
+            url: "x".into(),
+        })
+        .collect();
+    assert_eq!(codes(&l), vec![("bookmarks".to_string(), "too_many")]);
+}
+
+#[test]
+fn the_error_list_is_capped_at_100() {
+    // 30 groups of 10 cards with a bad link and a bad colour: 600 problems.
+    let mut l = sample();
+    l.groups = (0..30)
+        .map(|g| Group {
+            id: format!("g{g}"),
+            title: "G".into(),
+            cards: (0..10)
+                .map(|c| {
+                    let mut k = card(&format!("c{g}-{c}"));
+                    k.url = "ftp://x".into();
+                    k.icon.colour = "plum".into();
+                    k
+                })
+                .collect(),
+        })
+        .collect();
+    let errors = codes(&l);
+    assert_eq!(errors.len(), 100);
+    // The first ones, in document order.
+    assert_eq!(errors[0].0, "groups[0].cards[0].url");
 }

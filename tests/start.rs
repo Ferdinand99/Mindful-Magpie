@@ -182,3 +182,126 @@ async fn grid_fills_the_width() {
         }
     }
 }
+
+/// The JSON inside `<script type="application/json" id="{id}">`, found the
+/// way a browser finds it: the block ends at the first `</script>`.
+fn json_block(page: &str, id: &str) -> serde_json::Value {
+    let open = format!(r#"<script type="application/json" id="{id}">"#);
+    let start = page
+        .find(&open)
+        .unwrap_or_else(|| panic!("no {id} block in {page}"))
+        + open.len();
+    let end = page[start..].find("</script>").expect("block never closes") + start;
+    serde_json::from_str(&page[start..end]).unwrap_or_else(|e| panic!("{e}: {}", &page[start..end]))
+}
+
+/// Saves a layout with one card titled `title` for the signed-in `web`.
+async fn save_card(web: &mut Web<'_>, title: &str) {
+    let layout = serde_json::json!({
+        "version": 0,
+        "background": { "kind": "preset", "name": "hedgerow" },
+        "groups": [{
+            "id": "g1",
+            "title": "Services",
+            "cards": [{
+                "id": "c1",
+                "title": title,
+                "description": "",
+                "url": "https://vole.example.com/",
+                "icon": { "emoji": null, "colour": "teal" }
+            }]
+        }],
+        "bookmarks": []
+    });
+    let req = Request::post("/start/layout")
+        .header("hx-request", "true")
+        .header("content-type", "application/json")
+        .body(Body::from(layout.to_string()))
+        .unwrap();
+    let res = web.send(req).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+}
+
+#[tokio::test]
+async fn start_page_embeds_the_users_layout() {
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+
+    // Before any save: the default layout, as data.
+    let res = start_page(&mut web, "en").await;
+    let layout = json_block(&res.body, "mm-layout");
+    assert_eq!(layout["version"], 0);
+    assert_eq!(layout["groups"], serde_json::json!([]));
+    assert_eq!(layout["background"]["name"], "hedgerow");
+
+    save_card(&mut web, "Vigilant Vole").await;
+    let res = start_page(&mut web, "en").await;
+    let layout = json_block(&res.body, "mm-layout");
+    assert_eq!(layout["version"], 1);
+    assert_eq!(layout["groups"][0]["cards"][0]["title"], "Vigilant Vole");
+}
+
+#[tokio::test]
+async fn hostile_titles_cannot_close_the_json_block() {
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    let hostile = "</script><script>alert(1)</script><!-- <script>";
+    save_card(&mut web, hostile).await;
+
+    let res = start_page(&mut web, "en").await;
+    // The block parses, and holds the title as text.
+    let layout = json_block(&res.body, "mm-layout");
+    assert_eq!(layout["groups"][0]["cards"][0]["title"], hostile);
+    // The raw text never appears in the page: `</` and `<!--` are escaped.
+    assert!(
+        !res.body.contains("</script><script>alert(1)"),
+        "{}",
+        res.body
+    );
+    assert!(res.body.contains(r"<\/script>"), "{}", res.body);
+    assert!(!res.body.contains("<!-- <script>"), "{}", res.body);
+    // And the page has no script of its own beyond the static files.
+    // (The data blocks are cut out first: their text is data, and `<script`
+    // in a title is harmless once `<!--` and `</` are escaped.)
+    let mut outside = res.body.clone();
+    for id in ["mm-layout", "mm-labels"] {
+        let open = format!(r#"<script type="application/json" id="{id}">"#);
+        let start = outside.find(&open).unwrap() + open.len();
+        let end = outside[start..].find("</script>").unwrap() + start;
+        outside.replace_range(start..end, "");
+    }
+    for (at, _) in outside.match_indices("<script") {
+        let tag = &outside[at..outside[at..].find('>').map_or(outside.len(), |e| at + e)];
+        assert!(
+            tag.contains("src=") || tag.contains(r#"type="application/json""#),
+            "an inline script: {tag}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn start_page_embeds_the_labels_for_the_renderer() {
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    for (lang, empty, invalid) in [
+        (
+            "en",
+            "Your start page is empty. Edit it to add services and bookmarks.",
+            "invalid link",
+        ),
+        (
+            "nb",
+            "Startsiden er tom. Rediger den for å legge til tjenester og bokmerker.",
+            "ugyldig lenke",
+        ),
+    ] {
+        let res = start_page(&mut web, lang).await;
+        let labels = json_block(&res.body, "mm-labels");
+        assert_eq!(labels["empty"], empty, "{lang}");
+        assert_eq!(labels["invalid_link"], invalid, "{lang}");
+        for key in ["group_label", "bookmarks_label"] {
+            let text = labels[key].as_str().unwrap_or_default();
+            assert!(!text.is_empty() && !text.contains("start."), "{lang} {key}");
+        }
+    }
+}

@@ -124,3 +124,15 @@ body:has(.main.start) .topbar-inner {
     font-size: 2.25rem;
   }
 }
+
+/* The notice for a start page that could not be read. */
+.mm-notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-3) var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+}
+.mm-notice .callout {
+  flex: 1 1 18rem;
+}

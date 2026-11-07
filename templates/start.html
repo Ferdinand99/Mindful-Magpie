@@ -26,6 +26,16 @@
   <h2 class="needs-title" id="needs-title">{{ tr("start.needs") }}</h2>
 </section>
 
+{#- The stored layout could not be read. The button is a plain form post, so it works without scripts. -#}
+{% if corrupt %}
+<section class="glass mm-notice" id="mm-corrupt" aria-label="{{ tr("start.corrupt_reset") }}">
+  {{ m::callout("warning", tr("start.corrupt")) }}
+  <form method="post" action="/start/layout/reset">
+    <button type="submit" class="btn btn-secondary">{{ tr("start.corrupt_reset") }}</button>
+  </form>
+</section>
+{% endif %}
+
 <section id="groups" aria-label="{{ tr("start.groups") }}">
   <div class="glass empty-card">
     <div class="empty">
@@ -34,4 +44,9 @@
     </div>
   </div>
 </section>
+
+{#- Data, not script: the browser never runs these blocks. The JSON is written so
+    that no text in it can end the block early (see json_for_html in pages.rs). -#}
+<script type="application/json" id="mm-layout">{{ layout_json|safe }}</script>
+<script type="application/json" id="mm-labels">{{ labels_json|safe }}</script>
 {% endblock %}

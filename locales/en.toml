@@ -9,6 +9,11 @@ needs = "Needs you"
 date = "{weekday}, {day_month}"
 empty = "Your start page is empty. Edit it to add services and bookmarks."
 groups = "Services and bookmarks"
+corrupt = "Your start page could not be read. It may have been changed outside Mindful Magpie. You can start over with an empty page."
+corrupt_reset = "Start over"
+invalid_link = "invalid link"
+group_label = "Group: {title}"
+bookmarks_label = "Bookmarks"
 
 # Texts the kit's pages take from the product
 # (vole_kit::i18n::catalog::PRODUCT_KEYS).

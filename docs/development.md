@@ -19,11 +19,12 @@ src/
   config.rs           # flags and MM_* environment variables
   server.rs           # listener, graceful shutdown
   db.rs               # Magpie's migration set (after the kit's core set)
+  layout/             # the start page layout: model and validation, per-user versioned storage
 templates/            # Magpie's pages (extend kit/layout.html)
 static/               # favicon, icons, web manifest, magpie.css, clock.js
 migrations/           # Magpie's migrations
 locales/              # Magpie's strings (en, nb)
-tests/                # boot.rs, auth.rs, start.rs; common/ builds an in-process app on a temporary data directory
+tests/                # boot.rs, auth.rs, start.rs, layout.rs, layout_http.rs; common/ builds an in-process app on a temporary data directory
 Dockerfile            # static musl binary on Alpine
 docker/               # the entrypoint (PUID/PGID)
 about.toml, about.hbs # cargo-about: licence allowlist and template for THIRD-PARTY-NOTICES
@@ -40,7 +41,7 @@ Builds and tests run in Docker on a build host (a shared Docker daemon), not on 
 cargo commands that run inside a Rust 1.99 container with clippy and rustfmt installed.
 
 ```bash
-cargo test --locked                                  # 19 tests: boot, auth and users, start page
+cargo test --locked                                  # 55 tests: boot, auth and users, start page, layout
 cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --all --check
 docker build -t magpie:dev .

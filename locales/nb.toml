@@ -9,6 +9,11 @@ needs = "Trenger deg"
 date = "{weekday} {day_month}"
 empty = "Startsiden er tom. Rediger den for å legge til tjenester og bokmerker."
 groups = "Tjenester og bokmerker"
+corrupt = "Startsiden din kunne ikke leses. Den kan være endret utenfor Mindful Magpie. Du kan starte på nytt med en tom side."
+corrupt_reset = "Start på nytt"
+invalid_link = "ugyldig lenke"
+group_label = "Gruppe: {title}"
+bookmarks_label = "Bokmerker"
 
 # Tekster kitets sider henter fra produktet
 # (vole_kit::i18n::catalog::PRODUCT_KEYS).

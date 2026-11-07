@@ -93,3 +93,19 @@ pub async fn save(core: &Core, user_id: i64, layout: &Layout) -> Result<u64, Sav
     .await?;
     outcome.map_err(|current| SaveError::Conflict { current })
 }
+
+/// The stored version (0 when nothing is stored), read without parsing the
+/// document. A page whose stored document cannot be read still needs it: a
+/// save over the broken document must carry this version.
+pub async fn stored_version(core: &Core, user_id: i64) -> Result<u64, DbError> {
+    let version: Option<i64> = db::interact(&core.db, move |c| {
+        c.query_row(
+            "SELECT version FROM layouts WHERE user_id = ?1",
+            params![user_id],
+            |r| r.get(0),
+        )
+        .optional()
+    })
+    .await?;
+    Ok(version.map_or(0, |v| u64::try_from(v).unwrap_or_default()))
+}
