@@ -93,6 +93,7 @@ enum Mode {
     ErrConnect,
     /// `Err(SecretUnreadable)`.
     ErrSecret,
+    ErrAuth,
     /// Never answers.
     Hang,
     /// Answers when the test opens the gate of its tag (see [`gate`]).
@@ -229,6 +230,7 @@ impl Integration for Stub {
                 Mode::Err => Err(FetchError::Config),
                 Mode::ErrConnect => Err(FetchError::Connect),
                 Mode::ErrSecret => Err(FetchError::SecretUnreadable),
+                Mode::ErrAuth => Err(FetchError::Auth),
                 Mode::Bad => Ok(Snapshot::failed(&FetchError::Connect)),
                 Mode::Ok => Ok(ok_snapshot(n, marker)),
             }
@@ -923,7 +925,11 @@ async fn unusable_settings_or_secret_need_an_admin_not_the_site() {
     let app = App::new().await;
     tokio::time::pause();
     // The kind has no "down" rule at all; the config need is the engine's.
-    for (tag, mode) in [("t_cfg", Mode::Err), ("t_cfg_secret", Mode::ErrSecret)] {
+    for (tag, mode) in [
+        ("t_cfg", Mode::Err),
+        ("t_cfg_secret", Mode::ErrSecret),
+        ("t_cfg_auth", Mode::ErrAuth),
+    ] {
         set_mode(tag, mode);
         let id = add_stub(&app, tag, tag, "", 10).await;
         let poller = start_with(&app, stub_kinds, 0);

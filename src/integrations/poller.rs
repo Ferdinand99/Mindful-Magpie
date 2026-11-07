@@ -633,10 +633,16 @@ impl Job {
 }
 
 /// Whether the reading failed because the settings or the secret can't be
-/// used, which an admin has to fix.
+/// used, or the service refused the key, which an admin has to fix.
 fn is_config_error(snapshot: &Snapshot) -> bool {
     snapshot.error.as_deref().is_some_and(|text| {
-        text == FetchError::Config.to_string() || text == FetchError::SecretUnreadable.to_string()
+        [
+            FetchError::Config,
+            FetchError::SecretUnreadable,
+            FetchError::Auth,
+        ]
+        .iter()
+        .any(|e| text == e.to_string())
     })
 }
 
