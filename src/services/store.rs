@@ -121,7 +121,7 @@ pub async fn visible_to(
     let viewer = viewer.into();
     db::interact(&core.db, move |c| {
         let mut stmt = c.prepare(
-            "SELECT id, kind, name FROM services s
+            "SELECT id, kind, name, interval_s FROM services s
              WHERE ?1 = 1 OR s.visibility = 'all'
                 OR (s.visibility = 'users' AND EXISTS (
                       SELECT 1 FROM service_users su
@@ -133,6 +133,7 @@ pub async fn visible_to(
                 id: r.get(0)?,
                 kind: r.get(1)?,
                 name: r.get(2)?,
+                interval_s: r.get(3)?,
             })
         })?
         .collect()
@@ -140,20 +141,33 @@ pub async fn visible_to(
     .await
 }
 
+/// The kind of the service `id` when `viewer` may see it, on a connection
+/// (the layout save asks inside its transaction). `None` for a service that
+/// does not exist and one that is hidden from `viewer`, so a caller cannot
+/// tell the two apart.
+pub fn visible_kind(
+    c: &Connection,
+    viewer: impl Into<Viewer>,
+    id: i64,
+) -> rusqlite::Result<Option<String>> {
+    let viewer = viewer.into();
+    c.query_row(
+        "SELECT s.kind FROM services s
+         WHERE s.id = ?3 AND (?1 = 1 OR s.visibility = 'all'
+            OR (s.visibility = 'users' AND EXISTS (
+                  SELECT 1 FROM service_users su
+                  WHERE su.service_id = s.id AND su.user_id = ?2)))",
+        params![viewer.admin, viewer.id, id],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
 /// Whether `viewer` may see the service `id` (false when there is none).
 pub async fn can_see(core: &Core, viewer: impl Into<Viewer>, id: i64) -> Result<bool, DbError> {
     let viewer = viewer.into();
     db::interact(&core.db, move |c| {
-        c.query_row(
-            "SELECT EXISTS (
-               SELECT 1 FROM services s
-               WHERE s.id = ?3 AND (?1 = 1 OR s.visibility = 'all'
-                  OR (s.visibility = 'users' AND EXISTS (
-                        SELECT 1 FROM service_users su
-                        WHERE su.service_id = s.id AND su.user_id = ?2))))",
-            params![viewer.admin, viewer.id, id],
-            |r| r.get(0),
-        )
+        visible_kind(c, viewer, id).map(|kind| kind.is_some())
     })
     .await
 }

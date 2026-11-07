@@ -31,6 +31,8 @@ use vole_kit::http::ApiError;
 use vole_kit::http::ratelimit::{Rate, too_many_requests};
 use vole_kit::state::Core;
 
+use crate::layout::Layout;
+use crate::services::{ServiceView, services_for};
 use crate::{Magpie, connect, layout};
 
 /// Token requests one address may make: a person connects once in a while, a
@@ -45,7 +47,7 @@ const TOKEN_NAME_PREFIX: &str = "Utvidelse: ";
 /// (`MAX_TOKENS_PER_USER` there), so the flow cannot get around it.
 const MAX_TOKENS_PER_USER: i64 = 50;
 
-const ME_START_EXAMPLE: &str = r##"{"version": 3, "background": {"kind": "preset", "name": "hav"}, "groups": [{"id": "g1", "title": "Services", "cards": [{"id": "c1", "title": "Vigilant Vole", "description": "Uptime", "url": "https://vole.example.com/", "icon": {"emoji": null, "colour": "teal"}}]}], "bookmarks": [{"id": "b1", "title": "Docs", "url": "https://docs.example.com/"}]}"##;
+const ME_START_EXAMPLE: &str = r##"{"version": 3, "background": {"kind": "preset", "name": "hav"}, "groups": [{"id": "g1", "title": "Services", "cards": [{"id": "c1", "title": "Vigilant Vole", "description": "Uptime", "url": "https://vole.example.com/", "icon": {"emoji": null, "colour": "teal"}, "service": {"id": 1, "metrics": ["status", "latency_ms"]}}]}], "bookmarks": [{"id": "b1", "title": "Docs", "url": "https://docs.example.com/"}], "services": [{"id": 1, "name": "Blog", "kind": "http", "interval_s": 60, "metrics": [{"id": "status", "label": "HTTP status", "format": "number"}, {"id": "latency_ms", "label": "Response time (ms)", "format": "number"}]}]}"##;
 
 /// Magpie's documented endpoints (the API reference at `/api-docs`).
 pub const ROUTES: &[RouteDoc] = &[
@@ -54,7 +56,7 @@ pub const ROUTES: &[RouteDoc] = &[
         "/api/v1/me/start",
         "viewer",
         "Start page",
-        "The start page layout of the token's owner, as the page shows it: `version`, `background`, `groups` of cards and `bookmarks`. Any API token opens it (read access is enough); a session cookie never does. If the stored layout is unreadable, the answer is the empty layout at the stored version, as the page shows it. A picture background that is no longer the user's picture is shown as the `hedgerow` preset, with the stored version. Never cached (`Cache-Control: no-store`).",
+        "The start page layout of the token's owner, as the page shows it: `version`, `background`, `groups` of cards and `bookmarks`, and `services`: the services the owner may see, each `{id, name, kind, interval_s, metrics: [{id, label, format}]}` (`label` in the request's language, `format` one of `number`, `percent`, `bytes`, `bytes_per_sec`, `duration`, `since`, `text`), never an address, a setting or a key. A card bound to a service has `service: {id, metrics: [ids]}`; the id may not be in `services` (the service was removed or is no longer visible). Any API token opens it (read access is enough); a session cookie never does. If the stored layout is unreadable, the answer is the empty layout at the stored version, as the page shows it. A picture background that is no longer the user's picture is shown as the `hedgerow` preset, with the stored version. Never cached (`Cache-Control: no-store`).",
     )
     .res(ME_START_EXAMPLE),
     r(
@@ -87,6 +89,17 @@ pub fn public_router() -> Router<Core> {
     Router::new().route("/api/v1/extension/token", post(extension_token))
 }
 
+/// The answer of `GET /api/v1/me/start`: the layout document, as it always
+/// was, and `services` next to its fields. A client that reads `version`,
+/// `background`, `groups` and `bookmarks` (the extension before 0.3.0) does not
+/// notice the extra field; a newer one draws the numbers of bound cards with it.
+#[derive(serde::Serialize)]
+struct StartDoc {
+    #[serde(flatten)]
+    layout: Layout,
+    services: Vec<ServiceView>,
+}
+
 /// `GET /api/v1/me/start`.
 async fn me_start(
     State(core): State<Core>,
@@ -102,7 +115,12 @@ async fn me_start(
         return Err(ApiError::Forbidden);
     }
     let (layout, _) = layout::load_or_default(&core, user.id).await?;
-    Ok(([(header::CACHE_CONTROL, "no-store")], Json(layout)).into_response())
+    let services = services_for(&core, &user).await?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(StartDoc { layout, services }),
+    )
+        .into_response())
 }
 
 #[derive(Deserialize)]

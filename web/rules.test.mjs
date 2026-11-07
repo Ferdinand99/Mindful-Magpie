@@ -10,6 +10,7 @@ import {
   emojiProblem,
   normalizeUrl,
   parsePath,
+  serviceProblem,
   urlProblem,
 } from "../static/magpie/rules.js";
 
@@ -102,4 +103,31 @@ test("parsePath_reads_server_paths", () => {
   assert.deepEqual(parsePath("bookmarks[3].url"), { kind: "bookmark", bookmark: 3, field: "url" });
   assert.equal(parsePath("groups").kind, "list");
   assert.equal(parsePath("background.name").kind, "background");
+});
+
+// Service bindings mirror `validate` in src/layout/model.rs (Plan 4, task 3b).
+test("a_card_without_a_service_or_with_one_to_four_metrics_passes", () => {
+  assert.deepEqual(checkCard({ ...ok, service: null }), {});
+  assert.deepEqual(checkCard({ ...ok, service: undefined }), {});
+  for (let n = 1; n <= 4; n++) {
+    const metrics = Array.from({ length: n }, (_, i) => `m_${i}-x`);
+    assert.deepEqual(checkCard({ ...ok, service: { id: 3, metrics } }), {}, `${n}`);
+  }
+});
+
+test("service_bindings_are_refused_by_the_same_codes_as_the_server", () => {
+  const one = (service) => checkCard({ ...ok, service }).service;
+  assert.equal(one({ id: 3, metrics: [] }), "required");
+  assert.equal(one({ id: 3, metrics: ["a", "b", "c", "d", "e"] }), "too_many");
+  assert.equal(one({ id: 3, metrics: ["a", "b", "a"] }), "duplicate_id");
+  assert.equal(one({ id: 3, metrics: ["has space"] }), "bad_id");
+  assert.equal(one({ id: 3, metrics: [""] }), "bad_id");
+  assert.equal(one({ id: 3, metrics: ["x".repeat(LIMITS.metricId + 1)] }), "bad_id");
+  assert.equal(one({ id: 3, metrics: ["x".repeat(LIMITS.metricId)] }), undefined);
+  assert.equal(one({ id: 0, metrics: ["a"] }), "bad_service");
+  assert.equal(one({ id: 1.5, metrics: ["a"] }), "bad_service");
+  assert.equal(one({ id: "3", metrics: ["a"] }), "bad_service");
+  assert.equal(one({ id: 3, metrics: "a" }), "required");
+  assert.equal(LIMITS.serviceMetrics, 4);
+  assert.equal(serviceProblem(null), null);
 });

@@ -2,11 +2,15 @@
 //! the version it was loaded at, so a second tab with old data gets a
 //! conflict instead of silently overwriting the first.
 
+use std::collections::HashMap;
+
 use rusqlite::{OptionalExtension as _, TransactionBehavior, params};
 use vole_kit::db::{self, DbError};
 use vole_kit::state::Core;
 
-use super::model::{Background, FieldError, Layout, validate};
+use super::model::{Background, FieldError, Layout, ServiceRef, validate};
+use crate::integrations;
+use crate::services::{Viewer, store as services};
 
 /// Why a layout could not be read.
 #[derive(Debug, thiserror::Error)]
@@ -119,6 +123,90 @@ enum Outcome {
     Conflict(u64),
     /// The document uses an image that is not the user's.
     BadImage,
+    /// A card is bound to a service, or to a metric, that the user may not use.
+    BadService(Vec<FieldError>),
+}
+
+/// One card's binding with where it is in the document.
+struct Bound {
+    path: String,
+    card: String,
+    service: ServiceRef,
+}
+
+/// The bound cards of `layout`, in document order.
+fn bound_cards(layout: &Layout) -> Vec<Bound> {
+    let mut out = Vec::new();
+    for (gi, group) in layout.groups.iter().enumerate() {
+        for (ci, card) in group.cards.iter().enumerate() {
+            if let Some(service) = &card.service {
+                out.push(Bound {
+                    path: format!("groups[{gi}].cards[{ci}]"),
+                    card: card.id.clone(),
+                    service: service.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// What is wrong with the bindings in `bound`, for `viewer`, inside the
+/// transaction `c`.
+///
+/// A binding the stored layout already has on the same card, unchanged, is
+/// let through: the service may have been deleted or hidden since (the card
+/// then shows "this service no longer exists"), and that must not stop the
+/// person from saving anything else on the page. Every other binding must
+/// name a service the viewer can see and metrics the service's kind has.
+/// A hidden service and one that does not exist give the same answer.
+fn binding_problems(
+    c: &rusqlite::Connection,
+    viewer: Viewer,
+    bound: &[Bound],
+    stored: Option<&Layout>,
+) -> rusqlite::Result<Vec<FieldError>> {
+    let kept: HashMap<&str, &ServiceRef> = stored
+        .into_iter()
+        .flat_map(|l| &l.groups)
+        .flat_map(|g| &g.cards)
+        .filter_map(|card| Some((card.id.as_str(), card.service.as_ref()?)))
+        .collect();
+    let mut kinds: HashMap<i64, Option<String>> = HashMap::new();
+    let mut problems = Vec::new();
+    for b in bound {
+        if kept.get(b.card.as_str()) == Some(&&b.service) {
+            continue;
+        }
+        let kind = match kinds.get(&b.service.id) {
+            Some(kind) => kind.clone(),
+            None => {
+                let kind = services::visible_kind(c, viewer, b.service.id)?;
+                kinds.insert(b.service.id, kind.clone());
+                kind
+            }
+        };
+        let Some(kind) = kind else {
+            problems.push(FieldError {
+                path: format!("{}.service", b.path),
+                code: "bad_service",
+            });
+            continue;
+        };
+        let known = integrations::find(&kind).map(|k| k.metrics());
+        let every_metric_exists = b
+            .service
+            .metrics
+            .iter()
+            .all(|m| known.is_some_and(|defs| defs.iter().any(|d| d.id == m)));
+        if !every_metric_exists {
+            problems.push(FieldError {
+                path: format!("{}.service.metrics", b.path),
+                code: "bad_metric",
+            });
+        }
+    }
+    Ok(problems)
 }
 
 /// Stores `layout` as the user's layout when `layout.version` is the stored
@@ -130,6 +218,11 @@ enum Outcome {
 /// checks it against the user's row, so a picture removed or replaced in
 /// between is never saved.
 /// That is a `bad_image` on `background.id`, before the version is looked at.
+///
+/// A card bound to a service must name one the user can see, and metrics its
+/// kind has (`bad_service` on `…service`, `bad_metric` on `…service.metrics`;
+/// see [`binding_problems`]). That is checked in the same transaction, after
+/// the version, against the stored layout.
 pub async fn save(core: &Core, user_id: i64, layout: &Layout) -> Result<u64, SaveError> {
     validate(layout).map_err(SaveError::Invalid)?;
     let expected = layout.version;
@@ -142,6 +235,7 @@ pub async fn save(core: &Core, user_id: i64, layout: &Layout) -> Result<u64, Sav
         Background::Image { id } => Some(id.clone()),
         Background::Preset { .. } => None,
     };
+    let bound = bound_cards(&next);
     let outcome = db::interact(&core.db, move |c| {
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(id) = image {
@@ -155,16 +249,35 @@ pub async fn save(core: &Core, user_id: i64, layout: &Layout) -> Result<u64, Sav
                 return Ok(Outcome::BadImage);
             }
         }
-        let stored: u64 = tx
+        let row: Option<(i64, String)> = tx
             .query_row(
-                "SELECT version FROM layouts WHERE user_id = ?1",
+                "SELECT version, doc FROM layouts WHERE user_id = ?1",
                 params![user_id],
-                |r| r.get::<_, i64>(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .optional()?
-            .map_or(0, |v| u64::try_from(v).unwrap_or_default());
+            .optional()?;
+        let stored = row
+            .as_ref()
+            .map_or(0, |(v, _)| u64::try_from(*v).unwrap_or_default());
         if stored != expected {
             return Ok(Outcome::Conflict(stored));
+        }
+        if !bound.is_empty() {
+            let admin: bool = tx
+                .query_row(
+                    "SELECT role = 'admin' FROM users WHERE id = ?1",
+                    params![user_id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(false);
+            // A stored document that cannot be read keeps nothing.
+            let before = row.and_then(|(_, doc)| serde_json::from_str::<Layout>(&doc).ok());
+            let problems =
+                binding_problems(&tx, Viewer::new(user_id, admin), &bound, before.as_ref())?;
+            if !problems.is_empty() {
+                return Ok(Outcome::BadService(problems));
+            }
         }
         // Version 0 means "nothing stored", so the first stored version is 1.
         let new = i64::try_from(stored + 1).unwrap_or(i64::MAX);
@@ -185,5 +298,6 @@ pub async fn save(core: &Core, user_id: i64, layout: &Layout) -> Result<u64, Sav
             path: "background.id".into(),
             code: "bad_image",
         }])),
+        Outcome::BadService(problems) => Err(SaveError::Invalid(problems)),
     }
 }

@@ -30,6 +30,9 @@ pub const MAX_ID: usize = 40;
 /// of combining marks.
 pub const MAX_EMOJI_BYTES: usize = 64;
 
+/// The most numbers one card shows from its service.
+pub const MAX_METRICS: usize = 4;
+
 /// Longest id of an uploaded background image, in characters (the renderer
 /// accepts the same shape, `render.js`).
 pub const MAX_IMAGE_ID: usize = 64;
@@ -92,6 +95,22 @@ pub struct Card {
     pub description: String,
     pub url: String,
     pub icon: Icon,
+    /// The service whose numbers the card shows. Layouts saved before
+    /// services existed have none, and a card without one is written without
+    /// the key, so such a layout reads and saves back unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<ServiceRef>,
+}
+
+/// A card's binding to a service: which one, and 1 to 4 of its metrics, in
+/// the order the card shows them. The ids are the kind's (`MetricDef::id`);
+/// [`validate`] checks their shape and count, and the save checks the service
+/// exists, is visible to the user and has these metrics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceRef {
+    pub id: i64,
+    pub metrics: Vec<String>,
 }
 
 /// A letter tile: the first letter of the title, or one emoji, on a palette
@@ -113,7 +132,8 @@ pub struct Bookmark {
 
 /// One thing wrong with a document: where, and a stable machine code
 /// (`too_long`, `required`, `bad_url`, `bad_scheme`, `too_many`, `bad_id`,
-/// `duplicate_id`, `bad_colour`, `bad_emoji`, `bad_preset`, `bad_image`).
+/// `duplicate_id`, `bad_colour`, `bad_emoji`, `bad_preset`, `bad_image`,
+/// `bad_service`, `bad_metric`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FieldError {
     /// For example `groups[0].cards[2].url`.
@@ -176,6 +196,15 @@ fn is_visible_symbol(emoji: &str) -> bool {
     }) && emoji.chars().any(|c| !is_emoji_glue(c) && !is_tag(c))
 }
 
+/// Whether `value` is 1 to 40 of `[A-Za-z0-9_-]`.
+fn id_shape(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_ID
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 /// The most problems [`validate`] returns.
 const MAX_ERRORS: usize = 100;
 
@@ -206,12 +235,7 @@ impl Checker {
 
     /// An id: 1 to 40 of `[A-Za-z0-9_-]`, unique in the document.
     fn id(&mut self, path: String, value: &str) {
-        let ok = !value.is_empty()
-            && value.len() <= MAX_ID
-            && value
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
-        if !ok {
+        if !id_shape(value) {
             self.err(path, "bad_id");
         } else if !self.ids.insert(value.to_string()) {
             self.err(path, "duplicate_id");
@@ -239,6 +263,30 @@ impl Checker {
             // too; keep only the plain `scheme://host` shape.
             Ok(_) if !plain_authority(value) => self.err(path, "bad_url"),
             Ok(_) => {}
+        }
+    }
+
+    /// A card's service binding, as far as it can be told without the
+    /// database: an id that can be one, and 1 to 4 metric ids of the shape of
+    /// an id, none twice. One problem at most is reported, on `…service.metrics`.
+    fn service(&mut self, path: &str, service: &ServiceRef) {
+        if service.id < 1 {
+            self.err(format!("{path}.service"), "bad_service");
+        }
+        let metrics = format!("{path}.service.metrics");
+        if service.metrics.is_empty() {
+            return self.err(metrics, "required");
+        }
+        // Over the limit: say so without walking a list of any length.
+        if service.metrics.len() > MAX_METRICS {
+            return self.err(metrics, "too_many");
+        }
+        if !service.metrics.iter().all(|m| id_shape(m)) {
+            return self.err(metrics, "bad_id");
+        }
+        let distinct: HashSet<&str> = service.metrics.iter().map(String::as_str).collect();
+        if distinct.len() != service.metrics.len() {
+            self.err(metrics, "duplicate_id");
         }
     }
 
@@ -317,6 +365,9 @@ pub fn validate(layout: &Layout) -> Result<(), Vec<FieldError>> {
             );
             c.url(format!("{cp}.url"), &card.url);
             c.icon(&format!("{cp}.icon"), &card.icon);
+            if let Some(service) = &card.service {
+                c.service(&cp, service);
+            }
         }
     }
     for (bi, bookmark) in layout.bookmarks.iter().enumerate() {

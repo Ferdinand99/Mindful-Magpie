@@ -10,6 +10,9 @@
 
 pub mod pages;
 pub mod store;
+pub mod view;
+
+pub use view::{MetricView, ServiceView, services_for};
 
 use std::time::Duration;
 
@@ -96,8 +99,11 @@ impl Viewer {
 }
 
 impl From<&CurrentUser> for Viewer {
+    /// Admin by the account's own role, not the request's: a read-only API
+    /// token caps `CurrentUser::role` at viewer, but the extension that holds it
+    /// shows its owner's page, and an admin's page may use admin-only services.
     fn from(user: &CurrentUser) -> Self {
-        Viewer::new(user.id, user.is_admin())
+        Viewer::new(user.id, user.account_role.is_admin())
     }
 }
 
@@ -133,6 +139,8 @@ pub struct ServiceSummary {
     pub id: i64,
     pub kind: String,
     pub name: String,
+    /// Seconds between fetches; a page needs it to tell a stale value.
+    pub interval_s: i64,
 }
 
 /// A change to the set of services, announced after it is stored (the

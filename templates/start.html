@@ -53,4 +53,6 @@
     that no text in it can end the block early (see json_for_html in pages.rs). -#}
 <script type="application/json" id="mm-layout">{{ layout_json|safe }}</script>
 <script type="application/json" id="mm-labels">{{ labels_json|safe }}</script>
+{#- Only the services this user may see, with their metrics: no address, no settings, no key. -#}
+<script type="application/json" id="mm-services">{{ services_json|safe }}</script>
 {% endblock %}

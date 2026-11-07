@@ -15,6 +15,17 @@ function readJson(doc, id) {
 }
 
 /**
+ * The services block of the page (`#mm-services`: what this user may see of the
+ * services, never an address or a key) as the renderer's `services` option. A
+ * page without the block, or with a block that is not a list, gives no option,
+ * and the renderer then draws bound cards as plain link cards.
+ */
+function servicesOpt(doc) {
+  const services = readJson(doc, "mm-services");
+  return Array.isArray(services) ? { services } : {};
+}
+
+/**
  * Draws the layout embedded in `doc` into #groups. On a page without #groups
  * (the body of another page was swapped in) it takes the background off <html>
  * instead, because htmx swaps only the body and <html> would keep it.
@@ -33,7 +44,7 @@ export function draw(doc) {
   // An unreadable layout draws as the empty page; the notice above says why.
   const layout = readJson(doc, "mm-layout");
   const labels = readJson(doc, "mm-labels") ?? {};
-  render(root, layout, { lang: doc.documentElement.lang, labels });
+  render(root, layout, { lang: doc.documentElement.lang, labels, ...servicesOpt(doc) });
 }
 
 /**
@@ -289,6 +300,7 @@ export function initEditing(doc, deps = {}) {
     try {
       editor = module.startEditing(root, () => readJson(doc, "mm-layout") ?? layout, save, {
         labels: readJson(doc, "mm-labels") ?? {},
+        ...servicesOpt(doc),
         lang: doc.documentElement.lang,
         editButton: button,
         reload: deps.reload,

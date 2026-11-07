@@ -7,6 +7,7 @@ pub mod store;
 
 pub use background::{BackgroundError, Backgrounds, Kind};
 pub use model::{
-    Background, Bookmark, Card, FieldError, Group, Icon, Layout, PALETTE, PRESETS, validate,
+    Background, Bookmark, Card, FieldError, Group, Icon, Layout, PALETTE, PRESETS, ServiceRef,
+    validate,
 };
 pub use store::{SaveError, StoreError, load, load_or_default, save};

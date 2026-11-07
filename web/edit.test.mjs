@@ -58,7 +58,7 @@ function layoutFixture() {
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-function setup({ layout = layoutFixture(), saveResult, background } = {}) {
+function setup({ layout = layoutFixture(), saveResult, background, services } = {}) {
   const { document, window } = parseHTML(
     `<!doctype html><html lang="en"><body><main>
        <div class="start-actions"><button type="button" id="mm-edit" aria-pressed="false">Edit</button></div>
@@ -89,6 +89,7 @@ function setup({ layout = layoutFixture(), saveResult, background } = {}) {
       editButton: document.getElementById("mm-edit"),
       reload: () => reloads.push(1),
       background,
+      services,
     });
   return { document, window, root, focus, saved, reloads, start, current };
 }
@@ -1996,4 +1997,321 @@ test("an_editor_whose_page_was_swapped_away_is_dropped_by_afterSettle", async ()
   fire(t, "htmx:afterSettle");
   assert.ok(fresh.textContent.includes("Sonarr"), "the new body is drawn");
   assert.equal(fresh.hasAttribute("data-editing"), false);
+});
+
+// ---- cards bound to services (Plan 4, task 3b) ---------------------------------
+
+const metric = (id, label, format = "number") => ({ id, label, format });
+const service = (id, name, metrics) => ({ id, name, kind: "http", interval_s: 60, metrics });
+const SERVICES = [
+  service(1, "Blog", [metric("status", "HTTP status"), metric("latency_ms", "Response time (ms)"), metric("checked", "Last checked", "since")]),
+  service(2, "Big one", ["a", "b", "c", "d", "e"].map((id) => metric(id, `Number ${id}`))),
+];
+
+/** Picks the service in the form's select, as a person (or their keyboard) does. */
+function chooseService(dialog, value) {
+  const select = dialog.querySelector('select[name="service"]');
+  for (const option of select.querySelectorAll("option")) {
+    const on = option.value === value;
+    if (on) option.setAttribute("selected", "");
+    else option.removeAttribute("selected");
+  }
+  select.dispatchEvent(new dialog.ownerDocument.defaultView.Event("change", { bubbles: true }));
+}
+
+const boxes = (dialog) => [...dialog.querySelectorAll('input[name="metric"]')];
+const boxOn = (box) => box.checked ?? box.hasAttribute("checked");
+
+function setBox(box, on) {
+  box.checked = on;
+  if (on) box.setAttribute("checked", "");
+  else box.removeAttribute("checked");
+  box.dispatchEvent(new box.ownerDocument.defaultView.Event("change", { bubbles: true }));
+}
+
+const metricsPicker = (dialog) => dialog.querySelector("[data-metrics]");
+
+function bound(id, metrics, extra = {}) {
+  return { ...card("c1", "Blog card"), service: { id, metrics }, ...extra };
+}
+
+function layoutWith(c1) {
+  const layout = layoutFixture();
+  layout.groups[0].cards[0] = c1;
+  return layout;
+}
+
+test("the_card_form_offers_a_labelled_service_select_with_none_first_in_the_tab_order", () => {
+  const t = setup({ services: SERVICES });
+  t.start();
+  click(act(item(t.root, "card", "c1"), "edit"));
+  const dialog = sheet(t.document);
+  const select = dialog.querySelector('select[name="service"]');
+  assert.ok(select, "a «Tjeneste» select");
+  const label = dialog.querySelector(`label[for="${select.getAttribute("id")}"]`);
+  assert.equal(label.firstChild.textContent, LABELS.field_service);
+  assert.equal(NB.field_service, "Tjeneste");
+  assert.equal(NB.service_none, "Ingen");
+  const options = [...select.querySelectorAll("option")].map((o) => [o.value, o.textContent]);
+  assert.deepEqual(options, [["", LABELS.service_none], ["1", "Blog"], ["2", "Big one"]]);
+  // The select describes itself with the help text and the error line.
+  for (const id of select.getAttribute("aria-describedby").split(" ")) assert.ok(dialog.querySelector(`#${id}`), id);
+  // Nothing is chosen on a card without a service, and no boxes are shown.
+  assert.ok(metricsPicker(dialog).hasAttribute("hidden"));
+  assert.equal(boxes(dialog).length, 0);
+  // Reachable by Tab in the order of the form: after the colours, before the buttons.
+  const order = [...dialog.querySelectorAll("input, select, button, textarea, a[href]")];
+  assert.ok(order.indexOf(dialog.querySelector('[name="title"]')) < order.indexOf(select));
+  assert.ok(order.indexOf(dialog.querySelector('input[name="colour"]')) < order.indexOf(select));
+  assert.ok(order.indexOf(select) < order.indexOf(dialog.querySelector('button[type="submit"]')));
+  assert.equal(dialog.querySelector("[tabindex]"), null, "no tabindex: the natural order stands");
+  assert.equal(select.hasAttribute("disabled"), false);
+});
+
+test("a_keyboard_flow_binds_a_card_to_a_service_with_two_numbers_and_saves_the_payload", async () => {
+  const t = setup({ services: SERVICES });
+  const ed = t.start();
+  click(act(item(t.root, "card", "c1"), "edit"));
+  const dialog = sheet(t.document);
+  chooseService(dialog, "1");
+
+  // The numbers of the service, each a labelled checkbox in a labelled group; the first is on.
+  const picker = metricsPicker(dialog);
+  assert.equal(picker.hasAttribute("hidden"), false);
+  const group = picker.querySelector('[role="group"]');
+  assert.equal(picker.querySelector(`#${group.getAttribute("aria-labelledby")}`).textContent, LABELS.field_metrics);
+  assert.deepEqual(boxes(dialog).map((b) => b.value), ["status", "latency_ms", "checked"]);
+  for (const box of boxes(dialog)) {
+    assert.equal(box.closest("label")?.tagName, "LABEL", `${box.value} is inside a label`);
+    assert.ok(box.closest("label").textContent.trim().length > 0);
+  }
+  assert.deepEqual(boxes(dialog).map(boxOn), [true, false, false]);
+
+  setBox(boxes(dialog)[1], true);
+  submit(dialog);
+  await tick();
+  assert.equal(sheet(t.document), null, "the form closed");
+  assert.deepEqual(ed.draft().groups[0].cards[0].service, { id: 1, metrics: ["status", "latency_ms"] });
+  assert.equal(ed.isDirty(), true);
+
+  click(act(bar(t.document), "done"));
+  await tick();
+  assert.equal(t.saved.length, 1);
+  assert.deepEqual(t.saved[0].groups[0].cards[0].service, { id: 1, metrics: ["status", "latency_ms"] });
+  // The other cards were not touched and have no service key at all.
+  assert.equal("service" in t.saved[0].groups[0].cards[1], false);
+});
+
+test("at_four_numbers_the_other_boxes_are_disabled_with_a_hint_and_come_back_at_three", () => {
+  const t = setup({ services: SERVICES });
+  t.start();
+  click(act(item(t.root, "card", "c1"), "edit"));
+  const dialog = sheet(t.document);
+  chooseService(dialog, "2");
+  assert.equal(boxes(dialog).length, 5);
+  const hint = metricsPicker(dialog).querySelector("p.help");
+  assert.equal(hint.getAttribute("aria-live"), "polite");
+  assert.equal(hint.textContent, LABELS.help_metrics);
+  for (const box of boxes(dialog)) assert.equal(box.getAttribute("aria-describedby"), hint.getAttribute("id"));
+
+  for (const box of boxes(dialog).slice(1, 4)) setBox(box, true);
+  assert.deepEqual(boxes(dialog).map(boxOn), [true, true, true, true, false]);
+  assert.equal(boxes(dialog)[4].hasAttribute("disabled"), true, "the fifth is disabled");
+  assert.equal(boxes(dialog)[0].hasAttribute("disabled"), false, "the ticked ones can be cleared");
+  assert.equal(hint.textContent, LABELS.metrics_full);
+
+  setBox(boxes(dialog)[0], false);
+  assert.equal(boxes(dialog)[4].hasAttribute("disabled"), false);
+  assert.equal(hint.textContent, LABELS.help_metrics);
+});
+
+test("a_service_with_no_number_ticked_or_five_ticked_is_refused_in_the_form", async () => {
+  const t = setup({ services: SERVICES });
+  const ed = t.start();
+  click(act(item(t.root, "card", "c1"), "edit"));
+  const dialog = sheet(t.document);
+  chooseService(dialog, "2");
+  setBox(boxes(dialog)[0], false);
+  submit(dialog);
+  await tick();
+  assert.equal(sheet(t.document), dialog, "the form stays open");
+  const message = dialog.querySelector('.field-error[data-for="service"]');
+  assert.equal(message.hasAttribute("hidden"), false);
+  assert.equal(message.textContent, LABELS.err_service_metrics);
+  assert.equal(dialog.querySelector('select[name="service"]').getAttribute("aria-invalid"), "true");
+  assert.equal(t.focus.last.getAttribute("name"), "service", "focus goes to the select");
+  assert.equal(ed.isDirty(), false);
+
+  // Five at once cannot be ticked from the keyboard, but the rule is the same if it were.
+  for (const box of boxes(dialog)) {
+    box.removeAttribute("disabled");
+    box.checked = true;
+  }
+  submit(dialog);
+  await tick();
+  assert.equal(message.textContent, LABELS.err_service_metrics);
+  assert.equal(ed.isDirty(), false);
+});
+
+test("choosing_none_sends_null_and_a_card_that_never_had_a_service_sends_no_key", async () => {
+  const t = setup({ services: SERVICES, layout: layoutWith(bound(1, ["status", "checked"])) });
+  const ed = t.start();
+  click(act(item(t.root, "card", "c1"), "edit"));
+  let dialog = sheet(t.document);
+  const select = dialog.querySelector('select[name="service"]');
+  // The form starts from the card: Blog, with its two numbers ticked.
+  assert.equal([...select.querySelectorAll("option")].find((o) => o.hasAttribute("selected")).textContent, "Blog");
+  assert.deepEqual(boxes(dialog).map(boxOn), [true, false, true]);
+
+  chooseService(dialog, "");
+  assert.ok(metricsPicker(dialog).hasAttribute("hidden"));
+  submit(dialog);
+  await tick();
+  assert.equal(ed.draft().groups[0].cards[0].service, null);
+
+  click(act(bar(t.document), "done"));
+  await tick();
+  assert.equal(t.saved[0].groups[0].cards[0].service, null);
+  assert.ok("service" in t.saved[0].groups[0].cards[0], "an explicit null, not a missing key");
+
+  // A card that never had one: saving the form unchanged is no change, and adds no key.
+  const t2 = setup({ services: SERVICES });
+  const ed2 = t2.start();
+  click(act(item(t2.root, "card", "c2"), "edit"));
+  dialog = sheet(t2.document);
+  submit(dialog);
+  await tick();
+  assert.equal(ed2.isDirty(), false);
+  assert.equal("service" in ed2.draft().groups[0].cards[1], false);
+
+  // A new card can be bound at once.
+  click(act(item(t2.root, "group", "g2"), "add-card"));
+  dialog = sheet(t2.document);
+  fill(dialog, { title: "Blog", url: "blog.example.com" });
+  chooseService(dialog, "1");
+  submit(dialog);
+  await tick();
+  assert.deepEqual(ed2.draft().groups[1].cards.at(-1).service, { id: 1, metrics: ["status"] });
+});
+
+test("another_service_starts_with_its_first_number_and_the_same_one_comes_back_as_it_was", () => {
+  const t = setup({ services: SERVICES, layout: layoutWith(bound(1, ["latency_ms", "checked"])) });
+  t.start();
+  click(act(item(t.root, "card", "c1"), "edit"));
+  const dialog = sheet(t.document);
+  chooseService(dialog, "2");
+  assert.deepEqual(boxes(dialog).map((b) => [b.value, boxOn(b)]), [["a", true], ["b", false], ["c", false], ["d", false], ["e", false]]);
+  chooseService(dialog, "1");
+  assert.deepEqual(boxes(dialog).map(boxOn), [false, true, true]);
+});
+
+test("a_card_whose_service_is_gone_says_so_keeps_its_binding_and_lets_the_person_pick_another", async () => {
+  const t = setup({ services: SERVICES, layout: layoutWith(bound(99, ["status"])) });
+  const ed = t.start();
+  click(act(item(t.root, "card", "c1"), "edit"));
+  let dialog = sheet(t.document);
+  const select = dialog.querySelector('select[name="service"]');
+  const gone = [...select.querySelectorAll("option")].find((o) => o.hasAttribute("data-gone"));
+  assert.ok(gone, "an option says the service is gone");
+  assert.equal(gone.textContent, LABELS.service_missing);
+  assert.equal(NB.service_missing, "Tjenesten finnes ikke lenger");
+  assert.equal(gone.hasAttribute("selected"), true);
+  assert.ok(metricsPicker(dialog).hasAttribute("hidden"));
+  // None and the real services are offered next to it.
+  assert.deepEqual([...select.querySelectorAll("option")].map((o) => o.value), ["", "1", "2", "99"]);
+
+  // Saving as it is changes nothing (the server lets an unchanged binding through).
+  submit(dialog);
+  await tick();
+  assert.deepEqual(ed.draft().groups[0].cards[0].service, { id: 99, metrics: ["status"] });
+  assert.equal(ed.isDirty(), false);
+
+  // Another service.
+  click(act(item(t.root, "card", "c1"), "edit"));
+  dialog = sheet(t.document);
+  chooseService(dialog, "1");
+  submit(dialog);
+  await tick();
+  assert.deepEqual(ed.draft().groups[0].cards[0].service, { id: 1, metrics: ["status"] });
+
+  // And back to none, from a gone one.
+  const t2 = setup({ services: SERVICES, layout: layoutWith(bound(99, ["status"])) });
+  const ed2 = t2.start();
+  click(act(item(t2.root, "card", "c1"), "edit"));
+  chooseService(sheet(t2.document), "");
+  submit(sheet(t2.document));
+  await tick();
+  assert.equal(ed2.draft().groups[0].cards[0].service, null);
+});
+
+test("without_a_services_list_the_form_offers_none_and_the_bound_card_counts_as_gone", () => {
+  const t = setup({ layout: layoutWith(bound(1, ["status"])) });
+  t.start();
+  click(act(item(t.root, "card", "c1"), "edit"));
+  const select = sheet(t.document).querySelector('select[name="service"]');
+  assert.deepEqual([...select.querySelectorAll("option")].map((o) => o.value), ["", "1"]);
+});
+
+test("a_service_name_with_markup_stays_text_in_the_form", () => {
+  const evil = [service(5, '<img src=x onerror="alert(1)">', [metric("m", "<b>bold</b>")])];
+  const t = setup({ services: evil });
+  t.start();
+  click(act(item(t.root, "card", "c1"), "edit"));
+  const dialog = sheet(t.document);
+  chooseService(dialog, "5");
+  assert.equal(dialog.querySelector("img"), null);
+  assert.equal(dialog.querySelector("b"), null);
+  assert.match(dialog.querySelector('select[name="service"]').textContent, /<img src=x/);
+});
+
+test("a_422_for_a_service_opens_the_card_form_with_the_message_under_the_select", async () => {
+  for (const [path, code, message] of [
+    ["groups[0].cards[0].service", "bad_service", LABELS.err_bad_service],
+    ["groups[0].cards[0].service.metrics", "bad_metric", LABELS.err_bad_metric],
+    ["groups[0].cards[0].service.metrics", "too_many", LABELS.err_service_metrics],
+  ]) {
+    const t = setup({
+      services: SERVICES,
+      layout: layoutWith(bound(1, ["status"])),
+      saveResult: { status: 422, body: { error: "invalid", fields: [{ path, code }] } },
+    });
+    t.start();
+    click(act(item(t.root, "group", "g2"), "add-card"));
+    fill(sheet(t.document), { title: "x", url: "x.example" });
+    submit(sheet(t.document));
+    await tick();
+    click(act(bar(t.document), "done"));
+    await tick();
+    // The summary names the field, not a list limit (a service problem is not "too many cards").
+    assert.match(alertText(t.document), new RegExp(LABELS.field_service));
+    assert.doesNotMatch(alertText(t.document), /at most \d+ (groups|cards|bookmarks)/);
+    click(t.document.querySelector(".mm-edit-alert button[data-path]"));
+    const dialog = sheet(t.document);
+    assert.ok(dialog, `${code}: the card's form is open`);
+    assert.equal(dialog.querySelector('.field-error[data-for="service"]').textContent, message, code);
+    assert.equal(dialog.querySelector('select[name="service"]').getAttribute("aria-invalid"), "true");
+  }
+});
+
+test("leaving_edit_mode_draws_bound_cards_with_the_services_again", async () => {
+  const t = setup({ services: SERVICES, layout: layoutWith(bound(1, ["status"])) });
+  t.start();
+  click(act(bar(t.document), "cancel"));
+  await tick();
+  const el = t.root.querySelector(".mm-card.mm-bound");
+  assert.ok(el, "the card is drawn as a bound card, not as a plain link");
+  assert.equal(el.getAttribute("data-service"), "1");
+  // No answer yet (the values come in the next task): the card says it is waiting.
+  assert.equal(el.querySelector(".mm-svc-notice").textContent, LABELS.service_waiting);
+  assert.equal(el.querySelector(".mm-status").getAttribute("data-status"), "unknown");
+});
+
+test("every_label_the_service_field_uses_is_listed_and_translated", () => {
+  const source = readFileSync(new URL("../static/magpie/edit.js", import.meta.url), "utf8");
+  const listed = source.match(/export const LABEL_KEYS = \[([\s\S]*?)\];/)[1];
+  for (const key of ["field_service", "service_none", "service_missing", "help_service", "field_metrics", "help_metrics", "metrics_full", "err_service_metrics", "err_bad_service", "err_bad_metric"]) {
+    assert.ok(listed.includes(`"${key}"`), `LABEL_KEYS lacks ${key}`);
+    assert.ok(source.includes(`L("${key}"`), `${key} is used`);
+    assert.ok(LABELS[key] && NB[key] && LABELS[key] !== NB[key], `${key} in both languages`);
+  }
 });

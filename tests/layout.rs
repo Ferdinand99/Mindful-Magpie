@@ -5,7 +5,8 @@ mod common;
 
 use common::{App, add_user};
 use mindful_magpie::layout::{
-    self, Background, Bookmark, Card, FieldError, Group, Icon, Layout, SaveError, validate,
+    self, Background, Bookmark, Card, FieldError, Group, Icon, Layout, SaveError, ServiceRef,
+    validate,
 };
 
 fn card(id: &str) -> Card {
@@ -18,6 +19,7 @@ fn card(id: &str) -> Card {
             emoji: None,
             colour: "teal".into(),
         },
+        service: None,
     }
 }
 
@@ -678,4 +680,95 @@ async fn an_unreadable_layout_reports_the_version_it_was_read_at() {
         layout::load(&app.magpie.core, ada).await.unwrap().version,
         8
     );
+}
+
+// ---------------------------------------------------------------------------
+// Cards bound to a service (Plan 4, task 3b)
+
+fn bound(metrics: &[&str]) -> ServiceRef {
+    ServiceRef {
+        id: 7,
+        metrics: metrics.iter().map(|m| (*m).to_string()).collect(),
+    }
+}
+
+#[test]
+fn a_card_with_a_service_round_trips() {
+    let mut l = sample();
+    l.groups[0].cards[0].service = Some(bound(&["status", "checked"]));
+    assert_eq!(codes(&l), vec![]);
+    let json = serde_json::to_value(&l).unwrap();
+    assert_eq!(
+        json["groups"][0]["cards"][0]["service"],
+        serde_json::json!({ "id": 7, "metrics": ["status", "checked"] })
+    );
+    let back: Layout = serde_json::from_value(json).unwrap();
+    assert_eq!(back, l);
+}
+
+#[test]
+fn an_old_card_without_service_loads_and_is_written_without_it() {
+    let old = serde_json::to_value(sample()).unwrap();
+    // The document of a layout stored before services existed.
+    assert!(old["groups"][0]["cards"][0].get("service").is_none());
+    let l: Layout = serde_json::from_value(old.clone()).unwrap();
+    assert_eq!(l.groups[0].cards[0].service, None);
+    assert_eq!(serde_json::to_value(&l).unwrap(), old);
+    // `null` reads as none, and is not written back.
+    let mut with_null = old.clone();
+    with_null["groups"][0]["cards"][0]["service"] = serde_json::Value::Null;
+    let l: Layout = serde_json::from_value(with_null).unwrap();
+    assert_eq!(serde_json::to_value(&l).unwrap(), old);
+}
+
+#[test]
+fn a_service_binding_refuses_unknown_fields() {
+    let mut v = serde_json::to_value(sample()).unwrap();
+    v["groups"][0]["cards"][0]["service"] =
+        serde_json::json!({ "id": 1, "metrics": ["a"], "name": "x" });
+    assert!(serde_json::from_value::<Layout>(v).is_err());
+}
+
+#[test]
+fn service_binding_validation_table() {
+    let path = "groups[0].cards[0].service.metrics";
+    let with =
+        |service: ServiceRef| move |l: &mut Layout| l.groups[0].cards[0].service = Some(service);
+    expect(with(bound(&[])), path, "required");
+    expect(with(bound(&["a", "b", "c", "d", "e"])), path, "too_many");
+    expect(with(bound(&["a", "b", "a"])), path, "duplicate_id");
+    expect(with(bound(&["has space"])), path, "bad_id");
+    expect(with(bound(&[""])), path, "bad_id");
+    expect(with(bound(&[&"x".repeat(41)])), path, "bad_id");
+    expect(
+        with(ServiceRef {
+            id: 0,
+            metrics: vec!["a".into()],
+        }),
+        "groups[0].cards[0].service",
+        "bad_service",
+    );
+    expect(
+        with(ServiceRef {
+            id: -3,
+            metrics: vec!["a".into()],
+        }),
+        "groups[0].cards[0].service",
+        "bad_service",
+    );
+    // One to four, in the shape of an id, passes.
+    for n in 1..=4 {
+        let metrics: Vec<String> = (0..n).map(|i| format!("m_{i}-x")).collect();
+        let mut l = sample();
+        l.groups[0].cards[0].service = Some(ServiceRef { id: 1, metrics });
+        assert_eq!(codes(&l), vec![], "{n} metrics");
+    }
+    // A huge list is refused by its length, not walked.
+    let many: Vec<String> = (0..50_000).map(|i| format!("m{i}")).collect();
+    let mut l = sample();
+    l.groups[0].cards[0].service = Some(ServiceRef {
+        id: 1,
+        metrics: many,
+    });
+    assert_eq!(codes(&l), vec![(path.to_string(), "too_many")]);
 }

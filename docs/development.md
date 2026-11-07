@@ -16,7 +16,7 @@ src/
   lib.rs              # start() (database, state) and router()
   product.rs          # KitConfig: names, cookies, token prefixes, nav, settings tabs, locales, static files
   pages.rs            # Magpie's own pages: the start page and the Settings redirect
-  api.rs              # REST routes for the extension: GET /api/v1/me/start, POST /api/v1/extension/token
+  api.rs              # REST routes for the extension: GET /api/v1/me/start (the layout plus `services`), POST /api/v1/extension/token
   connect.rs          # the extension's consent page (GET/POST /connect/extension) and its one-time codes
   config.rs           # flags and MM_* environment variables
   server.rs           # listener, graceful shutdown
@@ -31,7 +31,7 @@ web/                  # JavaScript tests (node --test, linkedom): render*, ops, 
 extension/            # the Firefox extension; extension/vendor/ is generated from static/magpie/ and web/kit-tokens.css
 migrations/           # Magpie's migrations (0001 init, 0002 layouts, 0003 extension codes, 0004 backgrounds, 0005 kept background, 0006 services, 0007 snapshots)
 locales/              # Magpie's strings (en, nb)
-tests/                # boot.rs, auth.rs, start.rs, layout.rs, layout_http.rs, api_start.rs, background.rs (uploads, the kept picture, token limits, upgrades from older schemas), connect.rs, services.rs (the services pages, sealed secrets, «Test» and the http kind against a stub server run in the test), poller.rs (the poller on a paused clock with a stub kind; hostile answers and secrets against a stub web server); common/ builds an in-process app on a temporary data directory
+tests/                # boot.rs, auth.rs, start.rs, layout.rs, layout_http.rs, cards.rs (cards bound to services: the save checks, the `#mm-services` embed, what a hidden service leaks), api_start.rs, background.rs (uploads, the kept picture, token limits, upgrades from older schemas), connect.rs, services.rs (the services pages, sealed secrets, «Test» and the http kind against a stub server run in the test), poller.rs (the poller on a paused clock with a stub kind; hostile answers and secrets against a stub web server); common/ builds an in-process app on a temporary data directory
 Dockerfile            # static musl binary on Alpine
 docker/               # the entrypoint (PUID/PGID)
 about.toml, about.hbs # cargo-about: licence allowlist and template for THIRD-PARTY-NOTICES
@@ -48,10 +48,10 @@ Builds and tests run in Docker on a build host (a shared Docker daemon), not on 
 cargo commands that run inside a Rust 1.99 container with clippy and rustfmt installed.
 
 ```bash
-cargo test --locked                                  # 208 Rust tests: boot, auth and users, start page, layout, backgrounds and migrations, extension API and connect flow, services, the poller
+cargo test --locked                                  # 228 Rust tests: boot, auth and users, start page, layout, backgrounds and migrations, extension API and connect flow, services, the poller
 cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --all --check
-cd web && npm ci && node --test                     # 242 JavaScript tests: renderer, operations, rules, edit mode and page wiring, the extension (node:22 container; linkedom stands in for the DOM)
+cd web && npm ci && node --test                     # 305 JavaScript tests: renderer, operations, rules, edit mode and page wiring, the extension (node:22 container; linkedom stands in for the DOM)
 cd web && npm run build:extension                    # copies the renderer into extension/vendor/; git must show no change
 docker build -t magpie:dev .
 docker run --rm magpie:dev --help     # every flag and its MM_ variable
