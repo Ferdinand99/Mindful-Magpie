@@ -11,7 +11,8 @@
 # step only (as WEB_EXT_API_KEY and WEB_EXT_API_SECRET in its environment) and are never printed.
 #
 # The sign job runs only for a tag or for main (the `if:` below). The secrets are repository
-# secrets, with no Environment: a workflow on any other branch cannot sign.
+# secrets, with no Environment. The `if:` only stops accidental manual runs from other branches;
+# it is not a security boundary, because it lives in the workflow file of the ref that runs.
 #
 # When the sign job succeeded and only the release job failed, re-run the failed job only
 # ("Re-run failed jobs", or "Re-run" on the release job): it picks up the signed .xpi from the

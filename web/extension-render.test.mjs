@@ -360,3 +360,27 @@ test("labels: a key missing in English falls back to Norwegian, never to an empt
     shipped.en.bookmarks_label = saved;
   }
 });
+
+test("a failed new image releases the old blob, and the old id is fetched again later", async () => {
+  let failNext = false;
+  const v = makeView({
+    fetchImpl: async (url) => {
+      v.fetchedUrls.push(url);
+      if (failNext) throw new TypeError("NetworkError");
+      return { status: 200, blob: async () => ({ type: "image/png" }) };
+    },
+  });
+  v.fetchedUrls = [];
+  await v.draw({ status: "fresh", data: imageLayout("old") }, CONN);
+  assert.equal(bgImage(v.html), `url("${v.urls.created[0]}")`);
+  failNext = true;
+  await v.draw({ status: "fresh", data: imageLayout("new") }, CONN);
+  assert.equal(v.html.getAttribute("data-bg"), "hedgerow");
+  assert.equal(bgImage(v.html), "");
+  assert.deepEqual(v.urls.revoked, [v.urls.created[0]], "the old blob URL is revoked");
+  failNext = false;
+  await v.draw({ status: "fresh", data: imageLayout("old") }, CONN);
+  assert.deepEqual(v.fetchedUrls.map((u) => u.split("/").pop()), ["old", "new", "old"]);
+  assert.equal(v.urls.created.length, 2);
+  assert.equal(bgImage(v.html), `url("${v.urls.created[1]}")`);
+});

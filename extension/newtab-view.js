@@ -34,6 +34,8 @@ export function createView({ doc, statusEl, root, language, fetchImpl, openOptio
   }
 
   function fallBack() {
+    // The image that was shown is gone from the page, so its blob URL goes too.
+    release();
     html.setAttribute("data-bg", FALLBACK_PRESET);
     html.style.removeProperty("--mm-bg-image");
   }

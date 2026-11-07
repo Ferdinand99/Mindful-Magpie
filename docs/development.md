@@ -86,7 +86,7 @@ A new licence must be added to `accepted` in `about.toml` on purpose. The image 
 ## Signing the extension
 
 `extension/` is the Firefox extension. `web/` holds its test tooling, including the pinned `web-ext`. CI runs
-`npx web-ext lint --source-dir ../extension --self-hosted` in the `Web tests (extension)` job on every pull
+`npx web-ext lint --source-dir ../extension --self-hosted` in the `Web tests` job on every pull
 request. Run the same commands on the build host:
 
 ```bash
