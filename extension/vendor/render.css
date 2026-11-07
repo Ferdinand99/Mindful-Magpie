@@ -112,10 +112,17 @@ html:root:has(.mm-root)[data-bg="image"] {
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
   gap: var(--sp-3);
   min-width: 0;
+  /* The grid is what the wide cards look at (see the container query below): two columns of it
+     are wide enough for two columns of a card, whatever the width of the screen. */
+  container-type: inline-size;
 }
 
 /* Cards ----------------------------------------------------------------------- */
+/* A card is a box; its title is the link, stretched over the whole box by ::after, so the card
+   opens when it is clicked anywhere (also with the middle button, a modifier key or the context
+   menu) and links inside the card (in its blocks) still work: they lie above (z-index 1). */
 .mm-card {
+  position: relative;
   display: flex;
   align-items: center;
   gap: var(--sp-3);
@@ -123,23 +130,40 @@ html:root:has(.mm-root)[data-bg="image"] {
   padding: var(--sp-3) 0.875rem;
   color: var(--text);
   text-decoration: none;
-}
-a.mm-card {
   transition:
     transform 0.12s cubic-bezier(0.23, 1, 0.32, 1),
     border-color 0.2s;
 }
+.mm-card-link {
+  color: inherit;
+  text-decoration: none;
+}
+.mm-card-link[href]::after {
+  content: "";
+  position: absolute;
+  /* Over the border too: the whole box is the link. */
+  inset: -1px;
+  border-radius: var(--r-lg);
+}
+/* The ring is the card's, not the title's. */
+.mm-card-link:focus-visible {
+  outline: none;
+}
+.mm-card-link:focus-visible::after {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
 @media (hover: hover) and (pointer: fine) {
-  a.mm-card:hover {
+  .mm-card:has(.mm-card-link[href]:hover) {
     border-color: var(--line-strong);
     transform: translateY(-1px);
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  a.mm-card {
+  .mm-card {
     transition: none;
   }
-  a.mm-card:hover {
+  .mm-card:has(.mm-card-link[href]:hover) {
     transform: none;
   }
 }
@@ -321,14 +345,14 @@ a.mm-card {
 
 /* Wide cards and detail blocks ------------------------------------------------------
    A card is normal or wide (render() sets data-size). A wide card spans two columns of the
-   grid on a wide screen and one below about 700px, where the grid has one column anyway.
+   grid when the grid is wide enough for two (33.5rem) and takes one column below that.
    Metric cells wrap in two columns on a normal card and in up to five on a wide one.
 
    The blocks (.mm-blocks) come after the cells: lists (.mm-list), bars (.mm-bars), strips
    (.mm-strip) and facts (.mm-facts), each with a small heading (.mm-block-title). A normal
    card shows the first list (three lines and "+ N more") and the first bars or strip; a wide
    card shows all of them, in two inner columns on a wide screen. */
-@media (min-width: 700px) {
+@container (min-width: 33.5rem) {
   .mm-card-wide {
     grid-column: span 2;
   }
@@ -389,6 +413,14 @@ a.mm-card {
   padding: 0;
   list-style: none;
 }
+.mm-li-slot {
+  display: flex;
+  flex: none;
+  align-items: center;
+}
+.mm-li-slot:empty {
+  display: none;
+}
 .mm-li {
   display: flex;
   align-items: center;
@@ -420,6 +452,11 @@ a.mm-card {
 a.mm-li-text:hover {
   text-decoration: underline;
 }
+/* A link in a block lies above the card's stretched link. */
+.mm-li-link {
+  position: relative;
+  z-index: 1;
+}
 .mm-li-link:focus-visible {
   outline: 2px solid var(--brand);
   outline-offset: 2px;
@@ -429,6 +466,17 @@ a.mm-li-text:hover {
 .mm-block-more {
   color: var(--muted);
   font-size: 0.71875rem;
+}
+.mm-badge {
+  align-self: flex-start;
+  margin-block-start: 0.1875rem;
+  padding: 0.0625rem 0.4375rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.65625rem;
+  line-height: 1.4;
+  white-space: nowrap;
 }
 .mm-li-sub {
   min-width: 0;
@@ -500,6 +548,15 @@ a.mm-li-text:hover {
   height: 100%;
   border-radius: 3px;
   background: var(--neutral);
+}
+.mm-bar-fill[data-status="ok"] {
+  background: var(--ok-text);
+}
+.mm-bar-fill[data-status="warn"] {
+  background: var(--warn-text);
+}
+.mm-bar-fill[data-status="bad"] {
+  background: var(--bad-text);
 }
 
 /* A strip: one cell for each reading (a status), side by side across the width. */

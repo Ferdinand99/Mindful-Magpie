@@ -452,10 +452,47 @@ function cardSizeOf(el) {
   return el.getAttribute("data-size") === "wide" ? "wide" : "normal";
 }
 
-/** The blocks of `details` that are well formed, at most six. */
-function wellFormedBlocks(details) {
+/** An `at` (epoch seconds) as milliseconds, or null when it is not a number. */
+function momentMs(at) {
+  return typeof at === "number" && Number.isFinite(at) ? at * 1000 : null;
+}
+
+/**
+ * A block as it is drawn: its kind, title key and the entries that can be drawn (at most the caps),
+ * or null when none can (a block with nothing to show is not drawn, not even its title).
+ */
+function shapeBlock(block, labels) {
+  const list = (value) => (Array.isArray(value) ? value.filter(isObject) : []);
+  let entries;
+  if (block.kind === "list") {
+    entries = list(block.items)
+      .filter((item) => text(item.text) !== "")
+      .slice(0, MAX_ITEMS);
+  } else if (block.kind === "bars") {
+    entries = list(block.bars).slice(0, MAX_ITEMS);
+  } else if (block.kind === "strip") {
+    entries = (Array.isArray(block.cells) ? block.cells : []).slice(0, MAX_CELLS);
+  } else {
+    // A row with no usable label (an unknown key and no text) says nothing: it is left out.
+    entries = list(block.rows)
+      .map((row) => ({ row, name: detailLabel(labels, row.label_key) || text(row.label) }))
+      .filter(({ name }) => name !== "")
+      .slice(0, MAX_ITEMS);
+  }
+  return entries.length === 0 ? null : { kind: block.kind, title_key: block.title_key, entries };
+}
+
+/** The blocks of `details` that can be drawn, at most six. */
+function wellFormedBlocks(details, labels) {
   if (!Array.isArray(details)) return [];
-  return details.filter((b) => isObject(b) && BLOCK_KINDS.includes(b.kind)).slice(0, MAX_BLOCKS);
+  const out = [];
+  for (const block of details) {
+    if (!isObject(block) || !BLOCK_KINDS.includes(block.kind)) continue;
+    const shaped = shapeBlock(block, labels);
+    if (shaped) out.push(shaped);
+    if (out.length === MAX_BLOCKS) break;
+  }
+  return out;
 }
 
 /**
@@ -479,52 +516,65 @@ function blocksFor(blocks, size) {
   return picked;
 }
 
-function blockTitle(doc, labels, block) {
-  const title = detailLabel(labels, block.title_key);
-  return title === "" ? null : make(doc, "span", "mm-block-title", title);
+/** A relative age in `className`, counted from the moment `thenMs` (tickAges() keeps it current). */
+function drawMoment(doc, className, thenMs, ctx) {
+  const el = isolated(doc, "span", className, formatRelative(Math.min(thenMs, ctx.nowMs), ctx.nowMs, ctx.lang));
+  el.setAttribute("data-since", String(thenMs));
+  return el;
 }
 
-function drawListItem(doc, labels, item) {
+function drawListItem(doc, ctx, item) {
   const li = make(doc, "li", "mm-li");
+  const href = safeHref(item.href);
+  const itemText = text(item.text);
+  // What a changed list is matched to the one on the page by: the line's link, else its text.
+  li.setAttribute("data-key", href ?? itemText);
+  // The slot is always there, so that a line that gains or loses its dot keeps its place.
+  const slot = make(doc, "span", "mm-li-slot");
   if (STATUSES.includes(item.status)) {
     li.setAttribute("data-status", item.status);
-    li.appendChild(drawStatus(doc, labels, item.status));
+    slot.appendChild(drawStatus(doc, ctx.labels, item.status));
   }
+  li.appendChild(slot);
   const main = make(doc, "span", "mm-li-main");
-  const href = safeHref(item.href);
   let line;
   if (href) {
-    line = isolated(doc, "a", "mm-li-text mm-li-link", text(item.text));
+    line = isolated(doc, "a", "mm-li-text mm-li-link", itemText);
     line.setAttribute("href", href);
     line.setAttribute("rel", "noreferrer");
   } else {
-    line = isolated(doc, "span", "mm-li-text", text(item.text));
+    line = isolated(doc, "span", "mm-li-text", itemText);
   }
   main.appendChild(line);
   const sub = text(item.sub);
   if (sub !== "") main.appendChild(isolated(doc, "span", "mm-li-sub", sub));
+  // A badge is a detail key; one the page does not know shows nothing.
+  const badge = detailLabel(ctx.labels, item.badge_key);
+  if (badge !== "") main.appendChild(make(doc, "span", "mm-badge", badge));
   li.appendChild(main);
+  const at = momentMs(item.at);
   const right = text(item.right);
-  if (right !== "") li.appendChild(isolated(doc, "span", "mm-li-right", right));
+  if (at !== null) li.appendChild(drawMoment(doc, "mm-li-right", at, ctx));
+  else if (right !== "") li.appendChild(isolated(doc, "span", "mm-li-right", right));
   return li;
 }
 
-function drawList(doc, labels, block, cut) {
-  const items = (Array.isArray(block.items) ? block.items : []).filter(isObject).slice(0, MAX_ITEMS);
+function drawList(doc, ctx, block, cut) {
   const ul = make(doc, "ul", "mm-list");
-  const shown = cut ? items.slice(0, NORMAL_LINES) : items;
-  for (const item of shown) ul.appendChild(drawListItem(doc, labels, item));
-  const more = items.length - shown.length;
+  const shown = cut ? block.entries.slice(0, NORMAL_LINES) : block.entries;
+  for (const item of shown) ul.appendChild(drawListItem(doc, ctx, item));
+  const more = block.entries.length - shown.length;
   if (more > 0) {
-    ul.appendChild(make(doc, "li", "mm-block-more", label(labels, "block_more").split("{n}").join(String(more))));
+    ul.appendChild(make(doc, "li", "mm-block-more", label(ctx.labels, "block_more").split("{n}").join(String(more))));
   }
   return ul;
 }
 
 function drawBars(doc, block) {
   const wrap = make(doc, "div", "mm-bars");
-  for (const bar of (Array.isArray(block.bars) ? block.bars : []).filter(isObject).slice(0, MAX_ITEMS)) {
+  for (const bar of block.entries) {
     const name = text(bar.label);
+    const barText = text(bar.text);
     const pct = Number.isFinite(bar.pct) ? Math.min(100, Math.max(0, bar.pct)) : 0;
     const row = make(doc, "div", "mm-bar-row");
     row.appendChild(isolated(doc, "span", "mm-bar-label", name));
@@ -533,33 +583,40 @@ function drawBars(doc, block) {
     track.setAttribute("aria-valuemin", "0");
     track.setAttribute("aria-valuemax", "100");
     track.setAttribute("aria-valuenow", String(Math.round(pct)));
+    // What the bar says in words ("12,3 av 14 TB") is what a screen reader reads.
+    if (barText !== "") track.setAttribute("aria-valuetext", barText);
     if (name !== "") track.setAttribute("aria-label", name);
     const fill = make(doc, "span", "mm-bar-fill");
+    if (STATUSES.includes(bar.status)) fill.setAttribute("data-status", bar.status);
     // Through the CSS object model: the page's CSP allows that, not a style attribute.
     fill.style.setProperty("--mm-pct", `${pct}%`);
     track.appendChild(fill);
     row.appendChild(track);
-    row.appendChild(isolated(doc, "span", "mm-bar-text", text(bar.text)));
+    row.appendChild(isolated(doc, "span", "mm-bar-text", barText));
     wrap.appendChild(row);
   }
   return wrap;
 }
 
-function drawStrip(doc, labels, block) {
+function drawStrip(doc, ctx, block) {
   const strip = make(doc, "div", "mm-strip");
-  const cells = (Array.isArray(block.cells) ? block.cells : []).slice(0, MAX_CELLS);
+  const cells = block.entries;
   // The cells are colours: the strip is one picture, named by its title, with the count of what is
-  // not well in its description.
-  strip.setAttribute("role", "img");
+  // not well in its description. One that has no name has nothing to say to a screen reader.
   const bad = cells.filter((c) => c === "bad").length;
   const warn = cells.filter((c) => c === "warn").length;
   const parts = [
-    detailLabel(labels, block.title_key),
-    bad > 0 ? `${label(labels, "status_bad")}: ${bad}` : "",
-    warn > 0 ? `${label(labels, "status_warn")}: ${warn}` : "",
+    detailLabel(ctx.labels, block.title_key),
+    bad > 0 ? `${label(ctx.labels, "status_bad")}: ${bad}` : "",
+    warn > 0 ? `${label(ctx.labels, "status_warn")}: ${warn}` : "",
   ];
   const name = parts.filter((p) => p !== "").join(", ");
-  if (name !== "") strip.setAttribute("aria-label", name);
+  if (name !== "") {
+    strip.setAttribute("role", "img");
+    strip.setAttribute("aria-label", name);
+  } else {
+    strip.setAttribute("aria-hidden", "true");
+  }
   for (const cell of cells) {
     const c = make(doc, "span", "mm-cell");
     c.setAttribute("data-status", statusOf(cell));
@@ -568,43 +625,54 @@ function drawStrip(doc, labels, block) {
   return strip;
 }
 
-function drawFacts(doc, labels, block) {
+function drawFacts(doc, ctx, block) {
   const wrap = make(doc, "div", "mm-facts");
-  for (const row of (Array.isArray(block.rows) ? block.rows : []).filter(isObject).slice(0, MAX_ITEMS)) {
-    const name = detailLabel(labels, row.label_key) || text(row.label);
+  for (const { row, name } of block.entries) {
     const fact = make(doc, "div", "mm-fact");
     fact.appendChild(isolated(doc, "span", "mm-fact-label", name));
-    fact.appendChild(isolated(doc, "span", "mm-fact-value", text(row.value)));
+    const at = momentMs(row.at);
+    fact.appendChild(at !== null ? drawMoment(doc, "mm-fact-value", at, ctx) : isolated(doc, "span", "mm-fact-value", text(row.value)));
     wrap.appendChild(fact);
   }
   return wrap;
 }
 
-function drawBlock(doc, labels, block, cut) {
+function drawBlock(doc, ctx, block, cut, id) {
   const el = make(doc, "div", `mm-block mm-block-${block.kind}`);
-  const title = blockTitle(doc, labels, block);
-  if (title) el.appendChild(title);
-  if (block.kind === "list") el.appendChild(drawList(doc, labels, block, cut));
+  const titleText = detailLabel(ctx.labels, block.title_key);
+  if (titleText !== "") {
+    const title = make(doc, "span", "mm-block-title", titleText);
+    title.setAttribute("id", id);
+    el.appendChild(title);
+    // The block is named by its visible title.
+    el.setAttribute("role", "group");
+    el.setAttribute("aria-labelledby", id);
+  }
+  if (block.kind === "list") el.appendChild(drawList(doc, ctx, block, cut));
   else if (block.kind === "bars") el.appendChild(drawBars(doc, block));
-  else if (block.kind === "strip") el.appendChild(drawStrip(doc, labels, block));
-  else el.appendChild(drawFacts(doc, labels, block));
+  else if (block.kind === "strip") el.appendChild(drawStrip(doc, ctx, block));
+  else el.appendChild(drawFacts(doc, ctx, block));
   return el;
 }
 
-/** The blocks of a reading for a card of `size`, or null when there is nothing to draw. */
-function drawBlocks(doc, details, size, opts) {
-  const picked = blocksFor(wellFormedBlocks(details), size);
+/**
+ * The blocks of a reading for a card of `size`, or null when there is nothing to draw. `cardKey`
+ * makes the ids of the titles (`mm-bt-<card>-<n>`) different on every card of the page.
+ */
+function drawBlocks(doc, details, size, opts, cardKey, nowMs) {
+  const ctx = { labels: opts.labels, lang: opts.lang, nowMs };
+  const picked = blocksFor(wellFormedBlocks(details, ctx.labels), size);
   if (picked.length === 0) return null;
   const wrap = make(doc, "div", "mm-blocks");
   wrap.setAttribute("data-count", String(picked.length));
-  for (const { block, cut } of picked) wrap.appendChild(drawBlock(doc, opts.labels, block, cut));
+  picked.forEach(({ block, cut }, i) => wrap.appendChild(drawBlock(doc, ctx, block, cut, `mm-bt-${cardKey}-${i}`)));
   return wrap;
 }
 
 /** The service part of a bound card: the notice, or the cells, the blocks, the status and the age. */
 function drawService(doc, el, ref, opts) {
   const labels = opts.labels;
-  const svc = make(doc, "span", "mm-svc");
+  const svc = make(doc, "div", "mm-svc");
   el.setAttribute("data-service", String(ref.id));
   el.setAttribute("data-metrics", JSON.stringify(ref.metrics));
 
@@ -664,7 +732,7 @@ function drawService(doc, el, ref, opts) {
     svc.appendChild(grid);
   }
 
-  const blocks = drawBlocks(doc, snap.details, cardSizeOf(el), opts);
+  const blocks = drawBlocks(doc, snap.details, cardSizeOf(el), opts, el.getAttribute("data-card") ?? `s${ref.id}`, nowMs);
   if (blocks) svc.appendChild(blocks);
 
   foot.appendChild(drawStatus(doc, labels, statusOf(snap.status)));
@@ -699,6 +767,11 @@ export function tickAges(root, opts = {}) {
     const thenMs = Number(age.getAttribute("data-since"));
     if (Number.isFinite(thenMs)) age.textContent = formatRelative(Math.min(thenMs, nowMs), nowMs, opts.lang);
   }
+  // The ages inside blocks (a line's "12 min ago", a fact's).
+  for (const el of root.querySelectorAll(".mm-li-right[data-since], .mm-fact-value[data-since]")) {
+    const thenMs = Number(el.getAttribute("data-since"));
+    if (Number.isFinite(thenMs)) el.textContent = formatRelative(Math.min(thenMs, nowMs), nowMs, opts.lang);
+  }
   for (const valueEl of root.querySelectorAll(".mm-metric-value[data-since]")) {
     const thenMs = Number(valueEl.getAttribute("data-since"));
     if (!Number.isFinite(thenMs)) continue;
@@ -724,16 +797,19 @@ function drawCard(doc, card, opts) {
   // A card with a service and no link of its own, whose service has none to
   // lend (it is gone, or has no address), is not invalid: it is just not a link.
   const unlinked = !href && ref !== null && !hasOwnUrl(card);
-  const el = href
-    ? make(doc, "a", "mm-card glass")
-    : make(doc, "div", unlinked ? "mm-card mm-card-nolink glass" : "mm-card mm-card-invalid glass");
-  if (href) {
-    el.setAttribute("href", href);
-    el.setAttribute("rel", "noreferrer");
-  }
+  // The card is a box, not a link: its title is the link, stretched over the whole card by the
+  // style sheet (a card may hold links of its own, in its blocks, and a link cannot hold a link).
+  const el = make(doc, "div", href ? "mm-card glass" : unlinked ? "mm-card mm-card-nolink glass" : "mm-card mm-card-invalid glass");
   el.appendChild(drawTile(doc, card, opts.lang));
   const body = make(doc, "span", "mm-card-text");
-  body.appendChild(isolated(doc, "span", "mm-card-title", text(card?.title)));
+  if (href) {
+    const title = isolated(doc, "a", "mm-card-title mm-card-link", text(card?.title));
+    title.setAttribute("href", href);
+    title.setAttribute("rel", "noreferrer");
+    body.appendChild(title);
+  } else {
+    body.appendChild(isolated(doc, "span", "mm-card-title", text(card?.title)));
+  }
   const description = text(card?.description);
   if (description !== "") {
     body.appendChild(isolated(doc, "span", "mm-card-desc", description));
@@ -751,12 +827,26 @@ function drawCard(doc, card, opts) {
   return el;
 }
 
+/** Whether two nodes can be one: text with text, or elements of the same tag and class. */
+function sameKind(a, b) {
+  if (a.nodeType === 3 && b.nodeType === 3) return true;
+  return (
+    a.nodeType === 1 &&
+    b.nodeType === 1 &&
+    a.nodeName === b.nodeName &&
+    a.getAttribute("class") === b.getAttribute("class")
+  );
+}
+
 /**
  * Makes `oldEl` (on the page) the same as `freshEl` (just drawn, not on the page) by changing it in
- * place: attributes and text are rewritten, children are matched by position, and only a child that
- * cannot be matched (another tag or class, or one more or one fewer) is replaced, added or removed. An
- * element that stays is the same element, so a focused link in a block keeps its focus. The one
- * style the renderer sets on elements, `--mm-pct` of a bar, goes through the CSS object model.
+ * place: attributes and text are rewritten, and the children are matched. A child with a `data-key`
+ * (a line of a list) is matched to the old child with the same key, wherever that stands; the others
+ * are matched by position among the others. What cannot be matched (another tag or class, or one
+ * more or one fewer) is replaced, added or removed. An element that stays is the same element, so a
+ * focused link in a block keeps its focus, also when the list around it is reordered: the element
+ * with the focus is never moved, the others are moved around it. The one style the renderer sets on
+ * elements, `--mm-pct` of a bar, goes through the CSS object model.
  */
 function morph(oldEl, freshEl) {
   for (const attr of [...oldEl.attributes]) {
@@ -768,22 +858,42 @@ function morph(oldEl, freshEl) {
   const pct = freshEl.style?.getPropertyValue?.("--mm-pct") ?? "";
   if (pct !== "" && oldEl.style.getPropertyValue("--mm-pct") !== pct) oldEl.style.setProperty("--mm-pct", pct);
   const olds = [...oldEl.childNodes];
-  const fresh = [...freshEl.childNodes];
-  fresh.forEach((next, i) => {
-    const prev = olds[i];
-    if (!prev) oldEl.appendChild(next);
-    else if (prev.nodeType === 3 && next.nodeType === 3) {
+  const keyOf = (node) => (node.nodeType === 1 ? node.getAttribute("data-key") : null);
+  // Old children with a key wait for the fresh child with the same key (in order, for a repeated
+  // one); the others wait their turn by position.
+  const byKey = new Map();
+  const unkeyed = [];
+  for (const old of olds) {
+    const key = keyOf(old);
+    if (key === null) unkeyed.push(old);
+    else byKey.set(key, [...(byKey.get(key) ?? []), old]);
+  }
+  let turn = 0;
+  const wanted = [...freshEl.childNodes].map((next) => {
+    const key = keyOf(next);
+    const prev = key === null ? (unkeyed[turn++] ?? null) : (byKey.get(key)?.shift() ?? null);
+    if (!prev || !sameKind(prev, next)) return next;
+    if (next.nodeType === 3) {
       if (prev.nodeValue !== next.nodeValue) prev.nodeValue = next.nodeValue;
-    } else if (
-      prev.nodeType === 1 &&
-      next.nodeType === 1 &&
-      prev.nodeName === next.nodeName &&
-      prev.getAttribute("class") === next.getAttribute("class")
-    ) {
+    } else {
       morph(prev, next);
-    } else oldEl.replaceChild(next, prev);
+    }
+    return prev;
   });
-  for (const extra of olds.slice(fresh.length)) oldEl.removeChild(extra);
+  const kept = new Set(wanted);
+  for (const old of olds) if (!kept.has(old)) oldEl.removeChild(old);
+  // Put them in order without moving the one that has the focus (moving an element takes its focus).
+  const active = oldEl.ownerDocument?.activeElement;
+  const anchor = wanted.findIndex((node) => node.nodeType === 1 && active && (node === active || node.contains?.(active)));
+  let before = anchor >= 0 ? wanted[anchor] : null;
+  for (let i = anchor + 1; i < wanted.length; i += 1) {
+    const expected = before ? before.nextSibling : oldEl.firstChild;
+    if (expected !== wanted[i]) oldEl.insertBefore(wanted[i], expected);
+    before = wanted[i];
+  }
+  for (let i = anchor - 1; i >= 0; i -= 1) {
+    if (wanted[i].nextSibling !== wanted[i + 1]) oldEl.insertBefore(wanted[i], wanted[i + 1]);
+  }
 }
 
 /**
@@ -835,7 +945,7 @@ export function updateValues(root, layout, opts = {}) {
         el.getAttribute("data-metrics") !== JSON.stringify(ref.metrics) ||
         el.getAttribute("data-size") !== cardSize(card, settings.services) ||
         // The service's link changed (or came or went) under a card with no link of its own.
-        (el.getAttribute("href") ?? null) !== (cardHref(card, settings.services) ?? null)
+        (el.querySelector(".mm-card-link")?.getAttribute("href") ?? null) !== (cardHref(card, settings.services) ?? null)
       ) {
         el.parentNode.replaceChild(drawCard(doc, card, settings), el);
         continue;
@@ -1260,7 +1370,11 @@ function applyBackground(doc, background, opts) {
  * lines and "+ N more", and the first bars or strip; a wide card draws all of them
  * (at most six), in two columns on a wide screen. Everything in a block is text,
  * a link goes through safeHref and opens in the same tab, a bar's width is a CSS
- * custom property.
+ * custom property. A list line may have `at` (epoch seconds; a fact too): it is drawn as
+ * an age ("12 min ago", counted again by tickAges()) in place of `right` (`value`), and
+ * `badge_key` (a detail key; an unknown one shows nothing); a bar may have `status`
+ * (its fill is green, yellow or red). A card is a box and its title is the link,
+ * stretched over the box by render.css, so links in the blocks can be links of their own.
  *
  * «Trenger deg»: `opts.values.needs` is `[{ service_id, service_name, key, level
  * (warn|bad), label, since (epoch seconds), acked }]`, the server's list for this

@@ -80,19 +80,22 @@ test("renders_groups_cards_and_bookmarks", () => {
   // The heading's accessible name comes from the label.
   assert.equal(groups[0].querySelector("h2").getAttribute("aria-label"), "Group: Media");
 
-  const first = [...groups[0].querySelectorAll("a.mm-card")];
+  const first = [...groups[0].querySelectorAll(".mm-card")];
+  assert.ok(first.every((el) => el.tagName === "DIV"), "a card is a box, its title is the link");
   assert.deepEqual(
     first.map((a) => a.querySelector(".mm-card-title").textContent),
     ["Sonarr", "Radarr"],
   );
-  assert.equal(first[0].getAttribute("href"), "https://sonarr.example/");
-  assert.equal(first[0].getAttribute("rel"), "noreferrer");
-  assert.equal(first[0].hasAttribute("target"), false);
+  const sonarr = first[0].querySelector("a.mm-card-link");
+  assert.equal(sonarr.textContent, "Sonarr");
+  assert.equal(sonarr.getAttribute("href"), "https://sonarr.example/");
+  assert.equal(sonarr.getAttribute("rel"), "noreferrer");
+  assert.equal(sonarr.hasAttribute("target"), false);
   assert.ok(first[0].classList.contains("glass"));
   assert.equal(first[0].querySelector(".mm-card-desc").textContent, "Series");
   // No empty description element.
   assert.equal(first[1].querySelector(".mm-card-desc"), null);
-  assert.equal(groups[1].querySelectorAll("a.mm-card").length, 1);
+  assert.equal(groups[1].querySelectorAll(".mm-card-link").length, 1);
 
   // Text that may be right-to-left is isolated, and the tile is decoration.
   assert.equal(first[0].querySelector(".mm-card-title").getAttribute("dir"), "auto");

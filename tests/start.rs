@@ -617,11 +617,56 @@ fn detail_keys(lang: &str) -> Vec<String> {
     for line in toml.lines() {
         if line.starts_with('[') {
             inside = line.trim() == "[detail]";
-        } else if inside && let Some((key, _)) = line.split_once(" = ") {
-            keys.push(key.trim().to_string());
+        } else if inside {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            // Nothing in the section may be left unread (a text over two lines,
+            // a key with dashes): the extension's generated copy and this test
+            // would both miss it.
+            let (key, value) = line
+                .split_once(" = ")
+                .unwrap_or_else(|| panic!("{lang}: cannot read the [detail] line {line:?}"));
+            assert!(
+                !key.is_empty()
+                    && key
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                "{lang}: [detail] key {key:?} is not lower-case letters, digits and underscores"
+            );
+            assert!(
+                value.len() >= 2 && value.starts_with('"') && value.ends_with('"'),
+                "{lang}: [detail] {key} is not one quoted line"
+            );
+            keys.push(key.to_string());
         }
     }
     keys
+}
+
+/// The keys the kit has under `[detail]` itself.
+const KIT_DETAIL_KEYS: [&str; 2] = ["expires", "request"];
+
+#[tokio::test]
+async fn every_detail_key_starts_with_the_id_of_a_kind() {
+    let _app = App::new().await;
+    let kinds: Vec<&str> = mindful_magpie::integrations::registry()
+        .iter()
+        .map(|k| k.kind())
+        .collect();
+    for key in detail_keys("en") {
+        assert!(
+            !KIT_DETAIL_KEYS.contains(&key.as_str()),
+            "{key} is a key of the kit's"
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|kind| key.starts_with(&format!("{kind}_"))),
+            "[detail] {key} must start with the id of a kind and an underscore ({kinds:?}), so that kinds and the kit do not collide"
+        );
+    }
 }
 
 #[tokio::test]

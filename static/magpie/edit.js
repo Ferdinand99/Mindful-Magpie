@@ -485,9 +485,12 @@ export function startEditing(root, getLayout, save, opts = {}) {
       "data-id": id,
       draggable: "true",
     });
-    // Edit mode never follows a link.
-    el.removeAttribute("href");
-    el.removeAttribute("rel");
+    // Edit mode never follows a link: not the item's own (a bookmark pill) and not the one inside it
+    // (a card's title, which is stretched over the card).
+    for (const link of [el, ...el.querySelectorAll("a[href]")]) {
+      link.removeAttribute("href");
+      link.removeAttribute("rel");
+    }
     el.parentNode.replaceChild(wrapper, el);
     wrapper.appendChild(el);
     wrapper.appendChild(itemControls(kind, id, title));

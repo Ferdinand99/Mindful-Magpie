@@ -42,9 +42,13 @@ export function detailTexts(toml) {
       inside = header[1] === "detail";
       continue;
     }
-    const entry = inside ? line.match(/^([A-Za-z0-9_.]+)\s*=\s*"((?:[^"\\]|\\.)*)"\s*$/) : null;
+    if (!inside || line.trim() === "" || line.trim().startsWith("#")) continue;
+    const entry = line.match(/^([A-Za-z0-9_.]+)\s*=\s*"((?:[^"\\]|\\.)*)"\s*$/);
+    // Nothing in the section may be skipped: a line this cannot read (a text over two lines, a key
+    // with a dash) would be missing from the extension and nobody would see it.
+    if (!entry) throw new Error(`cannot read the [detail] line: ${line}`);
     // The locale files' escapes (\", \\ and \n) are JSON's.
-    if (entry) texts[entry[1]] = JSON.parse(`"${entry[2]}"`);
+    texts[entry[1]] = JSON.parse(`"${entry[2]}"`);
   }
   return texts;
 }

@@ -243,9 +243,6 @@ html:root:has(.mm-root)[data-bg="image"] #mm-edit:not([aria-pressed="true"]) {
   justify-content: flex-end;
   gap: 2px;
 }
-[data-editing] a.mm-card:hover {
-  transform: none;
-}
 .mm-dragging {
   opacity: 0.45;
 }

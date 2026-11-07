@@ -70,7 +70,14 @@ pub enum Block {
 }
 
 /// One line of a list: the text, a smaller second line, a status dot, a value
-/// at the right and a link (an `http` or `https` address).
+/// at the right, a link (an `http` or `https` address), a moment (`at`, Unix
+/// seconds) and a badge (`badge_key`, a `[detail]` key the page shows as a small
+/// label next to the line).
+///
+/// When `at` is there the page shows how long ago it was, in the reader's
+/// language ("12 min ago"), in place of `right`; the kind still fills `right`
+/// with a text for a page that does not know `at`. `at` outside the years 2000
+/// up to a day from now is dropped.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ListItem {
     pub text: String,
@@ -82,6 +89,10 @@ pub struct ListItem {
     pub right: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub href: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge_key: Option<String>,
 }
 
 impl ListItem {
@@ -94,16 +105,21 @@ impl ListItem {
     }
 }
 
-/// One bar: a label, how full it is (0 to 100) and the text at its end.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// One bar: a label, how full it is (0 to 100), the text at its end and how it
+/// is going (`status`: the fill is green, yellow or red; none is neutral).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Bar {
     pub label: String,
     pub pct: f64,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<Status>,
 }
 
 /// One row of facts: the label (a locale key, or text from outside when the
-/// label is a name) and the value.
+/// label is a name; a row with neither is dropped) and the value. `at` (Unix
+/// seconds) is for a value that is a moment: the page shows how long ago it was
+/// in place of `value`, which the kind still fills as a text for an older page.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Fact {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -111,6 +127,8 @@ pub struct Fact {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<i64>,
 }
 
 /// Whether `key` has the shape of a detail key: 1 to 64 of `[a-z0-9_.]`.
@@ -145,6 +163,17 @@ fn link(href: &str) -> Option<String> {
     (link_problem(href).is_none() && !href.chars().any(is_format)).then(|| href.to_string())
 }
 
+/// The first moment an `at` may be (1 January 2000, Unix seconds).
+const MIN_AT: i64 = 946_684_800;
+/// How far ahead of now an `at` may be (a day: clocks differ a little).
+const AT_AHEAD: i64 = 86_400;
+
+/// `at` when it is from the year 2000 up to a day from now, else nothing.
+fn moment(at: i64) -> Option<i64> {
+    let latest = jiff::Timestamp::now().as_second().saturating_add(AT_AHEAD);
+    (MIN_AT..=latest).contains(&at).then_some(at)
+}
+
 /// A bar's fill: a number from 0 to 100 (anything else is 0).
 fn percent(pct: f64) -> f64 {
     if pct.is_finite() {
@@ -158,7 +187,9 @@ impl Block {
     /// The block cut down to the limits of the module, or `None` when nothing
     /// of it is left to show (no entry survives). Texts are cleaned and cut, a
     /// link that is not `http` or `https` is dropped (its line stays), a
-    /// percentage is clamped, and a key of the wrong shape is blanked.
+    /// percentage is clamped, a moment (`at`) outside the years 2000 up to a
+    /// day from now is dropped, and a key of the wrong shape is blanked (a
+    /// badge's, dropped; a fact's, which then needs its `label`).
     pub fn bounded(self) -> Option<Block> {
         match self {
             Block::List { title_key, items } => {
@@ -171,6 +202,8 @@ impl Block {
                             status: item.status,
                             right: item.right.as_deref().and_then(line),
                             href: item.href.as_deref().and_then(link),
+                            at: item.at.and_then(moment),
+                            badge_key: item.badge_key.filter(|k| key_shape(k)),
                         })
                     })
                     .take(MAX_ITEMS)
@@ -188,6 +221,7 @@ impl Block {
                             label: line(&bar.label)?,
                             pct: percent(bar.pct),
                             text: line(&bar.text).unwrap_or_default(),
+                            status: bar.status,
                         })
                     })
                     .take(MAX_ITEMS)
@@ -214,10 +248,15 @@ impl Block {
                         let label_key = row.label_key.map(clean_key).filter(|k| !k.is_empty());
                         let label = row.label.as_deref().and_then(line);
                         let value = line(&row.value)?;
+                        // A value without a name says nothing.
+                        if label_key.is_none() && label.is_none() {
+                            return None;
+                        }
                         Some(Fact {
                             label_key,
                             label,
                             value,
+                            at: row.at.and_then(moment),
                         })
                     })
                     .take(MAX_FACTS)
@@ -230,13 +269,14 @@ impl Block {
         }
     }
 
-    /// The locale keys the block names (its title and its rows' labels), for
-    /// a test that every key a kind writes has a text.
+    /// The locale keys the block names (its title, its lines' badges and its
+    /// rows' labels), for a test that every key a kind writes has a text.
     pub fn keys(&self) -> Vec<&str> {
         match self {
-            Block::List { title_key, .. }
-            | Block::Bars { title_key, .. }
-            | Block::Strip { title_key, .. } => vec![title_key],
+            Block::List { title_key, items } => std::iter::once(title_key.as_str())
+                .chain(items.iter().filter_map(|i| i.badge_key.as_deref()))
+                .collect(),
+            Block::Bars { title_key, .. } | Block::Strip { title_key, .. } => vec![title_key],
             Block::Facts { title_key, rows } => std::iter::once(title_key.as_str())
                 .chain(rows.iter().filter_map(|r| r.label_key.as_deref()))
                 .collect(),
@@ -263,12 +303,15 @@ mod tests {
             status: Some(Status::Warn),
             right: Some("c".into()),
             href: Some("https://x.example/".into()),
+            at: Some(1_760_000_000),
+            badge_key: Some("x_badge".into()),
         }]);
         assert_eq!(
             serde_json::to_value(&block).unwrap(),
             serde_json::json!({
                 "kind": "list", "title_key": "x.title",
-                "items": [{ "text": "a", "sub": "b", "status": "warn", "right": "c", "href": "https://x.example/" }]
+                "items": [{ "text": "a", "sub": "b", "status": "warn", "right": "c", "href": "https://x.example/",
+                            "at": 1_760_000_000, "badge_key": "x_badge" }]
             })
         );
         let bars = Block::Bars {
@@ -277,10 +320,26 @@ mod tests {
                 label: "CPU".into(),
                 pct: 40.0,
                 text: "40 %".into(),
+                status: Some(Status::Warn),
             }],
         };
         assert_eq!(
             serde_json::to_value(&bars).unwrap(),
+            serde_json::json!({ "kind": "bars", "title_key": "k",
+                "bars": [{ "label": "CPU", "pct": 40.0, "text": "40 %", "status": "warn" }] })
+        );
+        // No status, no key.
+        let plain = Block::Bars {
+            title_key: "k".into(),
+            bars: vec![Bar {
+                label: "CPU".into(),
+                pct: 40.0,
+                text: "40 %".into(),
+                status: None,
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
             serde_json::json!({ "kind": "bars", "title_key": "k",
                 "bars": [{ "label": "CPU", "pct": 40.0, "text": "40 %" }] })
         );
@@ -298,12 +357,13 @@ mod tests {
                 label_key: Some("a.b".into()),
                 label: None,
                 value: "1".into(),
+                at: Some(1_760_000_000),
             }],
         };
         assert_eq!(
             serde_json::to_value(&facts).unwrap(),
             serde_json::json!({ "kind": "facts", "title_key": "k",
-                "rows": [{ "label_key": "a.b", "value": "1" }] })
+                "rows": [{ "label_key": "a.b", "value": "1", "at": 1_760_000_000 }] })
         );
         // And back; optional parts may be absent.
         let back: Block = serde_json::from_value(
@@ -330,7 +390,7 @@ mod tests {
             sub: Some(hostile.clone()),
             status: None,
             right: Some(hostile.clone()),
-            href: None,
+            ..ListItem::default()
         }])
         .bounded() else {
             panic!("a list")
@@ -382,6 +442,7 @@ mod tests {
             label: "l".into(),
             pct,
             text: "t".into(),
+            status: None,
         };
         let Some(Block::Bars { bars, .. }) = (Block::Bars {
             title_key: "k".into(),
@@ -419,6 +480,7 @@ mod tests {
                     label: format!("b{i}"),
                     pct: 1.0,
                     text: String::new(),
+                    status: None,
                 })
                 .collect(),
         })
@@ -441,6 +503,7 @@ mod tests {
                     label_key: None,
                     label: Some(format!("l{i}")),
                     value: "v".into(),
+                    at: None,
                 })
                 .collect(),
         })
@@ -467,7 +530,8 @@ mod tests {
                 rows: vec![Fact {
                     label_key: None,
                     label: None,
-                    value: "\u{0}".into()
+                    value: "\u{0}".into(),
+                    at: None,
                 }]
             }
             .bounded(),
@@ -512,6 +576,7 @@ mod tests {
                 label_key: Some("BAD KEY".into()),
                 label: Some("Name".into()),
                 value: "1".into(),
+                at: None,
             }],
         })
         .bounded() else {
@@ -519,5 +584,116 @@ mod tests {
         };
         assert_eq!(rows[0].label_key, None);
         assert_eq!(rows[0].label.as_deref(), Some("Name"));
+    }
+
+    fn one_item(item: ListItem) -> ListItem {
+        let Some(Block::List { mut items, .. }) = list(vec![item]).bounded() else {
+            panic!("the line stays")
+        };
+        items.remove(0)
+    }
+
+    #[test]
+    fn a_moment_is_kept_from_the_year_2000_up_to_a_day_ahead() {
+        let now = jiff::Timestamp::now().as_second();
+        for (at, keeps) in [
+            (1_760_000_000, true),
+            (946_684_800, true),
+            (946_684_799, false),
+            (0, false),
+            (-5, false),
+            (i64::MIN, false),
+            (now, true),
+            (now + 3_600, true),
+            (now + 86_400 + 60, false),
+            (i64::MAX, false),
+        ] {
+            let mut item = ListItem::new("t");
+            item.at = Some(at);
+            assert_eq!(one_item(item).at.is_some(), keeps, "{at}");
+            let Some(Block::Facts { rows, .. }) = (Block::Facts {
+                title_key: "k".into(),
+                rows: vec![Fact {
+                    label: Some("l".into()),
+                    value: "v".into(),
+                    at: Some(at),
+                    ..Fact::default()
+                }],
+            })
+            .bounded() else {
+                panic!("the row stays")
+            };
+            assert_eq!(rows[0].at.is_some(), keeps, "fact {at}");
+        }
+        // The text next to it stays whatever `at` is.
+        let mut item = ListItem::new("t");
+        item.right = Some("12 min".into());
+        item.at = Some(0);
+        let item = one_item(item);
+        assert_eq!((item.right.as_deref(), item.at), (Some("12 min"), None));
+    }
+
+    #[test]
+    fn a_badge_key_is_checked_like_a_title_key() {
+        for (key, keeps) in [
+            ("vv_badge", true),
+            ("a.b_9", true),
+            ("Bad Key", false),
+            ("<b>", false),
+            ("", false),
+        ] {
+            let mut item = ListItem::new("t");
+            item.badge_key = Some(key.into());
+            assert_eq!(one_item(item).badge_key.is_some(), keeps, "{key:?}");
+        }
+        // And it is one of the keys a block names.
+        let mut item = ListItem::new("t");
+        item.badge_key = Some("x_badge".into());
+        let block = Block::List {
+            title_key: "x_title".into(),
+            items: vec![item],
+        };
+        assert_eq!(block.keys(), vec!["x_title", "x_badge"]);
+    }
+
+    #[test]
+    fn a_fact_without_a_label_is_dropped_and_a_bars_status_stays() {
+        let Some(Block::Facts { rows, .. }) = (Block::Facts {
+            title_key: "k".into(),
+            rows: vec![
+                Fact {
+                    value: "no name".into(),
+                    ..Fact::default()
+                },
+                Fact {
+                    label_key: Some("BAD KEY".into()),
+                    value: "bad key, no label".into(),
+                    ..Fact::default()
+                },
+                Fact {
+                    label: Some("named".into()),
+                    value: "ok".into(),
+                    ..Fact::default()
+                },
+            ],
+        })
+        .bounded() else {
+            panic!("one row stays")
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label.as_deref(), Some("named"));
+        let Some(Block::Bars { bars, .. }) = (Block::Bars {
+            title_key: "k".into(),
+            bars: vec![Bar {
+                label: "disk".into(),
+                pct: 90.0,
+                status: Some(Status::Bad),
+                ..Bar::default()
+            }],
+        })
+        .bounded() else {
+            panic!("bars")
+        };
+        assert_eq!(bars[0].status, Some(Status::Bad));
     }
 }

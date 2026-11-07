@@ -92,7 +92,8 @@ test("the new tab renders a layout through the vendored renderer, same as the we
     [...v.root.querySelectorAll("h2")].map((e) => e.textContent),
     ["Work", "Home"],
   );
-  assert.equal(v.root.querySelectorAll("a.mm-card").length, 2);
+  assert.equal(v.root.querySelectorAll(".mm-card").length, 3);
+  assert.equal(v.root.querySelectorAll("a.mm-card-link").length, 2, "the two valid links are the cards' titles");
   assert.equal(v.root.querySelectorAll(".mm-card-invalid").length, 1);
   assert.equal(v.root.querySelector("nav.mm-bookmarks a").textContent, "News");
   assert.equal(v.statusEl.textContent, "Oppdatert");
@@ -320,7 +321,7 @@ test("fetchBackground times out into null when the server never answers", async 
 test("labels: the keys are the ones render.js reads, and the texts the server's strings", () => {
   // The server's #mm-labels block also carries the editor's strings; the extension does not edit,
   // so it ships only what the renderer reads: the keys of its label(...) calls.
-  const used = [...new Set([...repo("static/magpie/render.js").matchAll(/label\((?:opts\.)?labels,\s*"(\w+)"\)/g)].map((m) => m[1]))];
+  const used = [...new Set([...repo("static/magpie/render.js").matchAll(/label\((?:opts\.|ctx\.)?labels,\s*"(\w+)"\)/g)].map((m) => m[1]))];
   assert.ok(used.length >= 4, `only ${used.length} keys found in render.js`);
   const rust = repo("src/pages.rs");
   const block = rust.slice(rust.indexOf("fn labels()"));

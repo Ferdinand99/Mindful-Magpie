@@ -52,3 +52,19 @@ test("the two languages name the same detail keys", () => {
     Object.keys(detailTexts(repo("locales/nb.toml"))).sort(),
   );
 });
+
+test("a [detail] line that cannot be read is an error, not a key the extension silently lacks", () => {
+  for (const bad of [
+    'dash-key = "x"',
+    'two_lines = "first',
+    'no_value =',
+    "just text",
+    'single = \'quoted\'',
+    'key = "unterminated',
+    'key = "a" # trailing comment',
+  ]) {
+    assert.throws(() => detailTexts(`[detail]\n${bad}\n`), /cannot read the \[detail\] line/, bad);
+  }
+  // Blank lines and comments are fine, and so are lines outside the section.
+  assert.deepEqual(detailTexts('[start]\nanything goes here\n\n[detail]\n\n# a note\nok_key = "fine"\n\n[other]\nlines = that are not read\n'), { ok_key: "fine" });
+});
