@@ -24,12 +24,13 @@ use axum::response::Redirect;
 use axum::routing::get;
 use common::App;
 use jiff::Timestamp;
+use mindful_magpie::integrations::block::ListItem;
 use mindful_magpie::integrations::poller::{
     CONFIG_KEY, Change, DOWN_KEY, FETCH_DEADLINE, Options, Poller, PollerHandle,
 };
 use mindful_magpie::integrations::{
-    self, BoxFuture, FetchCtx, FetchError, Field, Integration, Level, MetricDef, Need, Snapshot,
-    Status, Value,
+    self, Block, BoxFuture, FetchCtx, FetchError, Field, Integration, Level, MetricDef, Need,
+    Snapshot, Status, Value,
 };
 use mindful_magpie::services::{SecretChange, ServiceEvent, ServiceInput, Visibility, store};
 use serde_json::{Value as Json, json};
@@ -109,6 +110,8 @@ enum Mode {
     Block,
     /// Panics.
     Panic,
+    /// An ok reading whose details are far over every limit, with hostile text.
+    Details,
 }
 
 #[derive(Clone)]
@@ -181,6 +184,27 @@ fn gate(tag: &str) -> Arc<Notify> {
     g
 }
 
+/// Eleven blocks of which the first is a list of 40 hostile lines.
+fn hostile_details() -> Vec<Block> {
+    // A right-to-left override, built here because source with the character in it is refused.
+    let rlo = char::from_u32(0x202E).unwrap();
+    let mut blocks = vec![Block::List {
+        title_key: "stub.title".into(),
+        items: (0..40)
+            .map(|i| {
+                let mut item = ListItem::new(format!("<b>{rlo}line {i}</b> {}", "x".repeat(300)));
+                item.href = Some("javascript:alert(1)".into());
+                item
+            })
+            .collect(),
+    }];
+    blocks.extend((0..10).map(|i| Block::Strip {
+        title_key: format!("stub.strip{i}"),
+        cells: vec![Status::Ok; 100],
+    }));
+    blocks
+}
+
 static NO_FIELDS: [Field; 0] = [];
 static NO_METRICS: [MetricDef; 0] = [];
 
@@ -247,6 +271,7 @@ impl Integration for Stub {
                 Mode::Http500 => Ok(Snapshot::failed(&FetchError::Status(500))),
                 Mode::Http404 => Ok(Snapshot::failed(&FetchError::Status(404))),
                 Mode::Ok => Ok(ok_snapshot(n, marker)),
+                Mode::Details => Ok(ok_snapshot(n, marker).with_details(hostile_details())),
             }
         })
     }
@@ -646,6 +671,34 @@ async fn a_snapshot_is_stored_and_loaded_on_restart_before_the_first_fetch() {
     let fresh = wait_snapshot(&poller, id, |s| s.values.get("n") == Some(&Value::num(2.0))).await;
     assert_eq!(fresh.status, Status::Ok);
     assert_eq!(app.count("SELECT COUNT(*) FROM service_snapshots").await, 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn details_are_cut_down_before_they_are_stored_and_announced() {
+    let app = App::new().await;
+    tokio::time::pause();
+    set_mode("t_details", Mode::Details);
+    let id = add_stub(&app, "Details", "t_details", "d", 60).await;
+    let poller = start_with(&app, stub_kinds, 0).await;
+    wait_calls("t_details", 1).await;
+    let snap = wait_snapshot(&poller, id, |s| !s.details.is_empty()).await;
+    assert_eq!(snap.details.len(), 6, "at most six blocks");
+    let Block::List { items, .. } = &snap.details[0] else {
+        panic!("the list comes first")
+    };
+    assert_eq!(items.len(), 8);
+    for item in items {
+        assert!(item.text.chars().count() <= 80, "{}", item.text);
+        assert!(!item.text.contains(char::from_u32(0x202E).unwrap()));
+        assert_eq!(item.href, None, "a javascript: link is dropped");
+    }
+    let Block::Strip { cells, .. } = &snap.details[1] else {
+        panic!("a strip")
+    };
+    assert_eq!(cells.len(), 48);
+    // What is stored is what was cut down.
+    let stored: Snapshot = serde_json::from_str(&stored_json(&app, id).await.unwrap()).unwrap();
+    assert_eq!(stored.details, snap.details);
 }
 
 #[tokio::test(flavor = "current_thread")]

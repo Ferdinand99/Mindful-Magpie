@@ -589,6 +589,7 @@ impl Job {
             {
                 snapshot.needs.push(need);
             }
+            snapshot.bound_details();
             let before = self.shared.read().snapshots.get(&self.service.id).cloned();
             date_needs(&mut snapshot, before.as_deref());
             self.clear_acks(&snapshot, before.as_deref()).await;
