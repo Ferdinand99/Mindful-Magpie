@@ -5,7 +5,7 @@ mod common;
 
 use common::{App, add_user};
 use mindful_magpie::layout::{
-    self, Background, Bookmark, Card, FieldError, Group, Icon, Layout, SaveError, ServiceRef,
+    self, Background, Bookmark, Card, FieldError, Group, Icon, Layout, SaveError, ServiceRef, Size,
     validate,
 };
 
@@ -20,6 +20,7 @@ fn card(id: &str) -> Card {
             colour: "teal".into(),
         },
         service: None,
+        size: None,
     }
 }
 
@@ -735,7 +736,12 @@ fn service_binding_validation_table() {
     let with =
         |service: ServiceRef| move |l: &mut Layout| l.groups[0].cards[0].service = Some(service);
     expect(with(bound(&[])), path, "required");
-    expect(with(bound(&["a", "b", "c", "d", "e"])), path, "too_many");
+    // More than any kind has: refused by its length.
+    let over: Vec<String> = (0..=layout::model::MAX_METRICS)
+        .map(|i| format!("m{i}"))
+        .collect();
+    let over: Vec<&str> = over.iter().map(String::as_str).collect();
+    expect(with(bound(&over)), path, "too_many");
     expect(with(bound(&["a", "b", "a"])), path, "duplicate_id");
     expect(with(bound(&["has space"])), path, "bad_id");
     expect(with(bound(&[""])), path, "bad_id");
@@ -765,8 +771,9 @@ fn service_binding_validation_table() {
         "groups[0].cards[0].service",
         "bad_service",
     );
-    // One to four, in the shape of an id, passes.
-    for n in 1..=4 {
+    // One up to as many as a kind has, in the shape of an id, passes (the
+    // save checks the names against the kind's own).
+    for n in 1..=12 {
         let metrics: Vec<String> = (0..n).map(|i| format!("m_{i}-x")).collect();
         let mut l = sample();
         l.groups[0].cards[0].service = Some(ServiceRef { id: 1, metrics });
@@ -780,4 +787,103 @@ fn service_binding_validation_table() {
         metrics: many,
     });
     assert_eq!(codes(&l), vec![(path.to_string(), "too_many")]);
+}
+
+#[test]
+fn no_kind_has_more_metrics_than_a_card_may_name() {
+    for kind in mindful_magpie::integrations::registry() {
+        assert!(
+            kind.metrics().len() <= layout::model::MAX_METRICS,
+            "{} has {} metrics",
+            kind.kind(),
+            kind.metrics().len()
+        );
+    }
+}
+
+#[test]
+fn a_card_may_name_every_metric_of_its_kind_once() {
+    for kind in mindful_magpie::integrations::registry() {
+        let all: Vec<String> = kind.metrics().iter().map(|m| m.id.to_string()).collect();
+        let mut l = sample();
+        l.groups[0].cards[0].service = Some(ServiceRef {
+            id: 1,
+            metrics: all.clone(),
+        });
+        assert_eq!(codes(&l), vec![], "{}", kind.kind());
+        // One twice is refused, even when the count is within the catalogue.
+        let mut twice = all;
+        twice.push(twice[0].clone());
+        l.groups[0].cards[0].service = Some(ServiceRef {
+            id: 1,
+            metrics: twice,
+        });
+        assert_eq!(
+            codes(&l),
+            vec![(
+                "groups[0].cards[0].service.metrics".to_string(),
+                "duplicate_id"
+            )],
+            "{}",
+            kind.kind()
+        );
+    }
+}
+
+#[test]
+fn a_size_reads_writes_and_is_left_out_when_absent() {
+    // An old card: no size, written without one.
+    let old = serde_json::to_value(sample()).unwrap();
+    assert!(old["groups"][0]["cards"][0].get("size").is_none());
+    let l: Layout = serde_json::from_value(old.clone()).unwrap();
+    assert_eq!(l.groups[0].cards[0].size, None);
+    assert_eq!(serde_json::to_value(&l).unwrap(), old);
+    // A bound card with a size round-trips as plain words.
+    for (size, word) in [(Size::Wide, "wide"), (Size::Normal, "normal")] {
+        let mut l = sample();
+        l.groups[0].cards[0].service = Some(ServiceRef {
+            id: 7,
+            metrics: vec!["status".into()],
+        });
+        l.groups[0].cards[0].size = Some(size);
+        assert_eq!(codes(&l), vec![]);
+        let json = serde_json::to_value(&l).unwrap();
+        assert_eq!(json["groups"][0]["cards"][0]["size"], word);
+        assert_eq!(serde_json::from_value::<Layout>(json).unwrap(), l);
+    }
+    // Anything else is not a size.
+    for bad in [
+        serde_json::json!("huge"),
+        serde_json::json!(2),
+        serde_json::json!("WIDE"),
+    ] {
+        let mut v = serde_json::to_value(sample()).unwrap();
+        v["groups"][0]["cards"][0]["size"] = bad;
+        assert!(serde_json::from_value::<Layout>(v).is_err());
+    }
+    // null reads as absent.
+    let mut v = serde_json::to_value(sample()).unwrap();
+    v["groups"][0]["cards"][0]["size"] = serde_json::Value::Null;
+    let l: Layout = serde_json::from_value(v).unwrap();
+    assert_eq!(l.groups[0].cards[0].size, None);
+}
+
+#[test]
+fn a_size_belongs_to_a_card_with_a_service() {
+    let mut l = sample();
+    l.groups[0].cards[0].size = Some(Size::Wide);
+    assert_eq!(
+        codes(&l),
+        vec![("groups[0].cards[0].size".to_string(), "bad_size")]
+    );
+}
+
+#[test]
+fn the_kinds_that_have_a_lot_to_show_default_to_wide() {
+    let wide: Vec<&str> = mindful_magpie::integrations::registry()
+        .iter()
+        .filter(|k| k.default_size() == Size::Wide)
+        .map(|k| k.kind())
+        .collect();
+    assert_eq!(wide, ["proxmox", "unraid", "tofa", "github"]);
 }

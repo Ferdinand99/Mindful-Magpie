@@ -48,6 +48,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use vole_kit::net::{Forbidden, GuardedResolver, check_host};
 
+use crate::layout::Size;
+
 pub use block::Block;
 
 /// A boxed future, so [`Integration`] can be used as a trait object.
@@ -82,6 +84,11 @@ pub trait Integration: Send + Sync + 'static {
     /// own site (GitHub). `None`: the origin of the service's address.
     fn default_link(&self) -> Option<&'static str> {
         None
+    }
+    /// The size a card of a service of this kind has when the person has not
+    /// chosen one: wide for the kinds that have a lot to show.
+    fn default_size(&self) -> Size {
+        Size::Normal
     }
     /// Whether a service of this kind needs an address (`services.url`).
     fn url_required(&self) -> bool {

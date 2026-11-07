@@ -275,13 +275,14 @@ test("a_bound_card_draws_its_cells_in_norwegian", () => {
   assert.match(card.querySelector(".mm-age").textContent, /for 2 min.* siden/);
 });
 
-test("up_to_four_cells_and_no_more", () => {
-  const { card } = draw(bound(["cpu", "mem", "up", "net", "seen", "note"]));
-  assert.equal(cells(card).length, 4);
+test("every_chosen_metric_is_a_cell_and_there_is_no_cap", () => {
+  const { card } = draw(bound(["cpu", "mem", "up", "net", "seen", "note", "count"]));
+  assert.equal(cells(card).length, 7);
   assert.deepEqual(
     cells(card).map(([label]) => label),
-    ["CPU", "Memory", "Uptime", "Traffic"],
+    ["CPU", "Memory", "Uptime", "Traffic", "Seen", "Note", "Files"],
   );
+  assert.equal(card.querySelector(".mm-metrics").getAttribute("data-count"), "7");
   const ok = draw(bound(["seen", "note", "count", "net"])).card;
   assert.match(cells(ok)[0][1], /2 min/);
   assert.deepEqual(cells(ok).slice(1), [
@@ -724,7 +725,7 @@ test("update_values_keeps_the_card_element_and_swaps_the_numbers", () => {
   assert.equal(link.isConnected, true);
   assert.ok(link.querySelector(".mm-tile") === tile);
   assert.ok(link.querySelector(".mm-card-text") === body);
-  assert.ok(link.querySelector(".mm-svc") !== oldSvc, "only the service part is new");
+  assert.ok(link.querySelector(".mm-svc") === oldSvc, "the service part is changed in place");
   assert.equal(link.querySelectorAll(".mm-svc").length, 1);
   assert.deepEqual(cells(link), [
     ["CPU", "55%"],

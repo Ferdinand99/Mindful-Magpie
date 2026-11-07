@@ -16,7 +16,8 @@ use axum::extract::ConnectInfo;
 use axum::http::{HeaderValue, Request, StatusCode, header};
 use common::{App, HOST, Res, Web, bearer_get, make_token, user_id};
 use futures_util::{Stream, StreamExt as _};
-use mindful_magpie::integrations::{Snapshot, Status, Value as Reading};
+use mindful_magpie::integrations::block::ListItem;
+use mindful_magpie::integrations::{Block, Snapshot, Status, Value as Reading};
 use mindful_magpie::services::{SecretChange, ServiceEvent, ServiceInput, Visibility, store};
 use serde_json::{Value, json};
 use tokio::time::Instant;
@@ -1376,4 +1377,126 @@ async fn unbinding_a_card_while_the_stream_is_open_removes_the_service_at_the_ne
         .poller
         .set_snapshot_for_tests(w.b, snap(Status::Bad, 9.0));
     live.nothing().await;
+}
+
+// ---------------------------------------------------------------------------
+// Details (lists, bars and the like next to the numbers)
+
+const DETAIL_MARK: &str = "Hidden-Detail-Mark-7731";
+
+fn with_details(mut s: Snapshot, text: &str) -> Snapshot {
+    s.details = vec![Block::List {
+        title_key: "x".into(),
+        items: vec![ListItem::new(text)],
+    }];
+    s
+}
+
+#[tokio::test]
+async fn details_ride_in_the_entry_and_only_for_those_who_see_the_service() {
+    let w = world().await;
+    let mut bob = Web::new(&w.app, "bob", "viewer").await;
+    let bob_id = user_id(&w.app, "bob").await;
+    save(
+        &mut bob,
+        &doc(
+            0,
+            vec![
+                card("c1", Some(bind(w.a, &["status"]))),
+                card("c2", Some(bind(w.b, &["status"]))),
+            ],
+        ),
+    )
+    .await;
+    w.app
+        .magpie
+        .poller
+        .set_snapshot_for_tests(w.a, snap(Status::Ok, 1.0));
+    w.app
+        .magpie
+        .poller
+        .set_snapshot_for_tests(w.b, with_details(snap(Status::Ok, 2.0), DETAIL_MARK));
+
+    // The embed: an entry with blocks has `details`, one without has no key.
+    let values = embed(&mut bob).await;
+    let b = &values["services"][w.b.to_string()];
+    assert_eq!(
+        b["details"],
+        json!([{ "kind": "list", "title_key": "x", "items": [{ "text": DETAIL_MARK }] }])
+    );
+    assert!(values["services"][w.a.to_string()]["details"].is_null());
+
+    // The token API says the same.
+    let token = make_token(&w.app, bob_id, TokenScope::Read, "t").await;
+    let res = bearer_get(&w.app, "/api/v1/me/values", &token).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(
+        res.json()["services"][w.b.to_string()]["details"],
+        b["details"]
+    );
+
+    // The stream's first event carries it too.
+    let mut live = open_live(&bob, "en").await;
+    let first = live.event().await;
+    assert_eq!(first["services"][w.b.to_string()]["details"], b["details"]);
+    tokio::time::pause();
+
+    // Hidden from Bob: the details go with the entry, on every path.
+    set_visibility(&w.app, w.b, "Wiki", Visibility::Admin, &[]).await;
+    let update = live.event().await;
+    assert_eq!(update["removed"], json!([w.b]));
+    assert!(!update.to_string().contains(DETAIL_MARK), "{update}");
+    w.app
+        .magpie
+        .poller
+        .set_snapshot_for_tests(w.b, with_details(snap(Status::Bad, 9.0), DETAIL_MARK));
+    live.nothing().await;
+    let page = page(&mut bob, "en").await;
+    assert!(
+        !page.body.contains(DETAIL_MARK),
+        "the page leaks the details"
+    );
+    let res = bearer_get(&w.app, "/api/v1/me/values", &token).await;
+    assert!(!res.body.contains(DETAIL_MARK), "{}", res.body);
+}
+
+#[tokio::test]
+async fn a_change_of_the_details_alone_is_an_event() {
+    let w = world().await;
+    let mut bob = Web::new(&w.app, "bob", "viewer").await;
+    save(
+        &mut bob,
+        &doc(0, vec![card("c1", Some(bind(w.a, &["status"])))]),
+    )
+    .await;
+    w.app
+        .magpie
+        .poller
+        .set_snapshot_for_tests(w.a, with_details(snap(Status::Ok, 1.0), "one"));
+    let mut live = open_live(&bob, "en").await;
+    live.event().await;
+    tokio::time::pause();
+
+    w.app
+        .magpie
+        .poller
+        .set_snapshot_for_tests(w.a, with_details(snap(Status::Ok, 1.0), "two"));
+    let update = live.event().await;
+    assert_eq!(
+        update["services"][w.a.to_string()]["details"][0]["items"][0]["text"],
+        "two"
+    );
+    // The same blocks again change nothing worth sending.
+    w.app
+        .magpie
+        .poller
+        .set_snapshot_for_tests(w.a, with_details(snap(Status::Ok, 1.0), "two"));
+    live.nothing().await;
+    // Blocks that go away are an event too, and the key goes with them.
+    w.app
+        .magpie
+        .poller
+        .set_snapshot_for_tests(w.a, snap(Status::Ok, 1.0));
+    let update = live.event().await;
+    assert!(update["services"][w.a.to_string()]["details"].is_null());
 }

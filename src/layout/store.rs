@@ -204,6 +204,13 @@ fn binding_problems(
                 path: format!("{}.service.metrics", b.path),
                 code: "bad_metric",
             });
+        } else if known.is_some_and(|defs| b.service.metrics.len() > defs.len()) {
+            // More than the kind has: some are repeated (validate refuses that
+            // first; this keeps the count tied to the catalogue all the same).
+            problems.push(FieldError {
+                path: format!("{}.service.metrics", b.path),
+                code: "too_many",
+            });
         }
     }
     Ok(problems)

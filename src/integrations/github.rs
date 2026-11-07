@@ -163,6 +163,9 @@ impl Integration for GithubKind {
         &METRICS
     }
 
+    fn default_size(&self) -> crate::layout::Size {
+        crate::layout::Size::Wide
+    }
     fn default_interval(&self) -> Duration {
         Duration::from_secs(5 * 60)
     }

@@ -606,3 +606,58 @@ async fn magpies_own_scripts_and_styles_are_revalidated_not_kept_for_an_hour() {
         assert_eq!(again.header("etag"), etag, "{path}");
     }
 }
+
+/// The `[detail]` section of a locale file: its keys.
+fn detail_keys(lang: &str) -> Vec<String> {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("locales/{lang}.toml"));
+    let toml = std::fs::read_to_string(path).unwrap();
+    let mut inside = false;
+    let mut keys = Vec::new();
+    for line in toml.lines() {
+        if line.starts_with('[') {
+            inside = line.trim() == "[detail]";
+        } else if inside && let Some((key, _)) = line.split_once(" = ") {
+            keys.push(key.trim().to_string());
+        }
+    }
+    keys
+}
+
+#[tokio::test]
+async fn the_labels_carry_the_block_strings_and_every_detail_key() {
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    // Both languages name the same detail keys. (The kit has two keys of its own under the same
+    // heading, `expires` and `request`; they are carried too, and a kind must not reuse them.)
+    let keys = detail_keys("en");
+    assert_eq!(keys, detail_keys("nb"));
+    for lang in ["en", "nb"] {
+        let res = start_page(&mut web, lang).await;
+        let labels = json_block(&res.body, "mm-labels");
+        let more = labels["block_more"].as_str().unwrap();
+        assert!(more.contains("{n}"), "{lang}: {more}");
+        for key in &keys {
+            let text = labels[format!("detail.{key}").as_str()]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                !text.is_empty() && !text.starts_with("detail."),
+                "{lang}: no text for detail.{key}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_detail_key_is_known_when_the_locale_has_its_text() {
+    use mindful_magpie::integrations::block::{key_known, key_shape};
+    let _app = App::new().await;
+    for key in detail_keys("en") {
+        assert!(key_shape(&key), "{key} is shaped like a key");
+        assert!(key_known(&key), "{key} is known");
+    }
+    assert!(!key_known("no_such_key_in_the_locale"));
+    assert!(!key_known("Bad Shape"));
+    assert!(!key_known(""));
+}

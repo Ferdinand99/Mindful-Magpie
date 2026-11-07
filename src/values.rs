@@ -10,8 +10,12 @@
 //! produces nothing: not even a name. The save keeps old bindings without
 //! checking them again, so this filter is what keeps them quiet.
 //!
-//! **An entry** is `{ name, kind, interval_s, status, values, fetched_at,
-//! error_label? }`. A visible bound service that has no snapshot yet is there
+//! **An entry** is `{ name, kind, interval_s, status, values, details?,
+//! fetched_at, error_label? }`. `details` is the reading's blocks (lists, bars,
+//! strips and facts; see [`crate::integrations::block`]), absent when there
+//! are none: it follows the entry, so it is as visible as the values are, on the
+//! page, in the stream and in `GET /api/v1/me/values`, and a client that does not
+//! know the field ignores it. A visible bound service that has no snapshot yet is there
 //! with `status: "unknown"`, no values and `fetched_at: null` (the renderer
 //! shows "waiting"); an entry is therefore
 //! absent only when the user must not know of the service. `error_label` is the
@@ -73,7 +77,7 @@ use vole_kit::state::Core;
 
 use crate::Magpie;
 use crate::integrations::poller::{Change, PollerHandle};
-use crate::integrations::{self, Status, Value};
+use crate::integrations::{self, Block, Status, Value};
 use crate::layout::{self, Layout};
 use crate::needs::{self, NeedView};
 use crate::services::{ServiceEvent, ServiceSummary, ServiceView, Viewer, store, view_of};
@@ -130,6 +134,9 @@ pub struct ServiceValues {
     pub interval_s: i64,
     pub status: Status,
     pub values: BTreeMap<String, Value>,
+    /// What the card draws next to its numbers; absent when there is nothing.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<Block>,
     /// Unix seconds, `null` while the service has no snapshot.
     pub fetched_at: Option<i64>,
     /// Why the reading failed, translated; absent when it did not.
@@ -184,6 +191,7 @@ fn entry(summary: &ServiceSummary, poller: &PollerHandle) -> ServiceValues {
                 interval_s: summary.interval_s,
                 status: snapshot.status,
                 values,
+                details: snapshot.details.clone(),
                 fetched_at: Some(snapshot.fetched_at.as_second()),
                 error_label: snapshot.error.as_deref().map(error_label),
             }
@@ -194,6 +202,7 @@ fn entry(summary: &ServiceSummary, poller: &PollerHandle) -> ServiceValues {
             interval_s: summary.interval_s,
             status: Status::Unknown,
             values: BTreeMap::new(),
+            details: Vec::new(),
             fetched_at: None,
             error_label: None,
         },

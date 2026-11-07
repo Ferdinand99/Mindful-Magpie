@@ -1,8 +1,14 @@
 // The interface strings of the shared renderer, in English and Norwegian. The keys are the ones
 // the server writes into the start page's #mm-labels block (src/pages.rs, labels()); the texts
 // are the same as in locales/en.toml and locales/nb.toml (start.empty, start.invalid_link,
-// start.group_label, start.bookmarks_label, the service strings and the «Trenger deg» strings), so the new tab reads like the web page. A test keeps
+// start.group_label, start.bookmarks_label, the service strings, start.block_more and the «Trenger deg» strings), so the new tab reads like the web page. A test keeps
 // the key lists equal to the server's.
+
+import { detail } from "./vendor/detail-labels.js";
+
+// The titles and labels of detail blocks: the keys the server's labels() carries as `detail.<key>`
+// (the `[detail]` section of the locale files), generated into vendor/detail-labels.js.
+const detailLabels = (texts) => Object.fromEntries(Object.entries(texts).map(([key, text]) => [`detail.${key}`, text]));
 
 export const labels = {
   en: {
@@ -17,6 +23,7 @@ export const labels = {
     status_bad: "Status: problem",
     status_unknown: "Status: unknown",
     updated: "Last updated {when}",
+    block_more: "+ {n} more",
     needs: "Needs you",
     need_ack: "Acknowledge",
     need_ack_for: "Acknowledge {name}: {text}",
@@ -24,6 +31,7 @@ export const labels = {
     need_unack_for: "Undo the acknowledgement of {name}: {text}",
     needs_acked: "{n} acknowledged",
     needs_show_acked: "Show acknowledged",
+    ...detailLabels(detail.en),
   },
   nb: {
     empty: "Startsiden er tom. Rediger den for å legge til tjenester og bokmerker.",
@@ -37,6 +45,7 @@ export const labels = {
     status_bad: "Status: feil",
     status_unknown: "Status: ukjent",
     updated: "Sist oppdatert {when}",
+    block_more: "+ {n} til",
     needs: "Trenger deg",
     need_ack: "Kvitter",
     need_ack_for: "Kvitter {name}: {text}",
@@ -44,6 +53,7 @@ export const labels = {
     need_unack_for: "Angre kvitteringen for {name}: {text}",
     needs_acked: "{n} kvittert",
     needs_show_acked: "Vis kvitterte",
+    ...detailLabels(detail.nb),
   },
 };
 

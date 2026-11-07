@@ -425,7 +425,183 @@ function drawStatus(doc, labels, status) {
   return dot;
 }
 
-/** The service part of a bound card: the notice, or the cells, the status and the age. */
+// ---- detail blocks ------------------------------------------------------------------
+//
+// A service's reading may carry `details`: blocks of kind list, bars, strip or facts (see
+// src/integrations/block.rs for the shapes). Everything in them is text from outside, so it is set
+// with textContent only; a link goes through safeHref; a bar's width is a CSS custom property set
+// through the CSS object model. A block that is not well formed is left out, and the counts are
+// capped again here, because the extension may talk to a server that does not cap them.
+
+const BLOCK_KINDS = ["list", "bars", "strip", "facts"];
+const MAX_BLOCKS = 6;
+const MAX_ITEMS = 8;
+const MAX_CELLS = 48;
+// The lines of the first list a normal card shows.
+const NORMAL_LINES = 3;
+// The key a block names its title or a row's label by (the same shape the server enforces).
+const DETAIL_KEY = /^[a-z0-9_.]{1,64}$/;
+
+/** The text of a detail key in the page's labels (`detail.<key>`), "" when the key is not known. */
+function detailLabel(labels, key) {
+  return typeof key === "string" && DETAIL_KEY.test(key) ? label(labels, `detail.${key}`) : "";
+}
+
+/** The size of a card element: "wide" or "normal". */
+function cardSizeOf(el) {
+  return el.getAttribute("data-size") === "wide" ? "wide" : "normal";
+}
+
+/** The blocks of `details` that are well formed, at most six. */
+function wellFormedBlocks(details) {
+  if (!Array.isArray(details)) return [];
+  return details.filter((b) => isObject(b) && BLOCK_KINDS.includes(b.kind)).slice(0, MAX_BLOCKS);
+}
+
+/**
+ * What a card of `size` draws of `blocks`: all of them when wide; when normal the first list (cut to
+ * three lines) and the first bars or strip. Each is `{ block, cut }`.
+ */
+function blocksFor(blocks, size) {
+  if (size === "wide") return blocks.map((block) => ({ block, cut: false }));
+  const picked = [];
+  let list = false;
+  let visual = false;
+  for (const block of blocks) {
+    if (block.kind === "list" && !list) {
+      list = true;
+      picked.push({ block, cut: true });
+    } else if ((block.kind === "bars" || block.kind === "strip") && !visual) {
+      visual = true;
+      picked.push({ block, cut: false });
+    }
+  }
+  return picked;
+}
+
+function blockTitle(doc, labels, block) {
+  const title = detailLabel(labels, block.title_key);
+  return title === "" ? null : make(doc, "span", "mm-block-title", title);
+}
+
+function drawListItem(doc, labels, item) {
+  const li = make(doc, "li", "mm-li");
+  if (STATUSES.includes(item.status)) {
+    li.setAttribute("data-status", item.status);
+    li.appendChild(drawStatus(doc, labels, item.status));
+  }
+  const main = make(doc, "span", "mm-li-main");
+  const href = safeHref(item.href);
+  let line;
+  if (href) {
+    line = isolated(doc, "a", "mm-li-text mm-li-link", text(item.text));
+    line.setAttribute("href", href);
+    line.setAttribute("rel", "noreferrer");
+  } else {
+    line = isolated(doc, "span", "mm-li-text", text(item.text));
+  }
+  main.appendChild(line);
+  const sub = text(item.sub);
+  if (sub !== "") main.appendChild(isolated(doc, "span", "mm-li-sub", sub));
+  li.appendChild(main);
+  const right = text(item.right);
+  if (right !== "") li.appendChild(isolated(doc, "span", "mm-li-right", right));
+  return li;
+}
+
+function drawList(doc, labels, block, cut) {
+  const items = (Array.isArray(block.items) ? block.items : []).filter(isObject).slice(0, MAX_ITEMS);
+  const ul = make(doc, "ul", "mm-list");
+  const shown = cut ? items.slice(0, NORMAL_LINES) : items;
+  for (const item of shown) ul.appendChild(drawListItem(doc, labels, item));
+  const more = items.length - shown.length;
+  if (more > 0) {
+    ul.appendChild(make(doc, "li", "mm-block-more", label(labels, "block_more").split("{n}").join(String(more))));
+  }
+  return ul;
+}
+
+function drawBars(doc, block) {
+  const wrap = make(doc, "div", "mm-bars");
+  for (const bar of (Array.isArray(block.bars) ? block.bars : []).filter(isObject).slice(0, MAX_ITEMS)) {
+    const name = text(bar.label);
+    const pct = Number.isFinite(bar.pct) ? Math.min(100, Math.max(0, bar.pct)) : 0;
+    const row = make(doc, "div", "mm-bar-row");
+    row.appendChild(isolated(doc, "span", "mm-bar-label", name));
+    const track = make(doc, "span", "mm-bar");
+    track.setAttribute("role", "progressbar");
+    track.setAttribute("aria-valuemin", "0");
+    track.setAttribute("aria-valuemax", "100");
+    track.setAttribute("aria-valuenow", String(Math.round(pct)));
+    if (name !== "") track.setAttribute("aria-label", name);
+    const fill = make(doc, "span", "mm-bar-fill");
+    // Through the CSS object model: the page's CSP allows that, not a style attribute.
+    fill.style.setProperty("--mm-pct", `${pct}%`);
+    track.appendChild(fill);
+    row.appendChild(track);
+    row.appendChild(isolated(doc, "span", "mm-bar-text", text(bar.text)));
+    wrap.appendChild(row);
+  }
+  return wrap;
+}
+
+function drawStrip(doc, labels, block) {
+  const strip = make(doc, "div", "mm-strip");
+  const cells = (Array.isArray(block.cells) ? block.cells : []).slice(0, MAX_CELLS);
+  // The cells are colours: the strip is one picture, named by its title, with the count of what is
+  // not well in its description.
+  strip.setAttribute("role", "img");
+  const bad = cells.filter((c) => c === "bad").length;
+  const warn = cells.filter((c) => c === "warn").length;
+  const parts = [
+    detailLabel(labels, block.title_key),
+    bad > 0 ? `${label(labels, "status_bad")}: ${bad}` : "",
+    warn > 0 ? `${label(labels, "status_warn")}: ${warn}` : "",
+  ];
+  const name = parts.filter((p) => p !== "").join(", ");
+  if (name !== "") strip.setAttribute("aria-label", name);
+  for (const cell of cells) {
+    const c = make(doc, "span", "mm-cell");
+    c.setAttribute("data-status", statusOf(cell));
+    strip.appendChild(c);
+  }
+  return strip;
+}
+
+function drawFacts(doc, labels, block) {
+  const wrap = make(doc, "div", "mm-facts");
+  for (const row of (Array.isArray(block.rows) ? block.rows : []).filter(isObject).slice(0, MAX_ITEMS)) {
+    const name = detailLabel(labels, row.label_key) || text(row.label);
+    const fact = make(doc, "div", "mm-fact");
+    fact.appendChild(isolated(doc, "span", "mm-fact-label", name));
+    fact.appendChild(isolated(doc, "span", "mm-fact-value", text(row.value)));
+    wrap.appendChild(fact);
+  }
+  return wrap;
+}
+
+function drawBlock(doc, labels, block, cut) {
+  const el = make(doc, "div", `mm-block mm-block-${block.kind}`);
+  const title = blockTitle(doc, labels, block);
+  if (title) el.appendChild(title);
+  if (block.kind === "list") el.appendChild(drawList(doc, labels, block, cut));
+  else if (block.kind === "bars") el.appendChild(drawBars(doc, block));
+  else if (block.kind === "strip") el.appendChild(drawStrip(doc, labels, block));
+  else el.appendChild(drawFacts(doc, labels, block));
+  return el;
+}
+
+/** The blocks of a reading for a card of `size`, or null when there is nothing to draw. */
+function drawBlocks(doc, details, size, opts) {
+  const picked = blocksFor(wellFormedBlocks(details), size);
+  if (picked.length === 0) return null;
+  const wrap = make(doc, "div", "mm-blocks");
+  wrap.setAttribute("data-count", String(picked.length));
+  for (const { block, cut } of picked) wrap.appendChild(drawBlock(doc, opts.labels, block, cut));
+  return wrap;
+}
+
+/** The service part of a bound card: the notice, or the cells, the blocks, the status and the age. */
 function drawService(doc, el, ref, opts) {
   const labels = opts.labels;
   const svc = make(doc, "span", "mm-svc");
@@ -461,7 +637,6 @@ function drawService(doc, el, ref, opts) {
   const catalogue = Array.isArray(service.metrics) ? service.metrics : [];
   const shown = [];
   for (const id of ref.metrics) {
-    if (shown.length === 4) break;
     const metric = catalogue.find((m) => isObject(m) && m.id === id);
     // A metric listed twice is drawn once.
     if (metric && !shown.includes(metric)) shown.push(metric);
@@ -488,6 +663,9 @@ function drawService(doc, el, ref, opts) {
     }
     svc.appendChild(grid);
   }
+
+  const blocks = drawBlocks(doc, snap.details, cardSizeOf(el), opts);
+  if (blocks) svc.appendChild(blocks);
 
   foot.appendChild(drawStatus(doc, labels, statusOf(snap.status)));
   foot.appendChild(make(doc, "span", "mm-age", ageText(labels, opts.lang, fetchedMs, nowMs, stale)));
@@ -532,6 +710,14 @@ export function tickAges(root, opts = {}) {
   }
 }
 
+/** The size a card has: its own when it names one, else the one of its service's kind, else normal. */
+function cardSize(card, services) {
+  if (card?.size === "wide" || card?.size === "normal") return card.size;
+  const ref = Array.isArray(services) ? serviceRef(card) : null;
+  const service = ref ? services.find((s) => isObject(s) && s.id === ref.id) : null;
+  return service?.size === "wide" ? "wide" : "normal";
+}
+
 function drawCard(doc, card, opts) {
   const href = cardHref(card, opts.services);
   const ref = Array.isArray(opts.services) ? serviceRef(card) : null;
@@ -555,7 +741,9 @@ function drawCard(doc, card, opts) {
   if (!href && !unlinked) body.appendChild(invalidMarker(doc, opts.labels));
   el.appendChild(body);
   if (ref) {
-    el.setAttribute("class", `${el.getAttribute("class")} mm-bound`);
+    const size = cardSize(card, opts.services);
+    el.setAttribute("class", `${el.getAttribute("class")} mm-bound${size === "wide" ? " mm-card-wide" : ""}`);
+    el.setAttribute("data-size", size);
     // What updateValues() finds the card by.
     if (typeof card.id === "string" && card.id !== "") el.setAttribute("data-card", card.id);
     el.appendChild(drawService(doc, el, ref, opts));
@@ -564,12 +752,50 @@ function drawCard(doc, card, opts) {
 }
 
 /**
+ * Makes `oldEl` (on the page) the same as `freshEl` (just drawn, not on the page) by changing it in
+ * place: attributes and text are rewritten, children are matched by position, and only a child that
+ * cannot be matched (another tag or class, or one more or one fewer) is replaced, added or removed. An
+ * element that stays is the same element, so a focused link in a block keeps its focus. The one
+ * style the renderer sets on elements, `--mm-pct` of a bar, goes through the CSS object model.
+ */
+function morph(oldEl, freshEl) {
+  for (const attr of [...oldEl.attributes]) {
+    if (attr.name !== "style" && !freshEl.hasAttribute(attr.name)) oldEl.removeAttribute(attr.name);
+  }
+  for (const attr of [...freshEl.attributes]) {
+    if (attr.name !== "style" && oldEl.getAttribute(attr.name) !== attr.value) oldEl.setAttribute(attr.name, attr.value);
+  }
+  const pct = freshEl.style?.getPropertyValue?.("--mm-pct") ?? "";
+  if (pct !== "" && oldEl.style.getPropertyValue("--mm-pct") !== pct) oldEl.style.setProperty("--mm-pct", pct);
+  const olds = [...oldEl.childNodes];
+  const fresh = [...freshEl.childNodes];
+  fresh.forEach((next, i) => {
+    const prev = olds[i];
+    if (!prev) oldEl.appendChild(next);
+    else if (prev.nodeType === 3 && next.nodeType === 3) {
+      if (prev.nodeValue !== next.nodeValue) prev.nodeValue = next.nodeValue;
+    } else if (
+      prev.nodeType === 1 &&
+      next.nodeType === 1 &&
+      prev.nodeName === next.nodeName &&
+      prev.getAttribute("class") === next.getAttribute("class")
+    ) {
+      morph(prev, next);
+    } else oldEl.replaceChild(next, prev);
+  });
+  for (const extra of olds.slice(fresh.length)) oldEl.removeChild(extra);
+}
+
+/**
  * Brings the service part of every bound card up to date after new `opts.values`
- * (or `opts.services`) without drawing the page again. Per card it replaces only
- * `.mm-svc` and the `data-fetched`, `data-interval` and `data-stale` attributes;
- * the card's own element, its tile and its text stay, so a focused link keeps
- * focus. A card whose service or metrics changed is redrawn on its own (it loses
- * focus). Plain cards are not touched.
+ * (or `opts.services`) without drawing the page again. Per card it changes only
+ * `.mm-svc` and the `data-fetched`, `data-interval` and `data-stale` attributes, in
+ * place (see morph): the card's own element, its tile and its text stay, and so do
+ * the elements of the service part that still fit (a list line, a bar), so a focused
+ * link, also one inside a block, keeps focus. Only what cannot be matched (a block
+ * that changed its kind, a line more or fewer) is drawn anew. A card whose service,
+ * metrics or size changed is redrawn on its own (it loses focus). Plain cards are
+ * not touched.
  *
  * `layout` is the one given to the last render(); `opts` the same as for
  * render(). Returns true when every bound card of the layout was found on the
@@ -607,6 +833,7 @@ export function updateValues(root, layout, opts = {}) {
       if (
         el.getAttribute("data-service") !== String(ref.id) ||
         el.getAttribute("data-metrics") !== JSON.stringify(ref.metrics) ||
+        el.getAttribute("data-size") !== cardSize(card, settings.services) ||
         // The service's link changed (or came or went) under a card with no link of its own.
         (el.getAttribute("href") ?? null) !== (cardHref(card, settings.services) ?? null)
       ) {
@@ -616,7 +843,7 @@ export function updateValues(root, layout, opts = {}) {
       for (const name of ["data-fetched", "data-interval", "data-stale"]) el.removeAttribute(name);
       const old = el.querySelector(".mm-svc");
       const fresh = drawService(doc, el, ref, settings);
-      if (old) el.replaceChild(fresh, old);
+      if (old) morph(old, fresh);
       else el.appendChild(fresh);
     }
   }
@@ -996,30 +1223,44 @@ function applyBackground(doc, background, opts) {
  * path of a background image, for a page on another origin.
  *
  * Cards may be bound to a service (`card.service` is `{ id, metrics: [ids] }`,
- * null or absent for a plain link card). Two more options draw them; without
+ * null or absent for a plain link card; `card.size` is "normal" or "wide", or absent for the
+ * size of the service). Two more options draw them; without
  * `services` a bound card is drawn as a plain one:
  *
- *   - `opts.services`: `[{ id, name, kind, interval_s, link, metrics: [{ id,
- *     label, format }] }]`, the services the viewer can see. A bound id that is
+ *   - `opts.services`: `[{ id, name, kind, interval_s, link, size, metrics: [{ id,
+ *     label, format }] }]`, the services the viewer can see (`size` is the size a card
+ *     of the service has when it names none; absent reads normal). A bound id that is
  *     not in the list gets the notice `service_missing`; the card keeps its own
  *     link, and a card that has none is drawn as a plain element, not a link.
  *     A card with a service and an empty `url` opens the service's `link`; the
  *     card's own `url` always wins.
  *   - `opts.values`: `{ now, services: { "<id>": { name, kind, interval_s,
- *     status, values: { "<metric>": { num, text } }, fetched_at,
- *     error_label? } } }`. `now` and `fetched_at` are ISO 8601 strings or epoch
+ *     status, values: { "<metric>": { num, text } }, details?, fetched_at,
+ *     error_label? } } }`. `details` is the reading's blocks (see below). `now` and `fetched_at` are ISO 8601 strings or epoch
  *     seconds; ages count from `now`, never from the clock, so a page can draw
  *     the same thing twice. A service with no entry shows `service_waiting`.
  *     `status` is ok, warn, bad or unknown (anything else reads unknown).
  *
  * A bound card gets `data-service` (the id), a status dot (`.mm-status`, its
- * text in `aria-label`), up to four cells (`.mm-metric`: label and value), the
- * age (`.mm-age`) and, older than three intervals, `data-stale`. The extra
- * labels: `service_missing`, `service_waiting`, `status_ok`, `status_warn`,
- * `status_bad`, `status_unknown` and `updated` (with `{when}`). tickAges()
- * keeps the ages current later, updateValues() swaps new values in without
- * touching the cards' own elements (so focus stays), and formatValue() is the
- * number formatting.
+ * text in `aria-label`), a cell for each chosen metric (`.mm-metric`: label and
+ * value; two columns on a normal card, up to five on a wide one), the blocks, the
+ * age (`.mm-age`) and, older than three intervals, `data-stale`. A card is
+ * `data-size="normal"` or `"wide"` (class `mm-card-wide`, two grid columns on a
+ * wide screen). The extra labels: `service_missing`, `service_waiting`,
+ * `status_ok`, `status_warn`, `status_bad`, `status_unknown`, `updated` (with
+ * `{when}`) and `block_more` (with `{n}`). tickAges() keeps the ages current
+ * later, updateValues() changes the new values into the page in place (so focus
+ * stays, also on a link inside a block), and formatValue() is the number
+ * formatting.
+ *
+ * Blocks: `details` is a list of `{ kind: "list" | "bars" | "strip" | "facts",
+ * title_key, ... }` (see src/integrations/block.rs). A title is the label
+ * `detail.<title_key>` (the `[detail]` section of the locale files; a key that is
+ * not there shows no title). A normal card draws the first list, cut to three
+ * lines and "+ N more", and the first bars or strip; a wide card draws all of them
+ * (at most six), in two columns on a wide screen. Everything in a block is text,
+ * a link goes through safeHref and opens in the same tab, a bar's width is a CSS
+ * custom property.
  *
  * «Trenger deg»: `opts.values.needs` is `[{ service_id, service_name, key, level
  * (warn|bad), label, since (epoch seconds), acked }]`, the server's list for this
