@@ -92,6 +92,8 @@ export const LABEL_KEYS = [
   "confirm_leave",
   "confirm_leave_text",
   "confirm_leave_yes",
+  // The next three are used by start.js (the notice for a kept draft), not by
+  // edit.js: they are listed here so that one list covers every string.
   "restore_notice",
   "restore_yes",
   "restore_discard",

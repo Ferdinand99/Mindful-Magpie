@@ -43,8 +43,10 @@
 {% endif %}
 
 {#- The renderer (static/magpie/render.js) draws the groups, the bookmarks and the
-    empty state into this element from the data blocks below. -#}
-<section id="groups" class="mm-root" aria-label="{{ tr("start.groups") }}"></section>
+    empty state into this element from the data blocks below. data-user is the
+    signed-in user's number: an unsaved draft kept in the browser belongs to one
+    user only (static/magpie/start.js). -#}
+<section id="groups" class="mm-root" aria-label="{{ tr("start.groups") }}" data-user="{{ user_id }}"></section>
 <noscript>{{ m::callout("info", tr("start.noscript")) }}</noscript>
 
 {#- Data, not script: the browser never runs these blocks. The JSON is written so

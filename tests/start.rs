@@ -524,3 +524,23 @@ async fn edit_mode_scripts_are_served() {
         );
     }
 }
+
+#[tokio::test]
+async fn start_page_carries_the_signed_in_users_number() {
+    // A draft kept in the browser is tied to this number, so that the next
+    // person in the same tab never sees it (static/magpie/start.js).
+    let app = App::new().await;
+    let mut ada = Web::new(&app, "ada", "admin").await;
+    let mut bob = Web::new(&app, "bob", "viewer").await;
+    let ada_id = common::user_id(&app, "ada").await;
+    let bob_id = common::user_id(&app, "bob").await;
+    assert_ne!(ada_id, bob_id);
+    for (web, id, name) in [(&mut ada, ada_id, "ada"), (&mut bob, bob_id, "bob")] {
+        let res = start_page(web, "en").await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        let at = res.body.find(r#"id="groups""#).unwrap();
+        let tag = &res.body[at..res.body[at..].find('>').unwrap() + at];
+        assert!(tag.contains(&format!(r#"data-user="{id}""#)), "{tag}");
+        assert!(!tag.contains(name), "the name is not on the page: {tag}");
+    }
+}

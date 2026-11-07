@@ -107,9 +107,19 @@ export function makeSave(doc, fetchFn = (...args) => fetch(...args)) {
 
 // An unsaved draft is kept in sessionStorage when the person leaves edit mode in
 // a way that cannot be stopped (Back and Forward). The page offers it again the
-// next time the start page shows. Every access is guarded: storage can be off,
+// next time the start page shows. A tab can be used by more than one person in
+// turn, so the kept draft carries the number of the user it belongs to (the page
+// has it in data-user on #groups) and the time it was kept: it is offered only
+// to that user and only for a day. Every access is guarded: storage can be off,
 // full or blocked, and the page must work without it.
 const STASH_KEY = "mm-unsaved-draft";
+const STASH_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** The signed-in user's number from the page, or null. */
+function userOf(doc) {
+  const value = doc.getElementById("groups")?.getAttribute("data-user");
+  return typeof value === "string" && /^\d+$/.test(value) ? Number(value) : null;
+}
 
 /** The tab's sessionStorage, or null where it is not there or not allowed. */
 function storageOf(doc, deps) {
@@ -120,31 +130,45 @@ function storageOf(doc, deps) {
   }
 }
 
-/** Keeps `draft` (its `version` is the one it was loaded at). */
-export function stashDraft(storage, draft) {
+/** Keeps `draft` (its `version` is the one it was loaded at) for `user`. */
+export function stashDraft(storage, draft, user, now = Date.now()) {
   try {
-    storage?.setItem(STASH_KEY, JSON.stringify({ version: draft.version, draft }));
+    storage?.setItem(STASH_KEY, JSON.stringify({ user, at: now, version: draft.version, draft }));
   } catch {
     // Nothing to do: the draft is lost, as it was before this existed.
   }
 }
 
-/** The kept draft, or null when there is none or it does not look like a layout. */
-export function readStash(storage) {
+/**
+ * The draft kept for `user`, or null. Anything that is not offered (another
+ * user's, older than a day, or not a layout at all) is deleted on the way.
+ */
+export function readStash(storage, user, now = Date.now()) {
+  let raw;
   try {
-    const kept = JSON.parse(storage?.getItem(STASH_KEY) ?? "null");
-    const draft = kept?.draft;
-    const shaped =
-      draft &&
-      typeof draft === "object" &&
-      Number.isFinite(kept.version) &&
-      Array.isArray(draft.bookmarks) &&
-      Array.isArray(draft.groups) &&
-      draft.groups.every((g) => g && typeof g === "object" && Array.isArray(g.cards));
-    return shaped ? draft : null;
+    raw = storage?.getItem(STASH_KEY) ?? null;
   } catch {
     return null;
   }
+  if (raw === null) return null;
+  let draft = null;
+  try {
+    const kept = JSON.parse(raw);
+    const shaped =
+      kept?.draft &&
+      typeof kept.draft === "object" &&
+      Number.isFinite(kept.version) &&
+      Array.isArray(kept.draft.bookmarks) &&
+      Array.isArray(kept.draft.groups) &&
+      kept.draft.groups.every((g) => g && typeof g === "object" && Array.isArray(g.cards));
+    const mine = user !== null && kept?.user === user;
+    const fresh = Number.isFinite(kept?.at) && now - kept.at >= 0 && now - kept.at < STASH_TTL_MS;
+    if (shaped && mine && fresh) draft = kept.draft;
+  } catch {
+    // Not JSON: not offered.
+  }
+  if (draft === null) clearStash(storage);
+  return draft;
 }
 
 export function clearStash(storage) {
@@ -159,7 +183,7 @@ export function clearStash(storage) {
  * Wires the Edit button (`#mm-edit`, found at click time, because htmx swaps
  * the body) to edit mode. The module is loaded on the first press. Pressing the
  * button while editing is the same as «Done». `deps`: `load` (gives the module),
- * `save`, `reload`, `navigate`, `storage`. Returns `{ leave, check, offerRestore }`:
+ * `save`, `reload`, `navigate`, `storage`, `now` (a clock, for tests). Returns `{ leave, check, offerRestore }`:
  *
  * - `leave()`: the page is about to be saved to the history or left by Back or
  *   Forward, which cannot be stopped. Unsaved changes are kept (see above) and
@@ -170,6 +194,7 @@ export function clearStash(storage) {
 export function initEditing(doc, deps = {}) {
   const load = deps.load ?? (() => import("./edit.js"));
   const storage = storageOf(doc, deps);
+  const now = deps.now ?? (() => Date.now());
   const baseSave = deps.save ?? makeSave(doc);
   // A saved page has no use for an older draft.
   const save = async (layout) => {
@@ -216,7 +241,7 @@ export function initEditing(doc, deps = {}) {
   function offerRestore() {
     const root = doc.getElementById("groups");
     if (!root || editor?.isActive() || doc.getElementById("mm-restore")) return;
-    const kept = readStash(storage);
+    const kept = readStash(storage, userOf(doc), now());
     if (!kept) return;
     const labels = dataOf(doc, "mm-labels") ?? {};
     // Without the strings the notice would say nothing: leave the draft alone.
@@ -250,7 +275,8 @@ export function initEditing(doc, deps = {}) {
       // Its buttons would be dead when htmx puts the saved body back.
       doc.getElementById("mm-restore")?.remove();
       if (!editor?.isActive()) return;
-      if (editor.isDirty()) stashDraft(storage, editor.draft());
+      // Without a user number on the page the draft could not be tied to anyone.
+      if (editor.isDirty() && userOf(doc) !== null) stashDraft(storage, editor.draft(), userOf(doc), now());
       editor.stop({ focus: false });
     },
     check() {

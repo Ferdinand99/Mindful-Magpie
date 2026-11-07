@@ -53,6 +53,9 @@ struct StartPage {
     /// The user's layout as JSON for a `<script type="application/json">`
     /// block (see [`json_for_html`]).
     layout_json: String,
+    /// The signed-in user's id, on the page so that a draft kept in the browser
+    /// can be tied to the user it belongs to.
+    user_id: i64,
     /// The strings the renderer needs, as JSON for the same kind of block.
     labels_json: String,
     /// The stored layout could not be read: say so and offer a fresh start.
@@ -241,6 +244,7 @@ async fn start(
         date,
         timezone,
         layout_json: json_for_html(&layout),
+        user_id: user.id,
         labels_json: json_for_html(&labels()),
         corrupt,
     };

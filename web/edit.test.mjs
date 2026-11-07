@@ -51,7 +51,7 @@ function setup({ layout = layoutFixture(), saveResult } = {}) {
   const { document, window } = parseHTML(
     `<!doctype html><html lang="en"><body><main>
        <div class="start-actions"><button type="button" id="mm-edit" aria-pressed="false">Edit</button></div>
-       <section id="groups" class="mm-root"></section>
+       <section id="groups" class="mm-root" data-user="7"></section>
        <script type="application/json" id="mm-layout">${JSON.stringify(layout)}</script>
        <script type="application/json" id="mm-labels">${JSON.stringify(LABELS)}</script>
      </main></body></html>`,
@@ -822,8 +822,9 @@ const denied = {
   },
 };
 
-function wired(t, storage, save) {
+function wired(t, storage, save, now) {
   return initEditing(t.document, {
+    now,
     load: async () => ({ startEditing }),
     save: save ?? (async (next) => ({ status: 200, body: { version: next.version + 1 } })),
     reload: () => {},
@@ -851,7 +852,7 @@ test("history_save_while_dirty_keeps_the_draft_and_shows_the_plain_page", async 
   assert.equal(t.root.hasAttribute("data-editing"), false, "the history gets the plain page");
   assert.equal(t.root.querySelectorAll("[data-act]").length, 0);
   assert.ok(t.root.textContent.includes("Sonarr"), "the page shows what is stored");
-  const kept = readStash(storage);
+  const kept = readStash(storage, 7);
   assert.deepEqual(kept.groups[0].cards.map((c) => c.id), ["c2"], "the draft is not lost");
   assert.equal(kept.version, 3);
   assert.equal(JSON.parse([...storage.map.values()][0]).version, 3);
@@ -871,7 +872,7 @@ test("history_save_without_changes_keeps_nothing", async () => {
 test("the_restore_notice_reopens_edit_mode_on_the_kept_draft", async () => {
   const t = setup();
   const storage = fakeStorage();
-  stashDraft(storage, keptDraft());
+  stashDraft(storage, keptDraft(), 7);
   const editing = wired(t, storage);
   editing.offerRestore();
   editing.offerRestore();
@@ -891,13 +892,13 @@ test("the_restore_notice_reopens_edit_mode_on_the_kept_draft", async () => {
   assert.equal(item(t.root, "card", "c1"), null, "the kept draft is on screen");
   assert.ok(item(t.root, "card", "c2"));
   assert.ok(t.root.textContent.includes("Kept"));
-  assert.ok(readStash(storage), "kept until it is saved or given up");
+  assert.ok(readStash(storage, 7), "kept until it is saved or given up");
 });
 
 test("a_restored_draft_saves_with_its_version_and_clears_the_kept_copy", async () => {
   const t = setup();
   const storage = fakeStorage();
-  stashDraft(storage, keptDraft());
+  stashDraft(storage, keptDraft(), 7);
   const sent = [];
   const editing = wired(t, storage, async (next) => {
     sent.push(next);
@@ -911,14 +912,14 @@ test("a_restored_draft_saves_with_its_version_and_clears_the_kept_copy", async (
   assert.equal(sent.length, 1);
   assert.equal(sent[0].version, 3);
   assert.equal(sent[0].groups[0].title, "Kept");
-  assert.equal(readStash(storage), null);
+  assert.equal(readStash(storage, 7), null);
   assert.equal(storage.map.size, 0);
 });
 
 test("a_restored_draft_over_a_newer_page_takes_the_normal_409_path", async () => {
   const t = setup();
   const storage = fakeStorage();
-  stashDraft(storage, { ...keptDraft(), version: 1 });
+  stashDraft(storage, { ...keptDraft(), version: 1 }, 7);
   const editing = wired(t, storage, async () => ({ status: 409, body: { error: "conflict", current: 3 } }));
   editing.offerRestore();
   click(t.document.querySelector("#mm-restore button"));
@@ -926,7 +927,7 @@ test("a_restored_draft_over_a_newer_page_takes_the_normal_409_path", async () =>
   click(act(bar(t.document), "done"));
   await tick();
   assert.match(alertText(t.document), /changed in another tab/);
-  assert.ok(readStash(storage), "a failed save keeps the draft");
+  assert.ok(readStash(storage, 7), "a failed save keeps the draft");
   assert.ok(t.root.hasAttribute("data-editing"));
 });
 
@@ -934,7 +935,7 @@ test("cancel_and_discard_delete_the_kept_draft", async () => {
   // Cancel in a restored edit session.
   let t = setup();
   let storage = fakeStorage();
-  stashDraft(storage, keptDraft());
+  stashDraft(storage, keptDraft(), 7);
   let editing = wired(t, storage);
   editing.offerRestore();
   click(t.document.querySelector("#mm-restore button"));
@@ -948,7 +949,7 @@ test("cancel_and_discard_delete_the_kept_draft", async () => {
   // The notice's Discard.
   t = setup();
   storage = fakeStorage();
-  stashDraft(storage, keptDraft());
+  stashDraft(storage, keptDraft(), 7);
   editing = wired(t, storage);
   editing.offerRestore();
   click(t.document.querySelectorAll("#mm-restore button")[1]);
@@ -959,7 +960,7 @@ test("cancel_and_discard_delete_the_kept_draft", async () => {
   // Leaving through a link after "Leave" also gives the changes up.
   t = setup();
   storage = fakeStorage();
-  stashDraft(storage, keptDraft());
+  stashDraft(storage, keptDraft(), 7);
   editing = wired(t, storage);
   editing.offerRestore();
   click(t.document.querySelector("#mm-restore button"));
@@ -978,7 +979,7 @@ test("a_kept_draft_that_is_not_a_layout_is_ignored", () => {
   const storage = fakeStorage();
   for (const junk of ["garbage", "null", "{}", JSON.stringify({ version: 1, draft: { groups: [1], bookmarks: [] } }), JSON.stringify({ draft: keptDraft() })]) {
     storage.setItem("mm-unsaved-draft", junk);
-    assert.equal(readStash(storage), null, junk);
+    assert.equal(readStash(storage, 7), null, junk);
     wired(t, storage).offerRestore();
     assert.equal(t.document.getElementById("mm-restore"), null, junk);
   }
@@ -1032,7 +1033,7 @@ test("edit_mode_works_on_a_page_htmx_put_back_without_its_data_blocks", async ()
   t.document.getElementById("mm-layout").remove();
   t.document.getElementById("mm-labels").remove();
   const storage = fakeStorage();
-  stashDraft(storage, keptDraft());
+  stashDraft(storage, keptDraft(), 7);
   const editing = wired(t, storage);
   editing.offerRestore();
   assert.ok(t.document.getElementById("mm-restore"), "the notice still has its strings");
@@ -1061,4 +1062,76 @@ test("a_restored_body_without_blocks_is_redrawn_from_memory_not_emptied", () => 
   drawIfNeeded(t.document);
   assert.equal(t.root.innerHTML, drawn);
   assert.equal(t.document.documentElement.getAttribute("data-bg"), "hedgerow");
+});
+
+const HOUR = 60 * 60 * 1000;
+
+test("the_kept_draft_is_tied_to_the_user_and_the_time_it_was_kept", async () => {
+  const t = setup();
+  const storage = fakeStorage();
+  const clock = { now: 1_000_000 };
+  const editing = wired(t, storage, undefined, () => clock.now);
+  click(t.document.getElementById("mm-edit"));
+  await tick();
+  click(act(item(t.root, "card", "c1"), "delete"));
+  editing.leave();
+  const kept = JSON.parse([...storage.map.values()][0]);
+  assert.equal(kept.user, 7, "the number of the signed-in user");
+  assert.equal(kept.at, 1_000_000);
+  assert.deepEqual(Object.keys(kept).sort(), ["at", "draft", "user", "version"], "no user name, only the number");
+});
+
+test("a_draft_kept_for_another_user_is_deleted_and_not_offered", () => {
+  const t = setup();
+  const storage = fakeStorage();
+  stashDraft(storage, keptDraft(), 8);
+  wired(t, storage).offerRestore();
+  assert.equal(t.document.getElementById("mm-restore"), null);
+  assert.equal(storage.map.size, 0, "deleted without being offered");
+});
+
+test("a_draft_older_than_a_day_is_deleted_and_not_offered", () => {
+  const t = setup();
+  const storage = fakeStorage();
+  stashDraft(storage, keptDraft(), 7, 5 * HOUR);
+  wired(t, storage, undefined, () => 5 * HOUR + 24 * HOUR).offerRestore();
+  assert.equal(t.document.getElementById("mm-restore"), null);
+  assert.equal(storage.map.size, 0);
+
+  // A clock that went backwards is not trusted either.
+  stashDraft(storage, keptDraft(), 7, 100 * HOUR);
+  wired(t, storage, undefined, () => 5 * HOUR).offerRestore();
+  assert.equal(t.document.getElementById("mm-restore"), null);
+  assert.equal(storage.map.size, 0);
+});
+
+test("a_fresh_draft_of_the_same_user_is_offered", () => {
+  const t = setup();
+  const storage = fakeStorage();
+  stashDraft(storage, keptDraft(), 7, 5 * HOUR);
+  wired(t, storage, undefined, () => 5 * HOUR + 23 * HOUR + 59 * 60 * 1000).offerRestore();
+  assert.ok(t.document.getElementById("mm-restore"));
+  assert.equal(storage.map.size, 1, "kept until it is used");
+});
+
+test("without_a_user_number_on_the_page_nothing_is_kept_or_offered", async () => {
+  const t = setup();
+  t.root.removeAttribute("data-user");
+  const storage = fakeStorage();
+  stashDraft(storage, keptDraft(), 7);
+  const editing = wired(t, storage);
+  editing.offerRestore();
+  assert.equal(t.document.getElementById("mm-restore"), null);
+  assert.equal(storage.map.size, 0);
+
+  click(t.document.getElementById("mm-edit"));
+  await tick();
+  click(act(item(t.root, "card", "c1"), "delete"));
+  editing.leave();
+  assert.equal(storage.map.size, 0, "a draft that cannot be tied to a user is not kept");
+
+  t.root.setAttribute("data-user", "ada");
+  stashDraft(storage, keptDraft(), 7);
+  wired(t, storage).offerRestore();
+  assert.equal(t.document.getElementById("mm-restore"), null, "only a number counts");
 });
