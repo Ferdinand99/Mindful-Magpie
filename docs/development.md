@@ -16,20 +16,24 @@ src/
   lib.rs              # start() (database, state) and router()
   product.rs          # KitConfig: names, cookies, token prefixes, nav, settings tabs, locales, static files
   pages.rs            # Magpie's own pages: the start page and the Settings redirect
-  api.rs              # REST routes for the extension: GET /api/v1/me/start, POST /api/v1/extension/token
+  api.rs              # REST routes for the extension: GET /api/v1/me/start (the layout plus `services`), GET /api/v1/me/values (the latest readings), POST /api/v1/extension/token
   connect.rs          # the extension's consent page (GET/POST /connect/extension) and its one-time codes
   config.rs           # flags and MM_* environment variables
   server.rs           # listener, graceful shutdown
   db.rs               # Magpie's migration set (after the kit's core set)
   layout/             # the start page layout: model and validation, per-user versioned storage, uploaded backgrounds (background.rs)
+  integrations/       # the integration contract (mod.rs: the Integration trait, Snapshot, FetchCtx, the guarded HTTP client, the registry), the built-in kinds (http_kind.rs: "Nettside") and the background poller (poller.rs: fetches every service on its interval, keeps the latest snapshot in memory and in service_snapshots, follows the service events)
+  values.rs           # the values document (#mm-values, GET /api/v1/me/values) and the event stream GET /start/live: only services bound on the user's layout and visible to them, diffed against what the client has
+  needs.rs            # «Trenger deg»: the needs of those services for one user (the config need for admins only), the per-user acknowledgements (table acks) and POST /start/needs/ack and /unack
+  services/           # admin-managed services: store.rs (tables, sealed secrets, who sees what), pages.rs (Settings → Services and «Test»), mod.rs (types and checks)
 templates/            # Magpie's pages (extend kit/layout.html)
 static/               # favicon, icons, web manifest, magpie.css, clock.js
 static/magpie/        # the start page scripts (ES modules: render.js is the shared renderer, edit.js is edit mode with ops.js and rules.js) and render.css
-web/                  # JavaScript tests (node --test, linkedom): render*, ops, rules, edit (edit mode, the page wiring in start.js), extension-*; build-extension.mjs and kit-tokens.css; dev-only
+web/                  # JavaScript tests (node --test, linkedom): render, render-start, render-values and render-needs (the renderer: cards, live numbers, the «Trenger deg» row), live (the event stream, the ages, the acknowledge buttons), ops, rules, edit (edit mode, the page wiring in start.js) and the extension tests (extension-*: state, options, connect, newtab, render, values, vendor); build-extension.mjs and kit-tokens.css; dev-only
 extension/            # the Firefox extension; extension/vendor/ is generated from static/magpie/ and web/kit-tokens.css
-migrations/           # Magpie's migrations (0001 init, 0002 layouts, 0003 extension codes, 0004 backgrounds, 0005 kept background)
+migrations/           # Magpie's migrations (0001 init, 0002 layouts, 0003 extension codes, 0004 backgrounds, 0005 kept background, 0006 services, 0007 snapshots, 0008 acks)
 locales/              # Magpie's strings (en, nb)
-tests/                # boot.rs, auth.rs, start.rs, layout.rs, layout_http.rs, api_start.rs, background.rs (uploads, the kept picture, token limits, upgrades from older schemas), connect.rs; common/ builds an in-process app on a temporary data directory
+tests/                # boot.rs, auth.rs, start.rs, layout.rs, layout_http.rs, cards.rs (cards bound to services: the save checks, the `#mm-services` embed, what a hidden service leaks), api_start.rs, background.rs (uploads, the kept picture, token limits, upgrades from older schemas), connect.rs, services.rs (the services pages, sealed secrets, «Test» and the http kind against a stub server run in the test), values.rs and values_limit.rs (the `#mm-values` embed, the event stream on a paused clock, the values API, the caps on streams), needs.rs (the needs list, the acknowledgement rule, the ack routes, the config need for admins only, live updates after an ack, the service list the stream keeps for the editor's picker), poller.rs (the poller on a paused clock with a stub kind; hostile answers and secrets against a stub web server); common/ builds an in-process app on a temporary data directory
 Dockerfile            # static musl binary on Alpine
 docker/               # the entrypoint (PUID/PGID)
 about.toml, about.hbs # cargo-about: licence allowlist and template for THIRD-PARTY-NOTICES
@@ -46,10 +50,10 @@ Builds and tests run in Docker on a build host (a shared Docker daemon), not on 
 cargo commands that run inside a Rust 1.99 container with clippy and rustfmt installed.
 
 ```bash
-cargo test --locked                                  # 145 Rust tests: boot, auth and users, start page, layout, backgrounds and migrations, extension API and connect flow
+cargo test --locked                                  # 304 Rust tests: boot, auth and users, start page, layout, backgrounds and migrations, extension API and connect flow, services, the poller
 cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --all --check
-cd web && npm ci && node --test                     # 243 JavaScript tests: renderer, operations, rules, edit mode and page wiring, the extension (node:22 container; linkedom stands in for the DOM)
+cd web && npm ci && node --test                     # 424 JavaScript tests: renderer, live numbers and needs, operations, rules, edit mode and page wiring, the extension (node:22 container; linkedom stands in for the DOM)
 cd web && npm run build:extension                    # copies the renderer into extension/vendor/; git must show no change
 docker build -t magpie:dev .
 docker run --rm magpie:dev --help     # every flag and its MM_ variable

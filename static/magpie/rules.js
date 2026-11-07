@@ -14,6 +14,8 @@ export const LIMITS = {
   title: 80,
   groupTitle: 60,
   description: 160,
+  serviceMetrics: 4,
+  metricId: 40,
   url: 2048,
   emojiBytes: 64,
 };
@@ -114,6 +116,25 @@ export function emojiProblem(emoji) {
   return null;
 }
 
+/**
+ * The code for a service binding the server would refuse, or null (none is
+ * fine). `service` is `{ id, metrics }` or null. Mirrors `validate` in
+ * `src/layout/model.rs`. Whether the service exists and may be used, and
+ * whether the metrics are its kind's, is for the server to say (`bad_service`,
+ * `bad_metric`).
+ */
+export function serviceProblem(service) {
+  if (service === null || service === undefined) return null;
+  if (!Number.isInteger(service.id) || service.id < 1) return "bad_service";
+  const metrics = Array.isArray(service.metrics) ? service.metrics : [];
+  if (metrics.length === 0) return "required";
+  if (metrics.length > LIMITS.serviceMetrics) return "too_many";
+  const shaped = (id) => typeof id === "string" && id.length >= 1 && id.length <= LIMITS.metricId && /^[A-Za-z0-9_-]+$/.test(id);
+  if (!metrics.every(shaped)) return "bad_id";
+  if (new Set(metrics).size !== metrics.length) return "duplicate_id";
+  return null;
+}
+
 function collect(found) {
   const out = {};
   for (const [field, code] of Object.entries(found)) if (code) out[field] = code;
@@ -124,7 +145,7 @@ export function checkGroup({ title }) {
   return collect({ title: checkText(title, LIMITS.groupTitle, true) });
 }
 
-/** `values`: `title`, `description`, `url`, `emoji` ("" for none), `colour`. */
+/** `values`: `title`, `description`, `url`, `emoji` ("" for none), `colour`, and `service` (`{ id, metrics }` or null). */
 export function checkCard(values) {
   return collect({
     title: checkText(values.title, LIMITS.title, true),
@@ -132,6 +153,7 @@ export function checkCard(values) {
     url: urlProblem(values.url),
     emoji: emojiProblem(values.emoji),
     colour: PALETTE.includes(values.colour) ? null : "bad_colour",
+    service: serviceProblem(values.service),
   });
 }
 

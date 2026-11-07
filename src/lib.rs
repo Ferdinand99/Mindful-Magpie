@@ -11,16 +11,23 @@ pub mod api;
 pub mod config;
 pub mod connect;
 pub mod db;
+pub mod integrations;
 pub mod layout;
+pub mod needs;
 pub mod pages;
 pub mod product;
 pub mod server;
+pub mod services;
+pub mod values;
 
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 
-use axum::middleware::{from_fn, from_fn_with_state};
+use axum::extract::Request;
+use axum::http::{HeaderValue, header};
+use axum::middleware::{Next, from_fn, from_fn_with_state};
+use axum::response::Response;
 use axum::routing::get;
 use axum::{Extension, Router};
 use vole_kit::auth::{guard, pages as kit_pages};
@@ -30,6 +37,9 @@ use vole_kit::http::ratelimit::TokenBuckets;
 use vole_kit::state::Core;
 
 pub use product::{VERSION, install};
+
+/// The next [`Magpie::instance`].
+static NEXT_INSTANCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
 /// Why Magpie could not start.
 pub type StartError = Box<dyn std::error::Error + Send + Sync>;
@@ -47,6 +57,37 @@ pub struct Magpie {
     /// The users' uploaded start page backgrounds (files under the data
     /// directory).
     pub backgrounds: Arc<layout::Backgrounds>,
+    /// Announces a service that was created, changed or deleted, after the
+    /// change is stored. The poller subscribes; with no subscriber a send is
+    /// dropped.
+    pub service_events: tokio::sync::broadcast::Sender<services::ServiceEvent>,
+    /// The latest snapshot of every service (see [`integrations::poller`]).
+    /// Idle until the server starts the poller; pages only read from it.
+    pub poller: integrations::poller::PollerHandle,
+    /// Tells this running Magpie from the others of one process (the tests'):
+    /// what the per-user stream cap is counted under (see [`values`]).
+    pub instance: usize,
+    /// Announces the id of a user who acknowledged a need or took an
+    /// acknowledgement back, so that their open streams (see [`values`])
+    /// send the new list. With no stream a send is dropped.
+    pub ack_events: tokio::sync::broadcast::Sender<i64>,
+    /// Set when the server is told to stop: open event streams (see
+    /// [`values`]) end, because the server waits for every connection to
+    /// finish before it exits.
+    pub shutdown: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl Magpie {
+    /// Tells the open event streams to end (the server calls it when it is
+    /// told to stop).
+    pub fn begin_shutdown(&self) {
+        self.shutdown.send_replace(true);
+    }
+
+    /// A receiver that turns `true` when [`Magpie::begin_shutdown`] is called.
+    pub fn shutdown_signal(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.shutdown.subscribe()
+    }
 }
 
 /// Installs the configuration, opens and migrates the database in
@@ -101,7 +142,35 @@ pub async fn start_with(
         token_budget: Arc::new(TokenBuckets::new()),
         extension_hosts: Arc::new(connect::allowed_hosts(extension_ids)),
         backgrounds,
+        service_events: tokio::sync::broadcast::channel(64).0,
+        poller: integrations::poller::PollerHandle::idle(),
+        instance: NEXT_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ack_events: tokio::sync::broadcast::channel(64).0,
+        shutdown: Arc::new(tokio::sync::watch::channel(false).0),
     })
+}
+
+/// Whether `path` is one of Magpie's own scripts or styles (not the kit's, not
+/// an icon): the files that have to match the server's routes and data.
+fn is_own_code(path: &str) -> bool {
+    path.starts_with("/static/magpie/") || matches!(path, "/static/magpie.css" | "/static/clock.js")
+}
+
+/// Makes the browser ask again before it uses one of Magpie's own scripts or
+/// styles. Their URLs carry no version (the modules import each other by plain
+/// path, so a version in the page's URLs would load a second copy of each), and
+/// the kit's handler would let the browser keep them for an hour: after an
+/// update the old client would run against the new server. `no-cache` keeps
+/// the kit's `ETag`, so an unchanged file costs one `304`.
+async fn revalidate_own_code(request: Request, next: Next) -> Response {
+    let own = is_own_code(request.uri().path());
+    let mut response = next.run(request).await;
+    if own {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    }
+    response
 }
 
 /// The whole app: Magpie's pages, the kit's pages, static files and the
@@ -114,6 +183,9 @@ pub fn router(magpie: Magpie) -> Router {
         .merge(pages::router())
         .merge(connect::router())
         .merge(api::router())
+        .merge(services::pages::router())
+        .merge(values::router())
+        .merge(needs::router())
         .merge(kit_pages::router())
         // Inside the sign-in guard: sees who is signed in (see the function).
         .route_layer(from_fn(pages::sweep_after_user_delete))
@@ -121,7 +193,10 @@ pub fn router(magpie: Magpie) -> Router {
     // Sign-in, first-run setup, logout, health and static files.
     let public = Router::new()
         .route("/healthz", get(vole_kit::http::healthz))
-        .route("/static/{*path}", get(vole_kit::http::assets::static_asset))
+        .route(
+            "/static/{*path}",
+            get(vole_kit::http::assets::static_asset).layer(from_fn(revalidate_own_code)),
+        )
         .merge(api::public_router())
         // Takes a cookie or an API token and answers 401 itself (see the module).
         .merge(pages::image_router())
@@ -135,4 +210,59 @@ pub fn router(magpie: Magpie) -> Router {
         .layer(from_fn(vole_kit::http::error::negotiate))
         .layer(from_fn(headers::security_headers))
         .with_state(core)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{Request, header};
+    use tower::ServiceExt as _;
+
+    use super::*;
+
+    /// The kit's handler in a release build: files kept for an hour.
+    async fn kept_for_an_hour() -> ([(header::HeaderName, &'static str); 1], &'static str) {
+        ([(header::CACHE_CONTROL, "public, max-age=3600")], "x")
+    }
+
+    #[tokio::test]
+    async fn only_magpies_own_code_is_made_to_revalidate() {
+        let app = Router::new()
+            .route("/static/{*path}", get(kept_for_an_hour))
+            .layer(from_fn(revalidate_own_code));
+        let cache_control = |path: &'static str| {
+            let app = app.clone();
+            async move {
+                let res = app
+                    .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                res.headers()[header::CACHE_CONTROL]
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+        for own in [
+            "/static/magpie/start.js",
+            "/static/magpie/render.css",
+            "/static/magpie.css",
+            "/static/clock.js",
+        ] {
+            assert_eq!(cache_control(own).await, "no-cache", "{own}");
+        }
+        // The kit's files and the icons keep the long lifetime.
+        for other in [
+            "/static/style.css",
+            "/static/app.js",
+            "/static/favicon.svg",
+            "/static/magpie.css.map",
+        ] {
+            assert_eq!(
+                cache_control(other).await,
+                "public, max-age=3600",
+                "{other}"
+            );
+        }
+    }
 }

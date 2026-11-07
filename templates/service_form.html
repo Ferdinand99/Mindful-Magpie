@@ -1,0 +1,110 @@
+{% extends "kit/settings_layout.html" %}
+{% import "kit/macros.html" as m %}
+
+{% block settings_content %}
+{%- if !form.choose.is_empty() %}
+{% call m::page_header(tr("service.new"), tr("service.choose_kind"), "/settings/services") %}{% endcall %}
+<ul class="list" role="list">
+  {%- for k in form.choose %}
+  <li class="list-row">
+    <span class="list-main"><a class="list-title" href="/settings/services/new?kind={{ k.kind }}">{{ tr(k.label_key) }}</a></span>
+    <span class="list-trail">{{ m::icon("chevron-right") }}</span>
+  </li>
+  {%- endfor %}
+</ul>
+{%- else %}
+{% call m::page_header(ctx.title, tr(form.kind_label), "/settings/services") %}{% endcall %}
+
+<form class="form" id="service-form" method="post" action="{{ form.action }}">
+  <input type="hidden" name="kind" value="{{ form.kind }}">
+  {%- if let Some(id) = form.id %}
+  <input type="hidden" name="id" value="{{ id }}">
+  {%- endif %}
+
+  <section class="card stack">
+    {{ m::field_text("name", tr("service.name"), value=&form.name, required=true, help=tr("service.name_help"), error=&form.name_error) }}
+    {{ m::field_text("url", tr("service.url"), value=&form.url, kind="url", placeholder="https://example.com/…", required=form.url_required, help=tr("service.url_help"), error=&form.url_error) }}
+    {%- for f in form.settings %}
+    {%- if f.help.is_empty() %}
+    {{ m::field_text(&f.name, tr(f.label_key), value=&f.value, kind="text", placeholder=f.placeholder, required=f.required, error=&f.error) }}
+    {%- else %}
+    {{ m::field_text(&f.name, tr(f.label_key), value=&f.value, kind="text", placeholder=f.placeholder, required=f.required, help=tr(f.help), error=&f.error) }}
+    {%- endif %}
+    {%- endfor %}
+    {%- if let Some(s) = form.secret %}
+    {#- Never filled in: the secret does not come back from the server. -#}
+    {%- if form.has_secret && form.secret_unreadable %}
+    {#- A refused value is said first; the note only when there is no error. -#}
+    {%- if form.secret_error.is_empty() %}
+    {{ m::field_text("secret", tr(s.label_key), kind="password", autocomplete="new-password", help=tr(s.help), error=tr("service.secret_unreadable")) }}
+    {%- else %}
+    {{ m::field_text("secret", tr(s.label_key), kind="password", autocomplete="new-password", help=tr(s.help), error=&form.secret_error) }}
+    {%- endif %}
+    {{ m::checkbox("clear_secret", tr("service.clear_secret"), false) }}
+    {%- else if form.has_secret %}
+    {{ m::field_text("secret", tr(s.label_key), kind="password", placeholder=tr("service.secret_saved"), autocomplete="new-password", help=tr(s.help), error=&form.secret_error) }}
+    {{ m::checkbox("clear_secret", tr("service.clear_secret"), false) }}
+    {%- else %}
+    {{ m::field_text("secret", tr(s.label_key), kind="password", autocomplete="new-password", help=tr(s.help), error=&form.secret_error) }}
+    {%- endif %}
+    {%- endif %}
+    <div class="field{% if !form.interval_error.is_empty() %} is-invalid{% endif %}">
+      <label class="label" for="f-interval">{{ tr("service.interval") }}</label>
+      <input id="f-interval" name="interval" type="number" inputmode="numeric" min="{{ form.interval_min }}" max="86400" step="1" value="{{ form.interval }}" placeholder="{{ form.interval_default }}" autocomplete="off" aria-describedby="f-interval-help{% if !form.interval_error.is_empty() %} f-interval-error{% endif %}"{% if !form.interval_error.is_empty() %} aria-invalid="true"{% endif %}>
+      <p class="help" id="f-interval-help">{{ tr2("service.interval_help", "default", form.interval_default, "min", form.interval_min) }}</p>
+      {%- if !form.interval_error.is_empty() %}
+      <p class="field-error" id="f-interval-error">{{ form.interval_error }}</p>
+      {%- endif %}
+    </div>
+  </section>
+
+  <section class="card stack">
+    <div class="field{% if !form.visibility_error.is_empty() %} is-invalid{% endif %}">
+      <span class="label" id="service-vis-label">{{ tr("service.visibility") }}</span>
+      <div class="segmented segmented-block" role="radiogroup" aria-labelledby="service-vis-label">
+        <label><input type="radio" name="visibility" value="admin"{% if form.visibility.is("admin") %} checked{% endif %}><span>{{ tr("service.vis_admin") }}</span></label>
+        <label><input type="radio" name="visibility" value="users"{% if form.visibility.is("users") %} checked{% endif %}><span>{{ tr("service.vis_users") }}</span></label>
+        <label><input type="radio" name="visibility" value="all"{% if form.visibility.is("all") %} checked{% endif %}><span>{{ tr("service.vis_all") }}</span></label>
+      </div>
+      <p class="help">{{ tr("service.visibility_help") }}</p>
+      {%- if !form.visibility_error.is_empty() %}
+      <p class="field-error">{{ form.visibility_error }}</p>
+      {%- endif %}
+    </div>
+    <div class="field" data-show-when="visibility=users">
+      <span class="label" id="service-users-label">{{ tr("service.users") }}</span>
+      {%- if form.users.is_empty() %}
+      <p class="help">{{ tr("service.users_none") }}</p>
+      {%- else %}
+      <div class="stack-sm" role="group" aria-labelledby="service-users-label">
+        {%- for u in form.users %}
+        <label class="check"><input type="checkbox" name="users" value="{{ u.id }}"{% if u.checked %} checked{% endif %}><span class="check-text"><span class="check-label">{{ u.name }}</span></span></label>
+        {%- endfor %}
+      </div>
+      {%- endif %}
+    </div>
+  </section>
+
+  <section class="card stack">
+    {% call m::card_head(tr("service.test"), tr("service.test_help")) %}
+      <button type="button" class="btn btn-secondary" hx-post="/settings/services/test" hx-target="#service-test-result" hx-swap="innerHTML" hx-disabled-elt="this">{{ m::icon("refresh") }}<span>{{ tr("service.test_run") }}</span></button>
+    {% endcall %}
+    <div id="service-test-result" role="status" aria-live="polite"></div>
+  </section>
+
+  <div class="form-actions">
+    <button type="submit" class="btn btn-primary">{{ tr("common.save") }}</button>
+    <a class="btn btn-secondary" href="/settings/services">{{ tr("common.cancel") }}</a>
+  </div>
+</form>
+
+{%- if let Some(id) = form.id %}
+<section class="section" aria-labelledby="service-delete-title">
+  {% call m::section_head(tr("service.delete"), "", "service-delete-title") %}{% endcall %}
+  <form method="post" action="/settings/services/{{ id }}/delete" data-confirm="{{ tr("service.delete_q") }}" data-confirm-message="{{ tr("service.delete_msg") }}" data-confirm-label="{{ tr("common.delete") }}">
+    <button type="submit" class="btn btn-danger">{{ m::icon("trash") }}<span>{{ tr("common.delete") }}</span></button>
+  </form>
+</section>
+{%- endif %}
+{%- endif %}
+{% endblock %}

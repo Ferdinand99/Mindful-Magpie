@@ -24,7 +24,9 @@ async fn start_page_renders_for_signed_in_user() {
     let res = start_page(&mut web, "nb").await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert!(res.body.contains(r#"id="groups""#), "{}", res.body);
-    assert!(res.body.contains(r#"id="needs""#), "{}", res.body);
+    // The row «Trenger deg» is drawn by the renderer into #groups, not
+    // placed in the page.
+    assert!(!res.body.contains(r#"id="needs""#), "{}", res.body);
     assert!(res.body.contains(r#"id="clock""#), "{}", res.body);
     assert!(
         res.body.contains(r#"href="/static/magpie/render.css""#),
@@ -408,7 +410,17 @@ async fn start_page_embeds_the_labels_for_the_renderer() {
         let labels = json_block(&res.body, "mm-labels");
         assert_eq!(labels["empty"], empty, "{lang}");
         assert_eq!(labels["invalid_link"], invalid, "{lang}");
-        for key in ["group_label", "bookmarks_label"] {
+        for key in [
+            "group_label",
+            "bookmarks_label",
+            "service_missing",
+            "service_waiting",
+            "status_ok",
+            "status_warn",
+            "status_bad",
+            "status_unknown",
+            "updated",
+        ] {
             let text = labels[key].as_str().unwrap_or_default();
             assert!(!text.is_empty() && !text.contains("start."), "{lang} {key}");
         }
@@ -560,4 +572,37 @@ async fn start_page_is_not_kept_in_the_htmx_history_cache() {
         htmx.body.contains(r#"[hx-history="false" i]"#),
         "this htmx does not know hx-history=false"
     );
+}
+
+#[tokio::test]
+async fn magpies_own_scripts_and_styles_are_revalidated_not_kept_for_an_hour() {
+    // Their URLs carry no version, so after an update a browser must not run
+    // the old script against the new server. The kit's ETag stays: an
+    // unchanged file is a 304.
+    let app = App::new().await;
+    for path in [
+        "/static/magpie/start.js",
+        "/static/magpie/edit.js",
+        "/static/magpie/render.js",
+        "/static/magpie/render.css",
+        "/static/magpie.css",
+        "/static/clock.js",
+    ] {
+        let res = app.get(path).await;
+        assert_eq!(res.status, StatusCode::OK, "{path}");
+        assert_eq!(res.header("cache-control"), "no-cache", "{path}");
+        let etag = res.header("etag").to_string();
+        assert!(!etag.is_empty(), "{path} has an ETag");
+        let again = app
+            .send(
+                Request::get(path)
+                    .header("if-none-match", &etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(again.status, StatusCode::NOT_MODIFIED, "{path}");
+        assert_eq!(again.header("cache-control"), "no-cache", "{path}");
+        assert_eq!(again.header("etag"), etag, "{path}");
+    }
 }

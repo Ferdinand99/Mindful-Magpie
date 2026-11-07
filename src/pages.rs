@@ -26,6 +26,8 @@ use vole_kit::state::Core;
 use crate::Magpie;
 use crate::layout::background::MAX_BYTES;
 use crate::layout::{self, Kind, Layout, SaveError, StoreError};
+use crate::services::services_for;
+use crate::values::values_for;
 
 /// The largest body `POST /start/layout` takes. A document that passes
 /// validation is about 1.2 MB with four-byte characters; 4 MiB leaves room for
@@ -82,6 +84,12 @@ struct StartPage {
     user_id: i64,
     /// The strings the renderer needs, as JSON for the same kind of block.
     labels_json: String,
+    /// The services the user can see (see [`crate::services::ServiceView`]),
+    /// for the renderer and the card form. Always there, `[]` when none.
+    services_json: String,
+    /// The latest reading of each service bound on the user's layout that they
+    /// may see (see [`crate::values`]), for the renderer.
+    values_json: String,
     /// The stored layout could not be read: say so and offer a fresh start.
     corrupt: bool,
 }
@@ -116,6 +124,22 @@ fn labels() -> BTreeMap<&'static str, &'static str> {
         "invalid_link",
         "group_label",
         "bookmarks_label",
+        "service_missing",
+        "service_waiting",
+        "needs",
+        "need_ack",
+        "need_ack_for",
+        "need_unack",
+        "need_unack_for",
+        "need_ack_failed",
+        "need_gone",
+        "needs_acked",
+        "needs_show_acked",
+        "status_ok",
+        "status_warn",
+        "status_bad",
+        "status_unknown",
+        "updated",
         "edit_toolbar",
         "edit_done",
         "edit_cancel",
@@ -201,6 +225,16 @@ fn labels() -> BTreeMap<&'static str, &'static str> {
         "err_bad_emoji",
         "err_bad_colour",
         "err_generic",
+        "field_service",
+        "service_none",
+        "help_service",
+        "field_metrics",
+        "help_metrics",
+        "metrics_full",
+        "metrics_gone",
+        "err_service_metrics",
+        "err_bad_service",
+        "err_bad_metric",
         "colour_red",
         "colour_orange",
         "colour_yellow",
@@ -240,6 +274,7 @@ const VARY: &str = "HX-Boosted";
 
 async fn start(
     State(core): State<Core>,
+    Extension(magpie): Extension<Magpie>,
     user: CurrentUser,
     headers: HeaderMap,
     jar: SignedCookieJar,
@@ -256,6 +291,8 @@ async fn start(
     // must not take the page down: show the empty default, at the stored
     // version so that a save over the broken document is accepted, and say so.
     let (layout, corrupt) = layout::load_or_default(&core, user.id).await?;
+    let services = services_for(&core, &user).await?;
+    let values = values_for(&core, &magpie.poller, &user, &layout).await?;
     let site = core.with_conn(|c| SiteSettings::load(c)).await?;
     let timezone = site.timezone_or_utc().to_string();
     let (time, date) = clock_in(&timezone);
@@ -276,6 +313,8 @@ async fn start(
         layout_json: json_for_html(&layout),
         user_id: user.id,
         labels_json: json_for_html(&labels()),
+        services_json: json_for_html(&services),
+        values_json: json_for_html(&values),
         corrupt,
     };
     // The page holds one person's layout: no cache (the browser's back/forward

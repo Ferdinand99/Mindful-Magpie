@@ -155,6 +155,21 @@ test("saveConnection saves only when the test succeeds", async () => {
   }
 });
 
+test("saveConnection stores the new settings before it drops the old server's cache", async () => {
+  const env = makeEnv({ stored: { serverUrl: "http://old:1", token: "old", last: GOOD, lastValues: {}, valuesMissing: 1 } });
+  const result = await saveConnection(env.deps, { serverUrl: "http://h:1", token: TOKEN });
+  assert.equal(result.ok, true);
+  const writes = env.calls.filter((c) => c[0] === "storage.set" || c[0] === "storage.remove").map((c) => c[0]);
+  assert.deepEqual(writes, ["storage.set", "storage.remove"]);
+  assert.deepEqual(env.calls.find((c) => c[0] === "storage.remove")[1], ["last", "lastValues", "valuesMissing"]);
+  assert.equal(env.store.last, undefined);
+  // The same server and token again keeps the cache.
+  const again = makeEnv({ stored: { serverUrl: "http://h:1", token: TOKEN, last: GOOD } });
+  await saveConnection(again.deps, { serverUrl: "http://h:1", token: TOKEN });
+  assert.equal(again.calls.some((c) => c[0] === "storage.remove"), false);
+  assert.deepEqual(again.store.last, GOOD);
+});
+
 test("saveConnection saves the normalised url and the trimmed token on success", async () => {
   const env = makeEnv();
   const result = await saveConnection(env.deps, { serverUrl: "http://h:1///", token: ` ${TOKEN} ` });

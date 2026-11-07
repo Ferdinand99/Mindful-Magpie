@@ -1,8 +1,11 @@
 // Mindful Magpie: the start page script. It reads the layout and the interface
 // strings the server embedded in the page as data (#mm-layout, #mm-labels) and
 // draws them with the shared renderer. It never moves focus. Edit mode (edit.js)
-// is loaded only when the person presses the Edit button.
-import { render } from "./render.js";
+// is loaded only when the person presses the Edit button. Numbers of bound
+// cards come from #mm-values and stay current through an event stream (see
+// initLive); so does the «Trenger deg» row, whose «Kvitter» buttons are wired in
+// initNeeds.
+import { render, tickAges, toggleAckedNeeds, updateValues } from "./render.js";
 
 function readJson(doc, id) {
   const block = doc.getElementById(id);
@@ -12,6 +15,27 @@ function readJson(doc, id) {
   } catch {
     return null;
   }
+}
+
+/**
+ * The services block of the page (`#mm-services`: what this user may see of the
+ * services, never an address or a key) as the renderer's `services` option. A
+ * page without the block, or with a block that is not a list, gives no option,
+ * and the renderer then draws bound cards as plain link cards.
+ */
+function servicesOpt(doc) {
+  const services = readJson(doc, "mm-services");
+  return Array.isArray(services) ? { services } : {};
+}
+
+/**
+ * The values block of the page (`#mm-values`: the latest reading of each service
+ * a card of this page is bound to) as the renderer's `values` option, or no
+ * option when the block is missing or not an object.
+ */
+function valuesOpt(doc) {
+  const values = readJson(doc, "mm-values");
+  return values && typeof values === "object" && !Array.isArray(values) ? { values } : {};
 }
 
 /**
@@ -33,7 +57,7 @@ export function draw(doc) {
   // An unreadable layout draws as the empty page; the notice above says why.
   const layout = readJson(doc, "mm-layout");
   const labels = readJson(doc, "mm-labels") ?? {};
-  render(root, layout, { lang: doc.documentElement.lang, labels });
+  render(root, layout, { lang: doc.documentElement.lang, labels, canAck: true, ...servicesOpt(doc), ...valuesOpt(doc) });
 }
 
 /**
@@ -51,13 +75,18 @@ export function drawIfNeeded(doc) {
   draw(doc);
 }
 
-/** Replaces the layout block of the page, so that the page and the next edit start from it. */
-function writeLayoutBlock(doc, layout) {
-  const block = doc.getElementById("mm-layout");
+/** Replaces the data block `id` of the page with `value` as JSON. */
+function writeBlock(doc, id, value) {
+  const block = doc.getElementById(id);
   if (!block) return;
   // `<` as an escape: the block lives in HTML, and htmx saves it as HTML for the
   // history, so no text in it may be able to end it early.
-  block.textContent = JSON.stringify(layout).replace(/</g, "\\u003c");
+  block.textContent = JSON.stringify(value).replace(/</g, "\\u003c");
+}
+
+/** Replaces the layout block of the page, so that the page and the next edit start from it. */
+function writeLayoutBlock(doc, layout) {
+  writeBlock(doc, "mm-layout", layout);
 }
 
 /**
@@ -289,6 +318,7 @@ export function initEditing(doc, deps = {}) {
     try {
       editor = module.startEditing(root, () => readJson(doc, "mm-layout") ?? layout, save, {
         labels: readJson(doc, "mm-labels") ?? {},
+        ...servicesOpt(doc),
         lang: doc.documentElement.lang,
         editButton: button,
         reload: deps.reload,
@@ -296,7 +326,12 @@ export function initEditing(doc, deps = {}) {
         background,
         draft: restored ?? undefined,
         onDiscard: () => clearStash(storage),
+        // The page is drawn with the numbers again when edit mode ends.
+        getValues: () => readJson(doc, "mm-values") ?? undefined,
+        onEnd: () => deps.onEditingChange?.(),
       });
+      // The stream is closed while the page is being edited.
+      deps.onEditingChange?.();
     } catch (error) {
       // Only a draft that edit mode cannot use is dropped.
       if (restored) clearStash(storage);
@@ -386,9 +421,398 @@ export function initEditing(doc, deps = {}) {
   };
 }
 
+// ---- live values ------------------------------------------------------------
+
+export const LIVE_URL = "/start/live";
+/** How often the ages on the cards are brought up to date. */
+export const TICK_MS = 30 * 1000;
+/** How long to wait before opening the stream again after the server refused it. */
+export const RETRY_MS = 30 * 1000;
+
+/** A time as epoch milliseconds: epoch seconds, epoch milliseconds or an ISO string; else null. */
+function toMs(value) {
+  let n = Number.NaN;
+  if (typeof value === "number") {
+    n = value;
+  } else if (typeof value === "string" && value.trim() !== "") {
+    n = Number(value);
+    if (Number.isNaN(n)) return Number.isFinite(Date.parse(value)) ? Date.parse(value) : null;
+  }
+  if (!Number.isFinite(n)) return null;
+  // Seconds until about the year 5138, milliseconds beyond that.
+  return Math.abs(n) < 1e11 ? n * 1000 : n;
+}
+
+/**
+ * Merges a stream event into the values the page has. A `full` event replaces
+ * them; any other event adds and replaces the entries it carries and drops the
+ * ids in `removed`. The needs list (the person's «Trenger deg», acknowledgements
+ * applied) is replaced when the event carries one and kept when it does not.
+ * Returns `{ values, removed }`, `removed` being every id whose values the person
+ * no longer gets (the service was deleted, hidden or unbound). It says nothing of
+ * the services list the editor offers: that follows `services_visible` (see
+ * mergeServices). Neither argument is changed.
+ */
+export function mergeValues(current, update) {
+  const before = current && typeof current.services === "object" && current.services ? current.services : {};
+  const sent = update && typeof update.services === "object" && update.services ? update.services : {};
+  const listed = Array.isArray(update?.removed) ? update.removed.map(String) : [];
+  const services = update?.full ? {} : { ...before };
+  for (const id of listed) delete services[id];
+  Object.assign(services, sent);
+  const removed = new Set(listed);
+  if (update?.full) {
+    for (const id of Object.keys(before)) if (!(id in sent)) removed.add(id);
+  }
+  const needs = Array.isArray(update?.needs) ? update.needs : Array.isArray(current?.needs) ? current.needs : [];
+  return { values: { now: update?.now ?? current?.now, services, needs }, removed: [...removed] };
+}
+
+/**
+ * The services list after an event (the list the editor's picker offers): when
+ * the event says which services the person may see (`visible`, its
+ * `services_visible`: every id, sent when the set changed), the others gone;
+ * the views the event adds (`services_add`: a service that became visible while
+ * the page was open) put in, or replacing the one the list has, and names and
+ * intervals as the event's entries have them. By name, as the server lists them.
+ * Without `visible` nobody is dropped: a service that is visible but not bound to
+ * a card (its values were removed) is still to be offered.
+ */
+export function mergeServices(list, values, visible, add = []) {
+  const keep = Array.isArray(visible) ? new Set(visible.map(String)) : null;
+  const out = list.filter((s) => keep === null || keep.has(String(s?.id)));
+  for (const view of Array.isArray(add) ? add : []) {
+    if (!view || typeof view !== "object" || view.id === undefined) continue;
+    const at = out.findIndex((s) => String(s?.id) === String(view.id));
+    if (at >= 0) out[at] = view;
+    else out.push(view);
+  }
+  const byName = (a, b) => String(a?.name ?? "").localeCompare(String(b?.name ?? ""), undefined, { sensitivity: "base" });
+  return out.sort(byName).map((s) => {
+    const entry = values.services[String(s?.id)];
+    if (!entry) return s;
+    return { ...s, name: entry.name ?? s.name, interval_s: entry.interval_s ?? s.interval_s };
+  });
+}
+
+/** Whether any card of the layout shows a service. */
+function hasBoundCards(layout) {
+  return (Array.isArray(layout?.groups) ? layout.groups : []).some(
+    (g) => Array.isArray(g?.cards) && g.cards.some((c) => c && typeof c === "object" && c.service),
+  );
+}
+
+/**
+ * Keeps the numbers on the cards current. The page holds the latest readings in
+ * `#mm-values`; while the page is visible and not being edited, an EventSource
+ * on `/start/live` brings changes (the first event of a stream is the whole
+ * document, so a stream opened after a long hidden spell, a reconnect or a
+ * save catches up at once). Each event is merged into the block, and the cards
+ * are updated in place (`updateValues`: no element a person may be standing on
+ * is replaced, so focus stays); only when the page and the layout differ in
+ * more than numbers is it drawn again. Nothing is redrawn while edit mode is
+ * open (it owns the page); the stream is closed then, and opens again when edit
+ * mode ends.
+ *
+ * A timer every 30 s brings the ages up to date, counted on the server's clock:
+ * the offset between it and this one is taken from each event's `now`.
+ *
+ * The stream is closed when the page is hidden, when the body is swapped
+ * (`htmx:beforeSwap`, a boosted visit) or when `#groups` is no longer in the
+ * document, so nothing stays open across navigation. A server that refuses a
+ * stream (an `EventSource` does not retry those) is asked again after
+ * `RETRY_MS`, unless the answer shows the person is signed out: then nothing
+ * more is tried until the page is shown again or the body is swapped.
+ *
+ * `deps` (for tests): `EventSource`, `now`, `setInterval`, `clearInterval`,
+ * `setTimeout`, `clearTimeout`, `fetch` (the probe after a refusal). Returns `{ sync, close, tick, apply, isOpen }`:
+ * `sync()` opens or closes the stream as the page's state asks (call it when
+ * anything that matters changed), `tick()` is the timer's work.
+ */
+export function initLive(doc, deps = {}) {
+  const win = doc.defaultView;
+  const EventSourceCtor = deps.EventSource ?? win?.EventSource ?? globalThis.EventSource;
+  const now = deps.now ?? (() => Date.now());
+  const every = deps.setInterval ?? ((fn, ms) => globalThis.setInterval(fn, ms));
+  const stopEvery = deps.clearInterval ?? ((id) => globalThis.clearInterval(id));
+  const later = deps.setTimeout ?? ((fn, ms) => globalThis.setTimeout(fn, ms));
+  const stopLater = deps.clearTimeout ?? ((id) => globalThis.clearTimeout(id));
+  const request = deps.fetch ?? ((...args) => (win?.fetch ?? globalThis.fetch)(...args));
+  let source = null;
+  // Set after a refusal because the person is signed out: no more tries until
+  // the page is shown again or the body is swapped.
+  let signedOut = false;
+  let probing = false;
+  let timer = null;
+  let retry = null;
+  // Server clock minus this one, in ms; null until a page or an event says.
+  let offset = null;
+
+  const rootEl = () => doc.getElementById("groups");
+  const editing = () => rootEl()?.hasAttribute("data-editing") === true;
+
+  function learnClock(values) {
+    const server = toMs(values?.now);
+    if (server !== null) offset = server - now();
+  }
+  learnClock(readJson(doc, "mm-values"));
+
+  function wanted() {
+    const root = rootEl();
+    if (!root || !root.isConnected || editing() || typeof EventSourceCtor !== "function") return false;
+    if (doc.visibilityState !== "visible") return false;
+    if (!readJson(doc, "mm-values")) return false;
+    return hasBoundCards(readJson(doc, "mm-layout"));
+  }
+
+  function close() {
+    if (source) {
+      const old = source;
+      source = null;
+      old.close();
+    }
+    if (timer !== null) {
+      stopEvery(timer);
+      timer = null;
+    }
+    if (retry !== null) {
+      stopLater(retry);
+      retry = null;
+    }
+  }
+
+  function ages() {
+    const labels = readJson(doc, "mm-labels") ?? {};
+    tickAges(rootEl(), { now: now() + (offset ?? 0), lang: doc.documentElement.lang, labels });
+  }
+
+  function tick() {
+    // The page may have gone while the timer ran.
+    if (!wanted()) return sync();
+    ages();
+  }
+
+  /**
+   * Whether the server turns this session away (an `EventSource` does not say
+   * why it failed): asks once for the stream and looks at the answer's head.
+   */
+  async function turnedAway() {
+    try {
+      const controller = typeof AbortController === "function" ? new AbortController() : null;
+      const res = await request(LIVE_URL, {
+        credentials: "same-origin",
+        redirect: "manual",
+        headers: { Accept: "text/event-stream" },
+        signal: controller?.signal,
+      });
+      controller?.abort();
+      return res.type === "opaqueredirect" || [0, 301, 302, 303, 307, 308, 401, 403].includes(res.status);
+    } catch {
+      return false;
+    }
+  }
+
+  async function refused() {
+    probing = true;
+    const out = await turnedAway();
+    probing = false;
+    if (source !== null || !wanted()) return;
+    if (out) {
+      signedOut = true;
+      return;
+    }
+    if (retry === null) {
+      retry = later(() => {
+        retry = null;
+        sync();
+      }, RETRY_MS);
+    }
+  }
+
+  function open() {
+    const mine = new EventSourceCtor(LIVE_URL);
+    source = mine;
+    mine.addEventListener("values", (event) => {
+      if (source !== mine) return;
+      let update = null;
+      try {
+        update = JSON.parse(event.data);
+      } catch {
+        // Not ours to read: the next event will do.
+      }
+      if (update && typeof update === "object") apply(update);
+    });
+    mine.addEventListener("error", () => {
+      if (source !== mine) return;
+      // The browser reconnects by itself unless the server answered with
+      // something other than a stream (a refusal, a sign-out): that is final.
+      if (mine.readyState === 2) {
+        source = null;
+        refused();
+      }
+    });
+  }
+
+  function sync() {
+    if (!wanted()) return close();
+    if (!source && retry === null && !probing && !signedOut) open();
+    if (timer === null) {
+      timer = every(tick, TICK_MS);
+      // The page may have been hidden for a while: the ages are old.
+      ages();
+    }
+  }
+
+  /** Takes an update (an event's data) into the page: the blocks first, then the cards. */
+  function apply(update) {
+    let { values } = mergeValues(readJson(doc, "mm-values"), update);
+    // An update without a `now` (the answer to an acknowledgement) keeps the block's old
+    // one: ages would be counted from it, and look too young. Count them from the server's
+    // clock as it is now, as this page learned it; the clock itself is only learned from an
+    // update that says what time it is.
+    const stamped = toMs(update?.now) !== null;
+    if (!stamped && offset !== null) values = { ...values, now: (now() + offset) / 1000 };
+    writeBlock(doc, "mm-values", values);
+    const listed = readJson(doc, "mm-services");
+    if (Array.isArray(listed)) {
+      writeBlock(doc, "mm-services", mergeServices(listed, values, update.services_visible, update.services_add));
+    }
+    if (stamped) learnClock(values);
+    // Edit mode owns the page; the blocks are current for when it ends.
+    if (editing()) return;
+    const root = rootEl();
+    const layout = readJson(doc, "mm-layout");
+    if (!root || !layout) return;
+    const options = {
+      lang: doc.documentElement.lang,
+      labels: readJson(doc, "mm-labels") ?? {},
+      canAck: true,
+      ...servicesOpt(doc),
+      values,
+    };
+    if (!updateValues(root, layout, options)) draw(doc);
+  }
+
+  doc.addEventListener("visibilitychange", () => {
+    signedOut = false;
+    sync();
+  });
+  // A boosted visit swaps the body: nothing may stay open for the old page. A
+  // response htmx does not swap (an error answer, say) leaves the page as it is.
+  doc.addEventListener("htmx:beforeSwap", (event) => {
+    if (event?.detail?.shouldSwap !== true) return;
+    signedOut = false;
+    close();
+  });
+
+  return { sync, close, tick, apply, isOpen: () => source !== null };
+}
+
+// ---- «Trenger deg» --------------------------------------------------------------
+
+export const NEEDS_ACK_URL = "/start/needs/ack";
+export const NEEDS_UNACK_URL = "/start/needs/unack";
+
+/**
+ * Wires the buttons of the «Trenger deg» row (found at click time, one listener on
+ * the document, so a row that is drawn again needs no new wiring): «Kvitter» and
+ * the undo button post `{ service_id, key }` to `/start/needs/ack` and
+ * `/start/needs/unack` (with the `HX-Request` header, the same-origin proof the
+ * server asks for besides the cookie), and the toggle «N kvittert» shows and hides
+ * the acknowledged ones. The server answers with the person's new list; it goes
+ * through `deps.apply` (initLive's, which writes `#mm-values` and updates the row
+ * in place) at once, and the person's other tabs get it from their streams. A
+ * refusal or a failure changes nothing and is said in the row's live region
+ * («already cleared» when the need is gone, else «try again»).
+ *
+ * The one place focus is moved: the person pressed the button, so it is given to
+ * what took its place (the next chip, or the toggle when none is left), not left on
+ * a button that is gone. A second press while one is on its way does nothing.
+ *
+ * `deps` (for tests): `apply` (required for any change), `fetch`.
+ */
+export function initNeeds(doc, deps = {}) {
+  const win = doc.defaultView;
+  const request = deps.fetch ?? ((...args) => (win?.fetch ?? globalThis.fetch)(...args));
+  let busy = false;
+
+  function fail(key) {
+    const labels = readJson(doc, "mm-labels") ?? {};
+    const live = doc.querySelector("#groups .mm-needs-live");
+    if (live) live.textContent = typeof labels[key] === "string" ? labels[key] : "";
+  }
+
+  /** Gives the focus to what took the place of the need the person pressed the button of. */
+  function refocus(index, key, service, acknowledged) {
+    const root = doc.getElementById("groups");
+    if (!root) return;
+    const shown = [...root.querySelectorAll(".mm-needs-list:not(.mm-needs-acked) .mm-need")];
+    const inner = (li) => li?.querySelector("a.mm-need-chip") ?? li?.querySelector("button");
+    let target = null;
+    if (acknowledged) {
+      target = inner(shown[index] ?? shown[index - 1]) ?? root.querySelector(".mm-needs-toggle");
+    } else {
+      const back = shown.find((li) => li.getAttribute("data-key") === key && li.getAttribute("data-service") === service);
+      target = inner(back) ?? root.querySelector(".mm-needs-toggle");
+    }
+    target?.focus?.();
+  }
+
+  async function change(button, url, acknowledged) {
+    const item = button.closest(".mm-need");
+    const service = item?.getAttribute("data-service") ?? "";
+    const key = item?.getAttribute("data-key") ?? "";
+    const serviceId = Number(service);
+    if (!item || !Number.isSafeInteger(serviceId) || key === "" || busy || typeof deps.apply !== "function") return;
+    const index = [...doc.querySelectorAll("#groups .mm-needs-list:not(.mm-needs-acked) .mm-need")].indexOf(item);
+    busy = true;
+    button.setAttribute("aria-disabled", "true");
+    try {
+      const response = await request(url, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "HX-Request": "true" },
+        body: JSON.stringify({ service_id: serviceId, key }),
+      });
+      let body = null;
+      try {
+        body = await response.json();
+      } catch {
+        // Not JSON (a proxy's error page): the status says enough.
+      }
+      if (response.status === 200 && Array.isArray(body?.needs)) {
+        deps.apply({ full: false, services: {}, removed: [], needs: body.needs });
+        refocus(index, key, service, acknowledged);
+      } else {
+        // 404: the need is gone (it cleared, or the service is no longer the person's).
+        fail(response.status === 404 ? "need_gone" : "need_ack_failed");
+      }
+    } catch {
+      fail("need_ack_failed");
+    } finally {
+      busy = false;
+      button.removeAttribute("aria-disabled");
+    }
+  }
+
+  doc.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!target?.closest) return;
+    const toggle = target.closest(".mm-needs-toggle");
+    if (toggle) return toggleAckedNeeds(toggle);
+    const ack = target.closest(".mm-need-ack");
+    const unack = target.closest(".mm-need-unack");
+    const button = ack ?? unack;
+    if (!button || button.getAttribute("aria-disabled") === "true") return;
+    change(button, ack ? NEEDS_ACK_URL : NEEDS_UNACK_URL, Boolean(ack)).catch((error) => globalThis.console?.error?.(error));
+  });
+
+  return { change };
+}
+
 /**
  * Wires a page: edit mode, the first draw and what htmx does to the body. Returns
- * `{ editing, start }`; `start()` draws the page (call it when the document is
+ * `{ editing, start, live, needs }`; `start()` draws the page (call it when the document is
  * ready). `deps` goes to `initEditing` and `reloadIfDataLost` (tests give it a
  * clock, a storage and a `reload`).
  *
@@ -401,25 +825,31 @@ export function initEditing(doc, deps = {}) {
  * reloaded in full.
  */
 export function wirePage(doc, deps = {}) {
-  const editing = initEditing(doc, deps);
+  // `deps.live` goes to `initLive`; edit mode tells it when it opens and closes.
+  const live = initLive(doc, deps.live ?? {});
+  const editing = initEditing(doc, { ...deps, onEditingChange: () => live.sync() });
+  const needs = initNeeds(doc, { ...deps.needs, apply: live.apply });
   const start = () => {
     // A start page with its data takes off the mark of an earlier reload.
     reloadIfDataLost(doc, deps);
     draw(doc);
     editing.offerRestore();
+    live.sync();
   };
   doc.addEventListener("htmx:afterSettle", () => {
     if (reloadIfDataLost(doc, deps)) return;
     editing.check();
     drawIfNeeded(doc);
     editing.offerRestore();
+    live.sync();
   });
   doc.addEventListener("htmx:historyRestore", () => {
     if (reloadIfDataLost(doc, deps)) return;
     drawIfNeeded(doc);
     editing.offerRestore();
+    live.sync();
   });
-  return { editing, start };
+  return { editing, start, live, needs };
 }
 
 if (typeof document !== "undefined") {

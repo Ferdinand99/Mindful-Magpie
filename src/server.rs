@@ -15,7 +15,17 @@ pub async fn run(config: Config) -> Result<(), crate::StartError> {
     .await?;
     // Notifications and other work outside a request use the site language.
     vole_kit::i18n::site_language(&magpie.core).await;
+    // Fetches every service in the background and follows the services pages.
+    let poller = crate::integrations::poller::Poller::start(
+        magpie.core.clone(),
+        crate::integrations::client().clone(),
+        &magpie.service_events,
+    )
+    .await;
+    let magpie = crate::Magpie { poller, ..magpie };
 
+    // Open event streams would keep the graceful shutdown waiting for an hour.
+    let stopper = magpie.clone();
     let addr = config.bind_addr();
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -30,7 +40,10 @@ pub async fn run(config: Config) -> Result<(), crate::StartError> {
         listener,
         crate::router(magpie).into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        stopper.begin_shutdown();
+    })
     .await?;
     tracing::info!("stopped");
     Ok(())

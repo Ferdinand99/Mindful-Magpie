@@ -1,0 +1,40 @@
+{% extends "kit/settings_layout.html" %}
+{% import "kit/macros.html" as m %}
+
+{% block settings_content %}
+{% call m::page_header(tr("nav.services"), tr("service.sub")) %}
+  <a class="btn btn-primary" href="/settings/services/new">{{ m::icon("plus") }}<span>{{ tr("service.new") }}</span></a>
+{% endcall %}
+
+{%- if rows.is_empty() %}
+{{ m::empty_state("plug", tr("service.none_title"), tr("service.none_text"), "/settings/services/new", tr("service.new")) }}
+{%- else %}
+<section class="section" aria-labelledby="services-title">
+  {% call m::section_head(tr("nav.services"), "", "services-title") %}{% endcall %}
+  <ul class="list" role="list">
+    {%- for row in rows %}
+    <li class="list-row" id="service-{{ row.id }}">
+      <span class="list-main">
+        <a class="list-title" href="/settings/services/{{ row.id }}">{{ row.name }}</a>
+        <span class="list-sub">
+          {%- if let Some(label) = row.kind_label %}{{ tr(label) }}{% else %}{{ row.kind }}{% endif %}
+          {%- if !row.url.is_empty() %} · {{ row.url }}{% endif %}
+        </span>
+      </span>
+      <span class="list-trail cluster">
+        {%- if row.has_secret %}<span class="badge">{{ m::icon("key") }}{{ tr("service.secret_saved_badge") }}</span>{% endif %}
+        {%- if row.visibility.is("all") %}
+        <span class="badge">{{ tr("service.vis_all") }}</span>
+        {%- else if row.visibility.is("users") %}
+        <span class="badge">{{ tr1("service.vis_users_count", "n", row.viewers) }}</span>
+        {%- else %}
+        <span class="badge badge-brand">{{ tr("service.vis_admin") }}</span>
+        {%- endif %}
+        <a class="btn btn-secondary btn-sm" href="/settings/services/{{ row.id }}">{{ tr("common.edit") }}</a>
+      </span>
+    </li>
+    {%- endfor %}
+  </ul>
+</section>
+{%- endif %}
+{% endblock %}

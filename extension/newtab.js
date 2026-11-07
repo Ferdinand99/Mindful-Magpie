@@ -1,4 +1,4 @@
-import { start } from "./newtab-core.js";
+import { connectionChanged, start } from "./newtab-core.js";
 import { createView } from "./newtab-view.js";
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -11,5 +11,26 @@ document.addEventListener("DOMContentLoaded", () => {
     openOptions: () => browser.runtime.openOptionsPage(),
     objectUrl: { create: (blob) => URL.createObjectURL(blob), revoke: (url) => URL.revokeObjectURL(url) },
   });
-  start({ storage: browser.storage, fetchImpl: fetch, draw });
+  // The values refresh runs only while the tab is visible (see newtab-core.js).
+  const visibility = {
+    isHidden: () => document.hidden,
+    onChange: (callback) => document.addEventListener("visibilitychange", callback),
+  };
+  // A new server or token makes this tab's data stale: stop refreshing at once (newtab-core.js also
+  // checks the saved settings before every write). Saving the same values again changes nothing.
+  const connection = {
+    onChange: (callback) =>
+      browser.storage.onChanged.addListener((changes, area) => {
+        if (connectionChanged(changes, area)) callback();
+      }),
+  };
+  start({
+    storage: browser.storage,
+    fetchImpl: fetch,
+    draw,
+    update: draw.update,
+    tick: draw.tick,
+    visibility,
+    connection,
+  });
 });

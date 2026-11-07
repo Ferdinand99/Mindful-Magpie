@@ -81,25 +81,6 @@ html:root:has(.mm-root)[data-bg="image"] #mm-edit:not([aria-pressed="true"]) {
   backdrop-filter: saturate(180%) blur(16px);
 }
 
-/* "Needs you": one glass row of alerts; hidden while nothing needs you. */
-.needs {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--sp-2) var(--sp-3);
-  padding: var(--sp-3) var(--sp-4);
-}
-.needs[hidden] {
-  display: none;
-}
-.needs-title {
-  margin-inline-end: var(--sp-1);
-  color: var(--muted);
-  font-size: 0.8125rem;
-  font-weight: 500;
-  letter-spacing: 0;
-}
-
 /* The groups: the renderer fills this element with groups of cards (the card
    grid, repeat(auto-fill, minmax(260px, 1fr)), is in magpie/render.css). */
 #groups {
@@ -336,6 +317,12 @@ html:root:has(.mm-root)[data-bg="image"] #mm-edit:not([aria-pressed="true"]) {
 .mm-swatch-dot[data-colour="pink"] { background: var(--pal-pink); }
 .mm-swatch-dot[data-colour="brown"] { background: var(--pal-brown); }
 .mm-swatch-dot[data-colour="gray"] { background: var(--pal-gray); }
+
+/* The numbers a service card shows: a fieldset inside the Service field. It gets room above its
+   legend, as between the form's other fields. */
+.field[data-metrics] {
+  margin-block-start: var(--sp-3);
+}
 
 /* The background picker: four preset previews as a radio group, drawn from a
    data attribute (no style attributes), then the upload. */

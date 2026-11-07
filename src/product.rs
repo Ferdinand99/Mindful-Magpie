@@ -4,11 +4,11 @@
 //! the kit requires; Magpie sends no webhooks.)
 
 use rust_embed::Embed;
-use vole_kit::config::KitConfig;
+use vole_kit::config::{ExtraScope, KitConfig};
 use vole_kit::docs::{DocsSpec, RouteDoc};
 use vole_kit::http::assets::StaticFile;
 use vole_kit::notify::webhook::Wording;
-use vole_kit::page::{NavItem, SettingsTab, Ui};
+use vole_kit::page::{NavItem, SettingsTab, TabAccess, Ui};
 use vole_kit::settings::GeneralSettings;
 
 /// The product's version (`CARGO_PKG_VERSION`), reported by the OpenAPI
@@ -79,6 +79,16 @@ pub static DOCS: DocsSpec = DocsSpec {
     strict_access: true,
 };
 
+/// The admin's page for services (`/settings/services`; its routes check for an
+/// admin too, the tab is only the link).
+pub const SERVICES_TAB: SettingsTab = SettingsTab {
+    id: "services",
+    href: "/settings/services",
+    label: "nav.services",
+    icon: "plug",
+    access: TabAccess::Admins,
+};
+
 pub static KIT: KitConfig = KitConfig {
     product: NAME,
     slug: "mindful-magpie",
@@ -129,6 +139,7 @@ pub static KIT: KitConfig = KitConfig {
         ],
         settings_tabs: &[
             SettingsTab::GENERAL,
+            SERVICES_TAB,
             SettingsTab::USERS,
             SettingsTab::SECURITY,
             SettingsTab::TOKENS,
@@ -142,13 +153,26 @@ pub static KIT: KitConfig = KitConfig {
         duration: "duration",
         url_example: "https://example.com/hooks/magpie…",
     },
-    token_scopes: &[],
+    // The browser extension's token: read-only, and shows its owner's page
+    // with the owner's services (see `Viewer::for_token`).
+    token_scopes: &[ExtraScope {
+        name: OWNER_SCOPE,
+        label: "tokens.scope_owner",
+        help: "tokens.scope_owner_help",
+        implies_read: true,
+        paths: &[],
+    }],
     // Site name, public URL, time zone and language.
     general: Some(&GeneralSettings::CORE_ONLY),
     // The signed-in footer links the running version to its release notes.
     releases_url: Some("https://github.com/Ferdinand99/Mindful-Magpie/releases/tag/v{version}"),
     features: &vole_kit::config::KitFeatures::DEFAULT,
 };
+
+/// The product token scope of the browser extension: the token reads like any
+/// read-only token, and the services it shows are the ones its owner may see
+/// (an admin's token sees the admin-only ones too).
+pub const OWNER_SCOPE: &str = "start:owner";
 
 /// Every exempt path is a prefix above.
 fn no_exempt_path(_: &str) -> bool {

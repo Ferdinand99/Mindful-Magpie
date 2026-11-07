@@ -21,7 +21,11 @@
 // `onDiscard` (called when the person gives the changes up) and `background`
 // (`{ upload(file), remove(id) }`, the two calls of the background picture; each
 // resolves to `{ status, body }` like `save`. Without it the picker offers the
-// four presets only).
+// four presets only) and `services` (the services the person may use, from
+// #mm-services: `[{ id, name, kind, interval_s, metrics: [{ id, label, format }] }]`;
+// the card form binds a card to one of them, see `serviceField`), `getValues`
+// (gives the readings of the services, from #mm-values, that the page is drawn with
+// when edit mode ends) and `onEnd` (called when edit mode has ended, however).
 import {
   addBookmark,
   addCard,
@@ -77,6 +81,14 @@ export const LABEL_KEYS = [
   "field_description",
   "field_emoji",
   "field_colour",
+  "field_service",
+  "service_none",
+  "service_missing",
+  "help_service",
+  "field_metrics",
+  "help_metrics",
+  "metrics_full",
+  "metrics_gone",
   "optional",
   "help_url",
   "help_emoji",
@@ -136,6 +148,9 @@ export const LABEL_KEYS = [
   "err_bad_scheme",
   "err_bad_emoji",
   "err_bad_colour",
+  "err_service_metrics",
+  "err_bad_service",
+  "err_bad_metric",
   "err_generic",
   "colour_red",
   "colour_orange",
@@ -311,6 +326,21 @@ export function startEditing(root, getLayout, save, opts = {}) {
   // What "unsaved" is measured against: the stored layout (a kept draft is unsaved by definition).
   const baseline = JSON.stringify(opts.draft ? stored : draft);
   const background = opts.background ?? null;
+  // The services the card form offers; without the list a card cannot be bound here.
+  const services = Array.isArray(opts.services) ? opts.services : [];
+  // The page is drawn with them again when edit mode ends, so bound cards keep their numbers.
+  // `getValues` gives the page's latest readings, which the plain page is drawn with.
+  const pageOpts = () => {
+    const values = typeof opts.getValues === "function" ? opts.getValues() : undefined;
+    return {
+      lang,
+      labels: ui.labels,
+      // The start page can acknowledge needs; its script wires the buttons.
+      canAck: true,
+      ...(Array.isArray(opts.services) ? { services: opts.services } : {}),
+      ...(values && typeof values === "object" ? { values } : {}),
+    };
+  };
   // The picture the stored layout uses, if any, and the one uploaded in this
   // session. The server keeps one picture per user, and is asked to remove one
   // (by id, see cleanupPictures) only when this editor is done with it.
@@ -597,6 +627,11 @@ export function startEditing(root, getLayout, save, opts = {}) {
 
   /** The text of the error `code` for `field` of `kind` (group, card, bookmark). */
   function problemText(code, field, kind) {
+    if (field === "service") {
+      if (code === "bad_service") return L("err_bad_service");
+      if (code === "bad_metric") return L("err_bad_metric");
+      if (["required", "too_many", "duplicate_id", "bad_id"].includes(code)) return L("err_service_metrics");
+    }
     switch (code) {
       case "required":
         return L("err_required");
@@ -688,7 +723,7 @@ export function startEditing(root, getLayout, save, opts = {}) {
     let first = null;
     for (const message of form.querySelectorAll(".field-error[data-for]")) {
       const name = message.getAttribute("data-for");
-      const input = form.querySelector(`input[name="${name}"]`);
+      const input = form.querySelector(`input[name="${name}"], select[name="${name}"]`);
       const code = errors[name];
       if (code) {
         message.textContent = problemText(code, name, kind);
@@ -764,6 +799,118 @@ export function startEditing(root, getLayout, save, opts = {}) {
     });
   }
 
+  /** Whether a checkbox is on (where `checked` is not a property, the attribute says). */
+  const isOn = (el) => el.checked ?? el.hasAttribute("checked");
+
+  /**
+   * «Tjeneste»: a select (None, then the services by name) and, once one is
+   * chosen, a checkbox for each of its metrics, at most four. At four the other
+   * boxes are disabled and the hint says why (it is a live region). A card whose
+   * service is no longer in the list (removed, or hidden from this person) gets
+   * an extra choice, «Tjenesten finnes ikke lenger», selected: saving as it is
+   * keeps the card's binding, and the person may pick another service or None.
+   */
+  function serviceField(card) {
+    const bound = card?.service ?? null;
+    const gone = bound !== null && !services.some((s) => s.id === bound.id);
+    const selectId = uid("mm-f-service");
+    const helpId = `${selectId}-help`;
+    const errorId = `${selectId}-error`;
+    const wrap = h(doc, "div", { class: "field", "data-field": "service" });
+    const labelEl = h(doc, "label", { class: "label", for: selectId }, [L("field_service")]);
+    labelEl.appendChild(h(doc, "span", { class: "label-optional", text: ` ${L("optional")}` }));
+    const select = h(doc, "select", { id: selectId, name: "service", "aria-describedby": `${helpId} ${errorId}` });
+    const choice = (value, text, extra = {}) => h(doc, "option", { value, ...extra }, [text]);
+    select.appendChild(choice("", L("service_none"), bound === null ? { selected: true } : {}));
+    for (const service of services) {
+      select.appendChild(choice(String(service.id), service.name, bound?.id === service.id ? { selected: true } : {}));
+    }
+    if (gone) select.appendChild(choice(String(bound.id), L("service_missing"), { selected: true, "data-gone": true }));
+
+    const hintId = `${uid("mm-f-metrics")}-hint`;
+    // A fieldset with a legend: screen readers announce the group's name with each box.
+    const picker = h(doc, "fieldset", { class: "field", "data-metrics": true });
+    const group = h(doc, "div", { class: "stack-sm" });
+    const hint = h(doc, "p", { class: "help", id: hintId, "aria-live": "polite" });
+    // Ids the card has but the service no longer offers: said, then dropped on save.
+    const lost = h(doc, "p", { class: "help", role: "status", hidden: true });
+    picker.appendChild(h(doc, "legend", { text: L("field_metrics") }));
+    picker.appendChild(group);
+    picker.appendChild(hint);
+    picker.appendChild(lost);
+
+    const chosen = () => [...select.querySelectorAll("option")].find((o) => o.selected ?? o.hasAttribute("selected"));
+    const boxes = () => [...group.querySelectorAll('input[name="metric"]')];
+    const refreshLimit = () => {
+      const full = boxes().filter(isOn).length >= LIMITS.serviceMetrics;
+      for (const box of boxes()) {
+        if (full && !isOn(box)) box.setAttribute("disabled", "");
+        else box.removeAttribute("disabled");
+      }
+      hint.textContent = full ? L("metrics_full") : L("help_metrics");
+    };
+    // `keep`: the metric ids to tick when the boxes are made.
+    const fill = (keep) => {
+      while (group.firstChild) group.removeChild(group.firstChild);
+      const option = chosen();
+      const service =
+        option && option.value !== "" && !option.hasAttribute("data-gone")
+          ? services.find((s) => String(s.id) === option.value)
+          : null;
+      if (!service) {
+        picker.setAttribute("hidden", "");
+        return;
+      }
+      picker.removeAttribute("hidden");
+      // Another service: its first number to start with.
+      const start = keep ?? service.metrics.slice(0, 1).map((m) => m.id);
+      const offered = new Set(service.metrics.map((m) => m.id));
+      const missing = start.filter((id) => !offered.has(id));
+      lost.textContent = missing.length > 0 ? L("metrics_gone", { names: missing.join(", ") }) : "";
+      if (missing.length > 0) lost.removeAttribute("hidden");
+      else lost.setAttribute("hidden", "");
+      for (const metric of service.metrics) {
+        const box = h(doc, "input", { type: "checkbox", name: "metric", value: metric.id, "aria-describedby": hintId });
+        if (start.includes(metric.id)) box.setAttribute("checked", "");
+        box.addEventListener("change", refreshLimit);
+        group.appendChild(
+          h(doc, "label", { class: "check" }, [
+            box,
+            h(doc, "span", { class: "check-text" }, [h(doc, "span", { class: "check-label", dir: "auto", text: metric.label })]),
+          ]),
+        );
+      }
+      refreshLimit();
+    };
+    select.addEventListener("change", () => {
+      const option = chosen();
+      fill(option && bound && String(bound.id) === option.value ? bound.metrics : undefined);
+    });
+
+    wrap.appendChild(labelEl);
+    wrap.appendChild(select);
+    wrap.appendChild(h(doc, "p", { class: "help", id: helpId, text: L("help_service") }));
+    wrap.appendChild(picker);
+    wrap.appendChild(h(doc, "p", { class: "field-error", id: errorId, "data-for": "service", hidden: true }));
+    fill(bound?.metrics);
+    return wrap;
+  }
+
+  /** The service binding the card form says: `{ id, metrics }`, or null for none. */
+  function readService(form, card) {
+    const option = [...form.querySelectorAll('select[name="service"] option')].find((o) => o.selected ?? o.hasAttribute("selected"));
+    const value = option?.value ?? "";
+    if (value === "") return null;
+    // The choice that says the service is gone leaves the binding as it was.
+    if (option.hasAttribute("data-gone")) return card?.service ? structuredClone(card.service) : null;
+    const ticked = [...form.querySelectorAll('input[name="metric"]')].filter(isOn).map((box) => box.value);
+    // The card's own service: the numbers still ticked keep the card's order and
+    // new ones follow in the service's order. Another service: its order.
+    const stored = card?.service?.id === Number(value) ? card.service.metrics : [];
+    const metrics = [...stored.filter((id) => ticked.includes(id)), ...ticked.filter((id) => !stored.includes(id))];
+    return { id: Number(value), metrics };
+  }
+
   function cardForm({ groupId, card }, trigger, errors) {
     const adding = !card;
     formSheet({
@@ -775,6 +922,7 @@ export function startEditing(root, getLayout, save, opts = {}) {
         field("description", L("field_description"), card?.description ?? "", { optional: true, kind: "card" }),
         field("emoji", L("field_emoji"), card?.icon?.emoji ?? "", { help: L("help_emoji"), optional: true, kind: "card" }),
         colourField(card?.icon?.colour ?? DEFAULT_COLOUR),
+        serviceField(card),
       ],
       read: (form) => ({
         title: valueOf(form, "title").trim(),
@@ -782,6 +930,7 @@ export function startEditing(root, getLayout, save, opts = {}) {
         description: valueOf(form, "description").trim(),
         emoji: valueOf(form, "emoji").trim(),
         colour: chosenColour(form),
+        service: readService(form, card),
       }),
       check: checkCard,
       trigger,
@@ -794,6 +943,10 @@ export function startEditing(root, getLayout, save, opts = {}) {
           // An empty field is null: the server refuses an empty string.
           icon: { emoji: values.emoji === "" ? null : values.emoji, colour: values.colour },
         };
+        // A card with no service gets no key and stays as it was; taking one
+        // off is `null`, which the server reads as none.
+        if (values.service) data.service = values.service;
+        else if (card?.service) data.service = null;
         if (adding) {
           draft = addCard(draft, groupId, data);
           const id = draft.groups.find((g) => g.id === groupId).cards.at(-1).id;
@@ -1257,10 +1410,11 @@ export function startEditing(root, getLayout, save, opts = {}) {
       else if (at.kind === "card") {
         where = L("summary_card", { title: sent.groups[at.group]?.cards[at.card]?.title ?? "" });
         field = field.replace("icon.", "");
+        if (field.startsWith("service")) field = "service";
       } else if (at.kind === "bookmark") where = L("summary_bookmark", { title: sent.bookmarks[at.bookmark]?.title ?? "" });
       const known = at.kind === "group" || at.kind === "card" || at.kind === "bookmark";
       let text;
-      if (code === "too_many") {
+      if (code === "too_many" && at.kind === "list") {
         const key = path === "groups" ? "limit_groups" : path === "cards" ? "limit_cards" : "limit_bookmarks";
         text = L(key, { max: LIMITS[path] ?? "" });
       } else if (known) {
@@ -1274,7 +1428,7 @@ export function startEditing(root, getLayout, save, opts = {}) {
   }
 
   function fieldName(field) {
-    const key = { title: "field_title", url: "field_url", description: "field_description", emoji: "field_emoji", colour: "field_colour" }[field];
+    const key = { title: "field_title", url: "field_url", description: "field_description", emoji: "field_emoji", colour: "field_colour", service: "field_service" }[field];
     return key ? L(key) : field;
   }
 
@@ -1287,7 +1441,11 @@ export function startEditing(root, getLayout, save, opts = {}) {
     };
     const errors = {};
     for (const { path: p, code } of fields) {
-      if (same(p)) errors[parsePath(p).field.replace("icon.", "")] = code;
+      if (same(p)) {
+        const name = parsePath(p).field.replace("icon.", "");
+        // `service` and `service.metrics` are one field in the form: the select and its boxes.
+        errors[name.startsWith("service") ? "service" : name] = code;
+      }
     }
     // The saved copy says which item it was; the draft is what the form edits.
     if (at.kind === "group") {
@@ -1384,7 +1542,7 @@ export function startEditing(root, getLayout, save, opts = {}) {
   function finish(layout, { focus = true, settle = true, saved = false } = {}) {
     if (!active) return;
     teardown();
-    render(root, layout, { lang, labels: ui.labels });
+    render(root, layout, pageOpts());
     if (settle) cleanupPictures(layout, saved);
     if (focus && editButton) editButton.focus();
   }
@@ -1395,6 +1553,7 @@ export function startEditing(root, getLayout, save, opts = {}) {
     host.remove();
     root.removeAttribute("data-editing");
     if (editButton) editButton.setAttribute("aria-pressed", "false");
+    opts.onEnd?.();
   }
 
   // Unsaved changes. The browser prompt covers leaving the page (a reload, a

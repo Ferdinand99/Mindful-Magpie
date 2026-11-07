@@ -1,0 +1,17 @@
+{#- The answer of «Test», shown in the form's result area. It holds no secret, header or address. -#}
+<div class="stack-sm" data-test-status="{{ status }}">
+  <p><span class="badge status-{{ status }}">{{ headline }}</span></p>
+  {%- if let Some(reason) = reason %}
+  <p class="help">{{ reason }}</p>
+  {%- endif %}
+  {%- if !rows.is_empty() %}
+  <ul class="list" role="list">
+    {%- for row in rows %}
+    <li class="list-row">
+      <span class="list-main"><span class="list-title">{{ row.label }}</span></span>
+      <span class="list-trail">{{ row.value }}</span>
+    </li>
+    {%- endfor %}
+  </ul>
+  {%- endif %}
+</div>
