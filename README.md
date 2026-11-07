@@ -45,6 +45,21 @@ and pre-migration backups). The container starts as root only to hand `/data` to
 | | `MM_TRUST_PROXY` | off | honour `X-Forwarded-*` from a reverse proxy (read by vole-kit) |
 | | `MM_SETUP_TOKEN` | (random, logged at the first start) | `/setup` only opens with `?token=<value>` until the first user exists (read by vole-kit) |
 
+## Behind a reverse proxy
+
+Set the public address and tell Magpie to trust the proxy's forwarded headers:
+
+```yaml
+environment:
+  - MM_PUBLIC_URL=https://start.example.com
+  - MM_TRUST_PROXY=1
+```
+
+`MM_PUBLIC_URL` must be the root of its own host name (a path like `https://example.com/start` is refused at
+startup). Without `MM_TRUST_PROXY=1` Magpie sees every request as coming from the proxy: the sign-in rate limits are
+keyed to the proxy's address, so one person's failed attempts lock out everyone, and Magpie cannot tell that the
+request came in over HTTPS, so it sends no HSTS header.
+
 ## Develop
 
 See [`docs/development.md`](docs/development.md). All builds and tests run in Docker.

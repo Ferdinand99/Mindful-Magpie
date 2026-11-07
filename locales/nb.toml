@@ -29,7 +29,7 @@ scope_read_sub = "Lenker og tjenester på startsiden"
 
 [auth]
 all_set = "Alt er klart. Startsiden din er klar."
-setup_token_required = "Denne instansen krever en oppsettsnøkkel. Åpne /setup?token=… med verdien av MM_SETUP_TOKEN fra serverens konfigurasjon."
+setup_token_required = "Denne instansen krever en oppsettsnøkkel. Åpne /setup?token=… med verdien av MM_SETUP_TOKEN fra serverens konfigurasjon, eller bruk oppsettslenken i serverloggen (`docker logs`)."
 
 [error]
 back = "Tilbake til startsiden"

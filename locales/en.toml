@@ -29,7 +29,7 @@ scope_read_sub = "Links and services on the start page"
 
 [auth]
 all_set = "You’re all set. Your start page is ready."
-setup_token_required = "This instance needs a setup token. Open /setup?token=… with the value of MM_SETUP_TOKEN from the server’s configuration."
+setup_token_required = "This instance needs a setup token. Open /setup?token=… with the value of MM_SETUP_TOKEN from the server’s configuration, or use the setup link in the server log (`docker logs`)."
 
 [error]
 back = "Back to the start page"

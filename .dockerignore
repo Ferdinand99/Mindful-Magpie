@@ -14,7 +14,6 @@ data/
 .idea
 .env
 .env.*
-.superpowers
 
 # The image's own Rust (rust:1.99-alpine) builds it; a toolchain file would
 # make rustup download the same release again.

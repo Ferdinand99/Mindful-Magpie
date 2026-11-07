@@ -54,6 +54,17 @@ async fn setup_creates_the_first_admin() {
     let app = App::new().await;
     let mut web = Web::anonymous(&app);
 
+    // First run, with the token: the setup page renders its form.
+    let res = web.get(&format!("/setup?token={token}")).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    for field in ["username", "password", "confirm"] {
+        assert!(
+            res.body.contains(&format!(r#"name="{field}""#)),
+            "no {field} field on /setup: {}",
+            res.body
+        );
+    }
+
     // Without the token nothing is created.
     let res = web.post("/setup", &setup_form("")).await;
     assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
@@ -109,6 +120,8 @@ async fn member_cannot_manage_users() {
     assert_eq!(gina.get("/").await.status, StatusCode::OK);
     let res = gina.get("/settings/users").await;
     assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    let res = gina.get("/settings/general").await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
     let res = gina
         .post(
             "/settings/users",
@@ -162,8 +175,16 @@ async fn admin_can_add_a_user() {
 #[tokio::test]
 async fn data_survives_restart() {
     let app = App::new().await;
-    add_user(&app, "ada", "admin").await;
+    // Sign in before the restart: the session must survive it.
+    let session = Web::new(&app, "ada", "admin").await.cookies;
+    assert!(session.contains_key("mm_session"));
     let app = app.restart().await;
+    let mut carried = Web::anonymous(&app);
+    carried.cookies = session;
+    let res = carried.get("/").await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // And signing in again works on the restarted server.
     let mut ada = Web::anonymous(&app);
     let res = ada
         .post("/login", &[("username", "ada"), ("password", PASSWORD)])

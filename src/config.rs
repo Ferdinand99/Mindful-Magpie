@@ -37,7 +37,8 @@ impl Config {
     }
 }
 
-/// An http(s) URL without query or fragment, returned without a trailing slash.
+/// An http(s) URL for the root of a host, without query or fragment, returned
+/// without a trailing slash. Hosting under a subpath is not supported.
 fn parse_public_url(raw: &str) -> Result<String, String> {
     let raw = raw.trim();
     let url = url::Url::parse(raw).map_err(|e| format!("not a URL ({e})"))?;
@@ -46,6 +47,12 @@ fn parse_public_url(raw: &str) -> Result<String, String> {
     }
     if url.query().is_some() || url.fragment().is_some() || !url.username().is_empty() {
         return Err("leave out user names, queries and fragments".into());
+    }
+    if url.path() != "/" {
+        return Err(format!(
+            "serve Magpie at the root of its own address; hosting under the path {} is not supported",
+            url.path().trim_end_matches('/')
+        ));
     }
     Ok(url.as_str().trim_end_matches('/').to_string())
 }
@@ -77,9 +84,24 @@ mod tests {
 
     #[test]
     fn public_urls_are_checked() {
-        assert!(parse_public_url("https://example.com/start/").is_ok());
+        assert_eq!(
+            parse_public_url("https://example.com/").as_deref(),
+            Ok("https://example.com")
+        );
+        assert_eq!(
+            parse_public_url(" http://localhost:3010 ").as_deref(),
+            Ok("http://localhost:3010")
+        );
         for bad in ["example.com", "ftp://x", "https://x?y=1", "https://u@x"] {
             assert!(parse_public_url(bad).is_err(), "{bad}");
+        }
+        // Subpath hosting does not work, so a path is refused with a clear message.
+        for bad in ["https://example.com/start", "https://example.com/start/"] {
+            let err = parse_public_url(bad).unwrap_err();
+            assert!(
+                err.contains("not supported") && err.contains("/start"),
+                "{bad}: {err}"
+            );
         }
     }
 }
