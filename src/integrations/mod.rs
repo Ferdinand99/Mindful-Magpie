@@ -22,6 +22,7 @@ pub mod api;
 pub mod http_kind;
 pub mod kk;
 pub mod poller;
+pub mod proxmox;
 pub mod vv;
 pub mod ww_kind;
 
@@ -82,7 +83,13 @@ pub trait Integration: Send + Sync + 'static {
 
 /// The kinds compiled into this build.
 pub fn registry() -> &'static [&'static dyn Integration] {
-    static KINDS: [&dyn Integration; 4] = [&http_kind::HTTP, &vv::VV, &kk::KK, &ww_kind::WW];
+    static KINDS: [&dyn Integration; 5] = [
+        &http_kind::HTTP,
+        &vv::VV,
+        &kk::KK,
+        &ww_kind::WW,
+        &proxmox::PROXMOX,
+    ];
     &KINDS
 }
 
