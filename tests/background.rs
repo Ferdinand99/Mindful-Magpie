@@ -858,11 +858,21 @@ async fn a_picture_that_is_not_the_users_any_more_is_shown_as_hedgerow() {
     let shown = embedded_layout(&mut web).await;
     assert_eq!(shown["background"], json!({ "kind": "image", "id": old }));
 
-    // A new upload replaces it: the stored layout still names the old id.
+    // A new upload does not take the picture the layout uses away: it is kept
+    // until a saved layout stops using it, and still shown.
     let new = upload_ok(&mut web, &png(b"new")).await;
     assert_ne!(old, new);
     let stored = stored_layout(&app, uid).await;
     assert_eq!(stored["background"], json!({ "kind": "image", "id": old }));
+    let shown = embedded_layout(&mut web).await;
+    assert_eq!(shown["background"], json!({ "kind": "image", "id": old }));
+
+    // A picture the row has lost (here: the kept one is cleared, as a removal
+    // outside the page would) is a dead one.
+    app.exec(
+        "UPDATE backgrounds SET kept_id = NULL, kept_mime = NULL, kept_bytes = NULL".to_string(),
+    )
+    .await;
 
     // The page shows Hedgerow, at the stored version, for the whole layout.
     let shown = embedded_layout(&mut web).await;
@@ -987,20 +997,31 @@ async fn a_layout_may_only_use_the_users_own_image() {
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert_eq!(stored_layout(&app, uid).await["background"]["id"], json!(b));
 
-    // After a new upload the old id is no longer his.
+    // After a new upload the picture the layout used is kept, so it can still
+    // be saved; the new one can be saved too.
     let b2 = upload_ok(&mut bob, &png(b"bob's other")).await;
     let res = save_layout(
         &mut bob,
         &layout_with(1, json!({ "kind": "image", "id": b })),
     )
     .await;
-    assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", res.body);
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     let res = save_layout(
         &mut bob,
-        &layout_with(1, json!({ "kind": "image", "id": b2 })),
+        &layout_with(2, json!({ "kind": "image", "id": b2 })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    // Once the layout uses the new one, the old one can go, and then it is no
+    // longer his.
+    let res = delete_background(&mut bob, &b).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    let res = save_layout(
+        &mut bob,
+        &layout_with(3, json!({ "kind": "image", "id": b })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", res.body);
 }
 
 #[tokio::test]
@@ -1048,4 +1069,341 @@ async fn another_users_picture_id_in_a_stored_layout_is_shown_as_hedgerow() {
     assert_eq!(shown["version"], json!(4));
     // Ada's own page is not affected.
     assert_eq!(image_as(&app, &ada, &a).await.status, StatusCode::OK);
+}
+
+/// The ids the row holds: current and kept.
+async fn row_ids(app: &App, uid: i64) -> (Option<String>, Option<String>) {
+    app.magpie
+        .core
+        .with_conn(move |c| {
+            c.query_row(
+                "SELECT id, kept_id FROM backgrounds WHERE user_id = ?1",
+                [uid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap_or((None, None))
+}
+
+#[tokio::test]
+async fn an_upload_keeps_the_picture_the_stored_layout_uses() {
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    let uid = user_id(&app, "ada").await;
+    let old = upload_ok(&mut web, &png(b"old")).await;
+    let res = save_layout(
+        &mut web,
+        &layout_with(0, json!({ "kind": "image", "id": old })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let new = upload_ok(&mut web, &jpeg(b"new")).await;
+    // Both are in the row, on disk and served.
+    assert_eq!(
+        row_ids(&app, uid).await,
+        (Some(new.clone()), Some(old.clone()))
+    );
+    let mut both = vec![format!("{old}.png"), format!("{new}.jpg")];
+    both.sort();
+    assert_eq!(files_of(&app, uid), both);
+    let img = image_as(&app, &web, &old).await;
+    assert_eq!(img.status, StatusCode::OK);
+    assert_eq!(img.header("content-type"), "image/png");
+    assert_eq!(image_as(&app, &web, &new).await.status, StatusCode::OK);
+
+    // A third upload replaces the new one and still keeps the one in use.
+    let third = upload_ok(&mut web, &png(b"third")).await;
+    assert_eq!(
+        row_ids(&app, uid).await,
+        (Some(third.clone()), Some(old.clone()))
+    );
+    assert_eq!(
+        image_as(&app, &web, &new).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(files_of(&app, uid).len(), 2);
+
+    // A restart's sweep keeps both files.
+    drop(web);
+    let app = app.restart().await;
+    assert_eq!(files_of(&app, uid).len(), 2);
+    assert_eq!(row_ids(&app, uid).await, (Some(third), Some(old)));
+}
+
+#[tokio::test]
+async fn cancel_after_an_upload_leaves_the_old_picture_in_use() {
+    // What the page does: upload, then (Cancel) ask for its own upload to go.
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    let uid = user_id(&app, "ada").await;
+    let old = upload_ok(&mut web, &png(b"old")).await;
+    let res = save_layout(
+        &mut web,
+        &layout_with(0, json!({ "kind": "image", "id": old })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let new = upload_ok(&mut web, &png(b"new")).await;
+
+    let res = delete_background(&mut web, &new).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    // The old picture is the current one again, nothing is kept, and the page
+    // shows it as before.
+    assert_eq!(row_ids(&app, uid).await, (Some(old.clone()), None));
+    assert_eq!(files_of(&app, uid), vec![format!("{old}.png")]);
+    assert_eq!(image_as(&app, &web, &old).await.status, StatusCode::OK);
+    assert_eq!(
+        image_as(&app, &web, &new).await.status,
+        StatusCode::NOT_FOUND
+    );
+    let shown = embedded_layout(&mut web).await;
+    assert_eq!(shown["background"], json!({ "kind": "image", "id": old }));
+    assert_eq!(stored_version(&app, uid).await, 1);
+}
+
+#[tokio::test]
+async fn saving_the_new_picture_lets_the_old_one_go() {
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    let uid = user_id(&app, "ada").await;
+    let old = upload_ok(&mut web, &png(b"old")).await;
+    save_layout(
+        &mut web,
+        &layout_with(0, json!({ "kind": "image", "id": old })),
+    )
+    .await;
+    let new = upload_ok(&mut web, &png(b"new")).await;
+
+    // While the stored layout uses the old one, it cannot be removed.
+    let res = delete_background(&mut web, &old).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    assert_eq!(
+        row_ids(&app, uid).await,
+        (Some(new.clone()), Some(old.clone()))
+    );
+
+    // The new picture is saved; now the old one is unused and can go.
+    let res = save_layout(
+        &mut web,
+        &layout_with(1, json!({ "kind": "image", "id": new })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = delete_background(&mut web, &old).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    assert_eq!(row_ids(&app, uid).await, (Some(new.clone()), None));
+    assert_eq!(files_of(&app, uid), vec![format!("{new}.png")]);
+    assert_eq!(
+        image_as(&app, &web, &old).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(image_as(&app, &web, &new).await.status, StatusCode::OK);
+    // The layout and its version are as the save left them.
+    assert_eq!(stored_version(&app, uid).await, 2);
+}
+
+#[tokio::test]
+async fn an_upload_prunes_a_picture_the_layout_does_not_use() {
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    let uid = user_id(&app, "ada").await;
+    // A layout on a preset: the first picture is not in use, so a second
+    // upload replaces it as before (nothing is kept).
+    save_layout(
+        &mut web,
+        &layout_with(0, json!({ "kind": "preset", "name": "hav" })),
+    )
+    .await;
+    let first = upload_ok(&mut web, &png(b"first")).await;
+    let second = upload_ok(&mut web, &png(b"second")).await;
+    assert_eq!(row_ids(&app, uid).await, (Some(second.clone()), None));
+    assert_eq!(files_of(&app, uid), vec![format!("{second}.png")]);
+    assert_eq!(
+        image_as(&app, &web, &first).await.status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn upgrading_a_database_from_the_previous_migration_keeps_its_rows() {
+    // A database as 0004 left it: the table without the kept columns, a
+    // picture row, and a layout.
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    let uid = user_id(&app, "ada").await;
+    let id = upload_ok(&mut web, &png(b"before")).await;
+    save_layout(
+        &mut web,
+        &layout_with(0, json!({ "kind": "image", "id": id })),
+    )
+    .await;
+    app.exec(
+        "ALTER TABLE backgrounds DROP COLUMN kept_id;
+         ALTER TABLE backgrounds DROP COLUMN kept_mime;
+         ALTER TABLE backgrounds DROP COLUMN kept_bytes;
+         DELETE FROM schema_migrations WHERE name LIKE '%0005_kept%';"
+            .to_string(),
+    )
+    .await;
+    let token = make_token(&app, uid, TokenScope::Read, "ext").await;
+    drop(web);
+
+    let app = app.restart().await;
+    // Only the new migration ran, and the rows are intact.
+    assert_eq!(
+        app.count("SELECT COUNT(*) FROM schema_migrations WHERE name LIKE '%0005_kept%'")
+            .await,
+        1
+    );
+    assert_eq!(app.count("SELECT COUNT(*) FROM backgrounds").await, 1);
+    assert_eq!(app.count("SELECT COUNT(*) FROM layouts").await, 1);
+    assert_eq!(row_ids(&app, uid).await, (Some(id.clone()), None));
+    // The token made before the upgrade still works: the picture is served
+    // and the layout still shows it.
+    let img = fetch(&app, &format!("/start/background/{id}"), None, Some(&token)).await;
+    assert_eq!(img.status, StatusCode::OK);
+    let res = bearer_get(&app, "/api/v1/me/start", &token).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(
+        res.json()["background"],
+        json!({ "kind": "image", "id": id })
+    );
+}
+
+#[tokio::test]
+async fn upgrading_from_the_schema_of_main_applies_only_the_new_migrations() {
+    // Main's database has the kit's tables and Magpie's 0001 to 0003: a
+    // layout, an extension token. This build adds 0004 and 0005 and nothing else.
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    let uid = user_id(&app, "ada").await;
+    save_layout(
+        &mut web,
+        &layout_with(0, json!({ "kind": "preset", "name": "hav" })),
+    )
+    .await;
+    let token = make_token(&app, uid, TokenScope::Read, "ext").await;
+    let applied = app.count("SELECT COUNT(*) FROM schema_migrations").await;
+    app.exec(
+        "DROP TABLE backgrounds;
+         DELETE FROM schema_migrations WHERE name LIKE '%0004_backgrounds%'
+                                          OR name LIKE '%0005_kept%';"
+            .to_string(),
+    )
+    .await;
+    assert_eq!(
+        app.count("SELECT COUNT(*) FROM schema_migrations").await,
+        applied - 2
+    );
+    drop(web);
+
+    let app = app.restart().await;
+    // Both new migrations ran (and no other was applied twice or dropped).
+    assert_eq!(
+        app.count("SELECT COUNT(*) FROM schema_migrations").await,
+        applied
+    );
+    assert_eq!(
+        app.count("SELECT COUNT(*) FROM schema_migrations WHERE name LIKE '%0004_backgrounds%'")
+            .await,
+        1
+    );
+    assert_eq!(
+        app.count("SELECT COUNT(*) FROM schema_migrations WHERE name LIKE '%0005_kept%'")
+            .await,
+        1
+    );
+    // The old rows are untouched, and the new table has the kept columns.
+    assert_eq!(app.count("SELECT COUNT(*) FROM layouts").await, 1);
+    assert_eq!(app.count("SELECT COUNT(*) FROM api_tokens").await, 1);
+    assert_eq!(
+        app.count("SELECT COUNT(*) FROM pragma_table_info('backgrounds') WHERE name LIKE 'kept_%'")
+            .await,
+        3
+    );
+    let res = bearer_get(&app, "/api/v1/me/start", &token).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(
+        res.json()["background"],
+        json!({ "kind": "preset", "name": "hav" })
+    );
+}
+
+#[tokio::test]
+async fn a_read_token_cannot_save_upload_or_delete() {
+    // An API token (here with read scope; a write scope is no different on
+    // these routes) works under /api/ only. Sent alone, without the session
+    // cookie, to the page's save, upload and delete routes it is no sign-in, and
+    // nothing is written. The answer must not be a redirect to the sign-in page
+    // for a program that sends a token.
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    let uid = user_id(&app, "ada").await;
+    let id = upload_ok(&mut web, &png(b"mine")).await;
+    let res = save_layout(
+        &mut web,
+        &layout_with(0, json!({ "kind": "preset", "name": "hav" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let layout_before = stored_layout(&app, uid).await;
+    let files_before = files_of(&app, uid);
+    let version_before = stored_version(&app, uid).await;
+
+    for scope in [TokenScope::Read, TokenScope::Write] {
+        let token = make_token(&app, uid, scope, "ext").await;
+        let layout = layout_with(1, json!({ "kind": "preset", "name": "natt" })).to_string();
+        let upload = multipart("image", "x.png", "image/png", &png(b"other"));
+        let requests = [
+            ("POST /start/layout", {
+                Request::post("/start/layout")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(layout))
+                    .unwrap()
+            }),
+            ("POST /start/background", {
+                Request::post("/start/background")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={BOUNDARY}"),
+                    )
+                    .body(Body::from(upload))
+                    .unwrap()
+            }),
+            ("DELETE /start/background", {
+                Request::delete(format!("/start/background?id={id}"))
+                    .body(Body::empty())
+                    .unwrap()
+            }),
+        ];
+        for (what, mut req) in requests {
+            let headers = req.headers_mut();
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+            );
+            // What the page's own script would add, so that only the sign-in is in question.
+            headers.insert("hx-request", HeaderValue::from_static("true"));
+            let res = app.send(req).await;
+            assert_eq!(res.status, StatusCode::UNAUTHORIZED, "{what}: {}", res.body);
+            assert!(
+                res.headers.get(header::LOCATION).is_none(),
+                "{what}: redirected"
+            );
+        }
+        // Nothing changed.
+        assert_eq!(stored_layout(&app, uid).await, layout_before);
+        assert_eq!(stored_version(&app, uid).await, version_before);
+        assert_eq!(files_of(&app, uid), files_before);
+        assert_eq!(app.count("SELECT COUNT(*) FROM backgrounds").await, 1);
+        assert_eq!(image_as(&app, &web, &id).await.status, StatusCode::OK);
+    }
 }

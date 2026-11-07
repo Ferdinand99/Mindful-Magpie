@@ -1,7 +1,8 @@
 //! The user's uploaded start page background: one picture per user.
 //!
 //! The row in `backgrounds` holds the metadata and is the truth about which
-//! picture is the user's; the file lives at
+//! pictures are the user's: the current one and, while the stored layout still
+//! uses the one before it, that one (`kept_*`). The file lives at
 //! `<data_dir>/backgrounds/<user_id>/<id>.<ext>`. `<id>` is a prefix of the
 //! SHA-256 of the content, so the same picture always has the same name and a
 //! browser can cache it for good.
@@ -9,9 +10,12 @@
 //! Order of events, so that a failure never leaves a row without a file:
 //!
 //! - an upload writes the file (a temporary file, then a rename), commits the
-//!   row, and only then deletes everything else in the user's directory (the
-//!   previous picture, leftovers of a crash);
-//! - a delete commits the row first, then removes the directory; it never
+//!   row, and only then deletes everything else in the user's directory
+//!   (leftovers of a crash, a picture nothing uses). The picture the stored
+//!   layout uses is not touched: it becomes the kept picture, so that a Cancel
+//!   after an upload leaves the user's page as it was; the layout that is saved
+//!   later decides which of the two stays (the client asks for the other to go);
+//! - a delete commits the row first, then removes the file; it never
 //!   touches the layout (a layout that still names a removed picture is shown
 //!   on the default preset, see `store::load_or_default`);
 //! - [`Backgrounds::reconcile`] removes what no row accounts for. It runs at
@@ -157,22 +161,25 @@ impl Backgrounds {
         task.await?
     }
 
-    /// The user's picture when `id` is its id: its kind and bytes. `None` when
-    /// the user has no picture, another id, or the file is missing.
+    /// The user's picture when `id` is the id of the current or the kept
+    /// picture: its kind and bytes. `None` when the user has no such picture or
+    /// the file is missing.
     pub async fn read(
         &self,
         core: &Core,
         user_id: i64,
         id: &str,
     ) -> Result<Option<(Kind, Vec<u8>)>, BackgroundError> {
-        let row = meta(core, user_id).await?;
-        let Some((stored, mime)) = row else {
+        let Some(row) = meta(core, user_id).await? else {
             return Ok(None);
         };
-        let Some(kind) = Kind::from_mime(&mime).filter(|_| stored == id) else {
+        let Some(picture) = row.pictures().into_iter().find(|p| p.id == id) else {
             return Ok(None);
         };
-        let path = self.user_dir(user_id).join(file_name(&stored, kind));
+        let Some(kind) = Kind::from_mime(&picture.mime) else {
+            return Ok(None);
+        };
+        let path = self.user_dir(user_id).join(file_name(&picture.id, kind));
         match tokio::fs::read(&path).await {
             Ok(data) => Ok(Some((kind, data))),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -183,12 +190,13 @@ impl Backgrounds {
         }
     }
 
-    /// Removes the user's picture `id`, when it is still the user's current
+    /// Removes the user's picture `id`, when it is the current or the kept
     /// picture and the stored layout does not use it. Anything else is a no-op
     /// (the picture was replaced, or a layout saved since points at it), so a
     /// stale tab can never take away a picture another tab has put to use.
-    /// The layout and its version are never changed. Returns whether a picture
-    /// was removed.
+    /// Removing the current picture while one is kept makes the kept one the
+    /// current. The layout and its version are never changed. Returns whether a
+    /// picture was removed.
     ///
     /// Like [`Backgrounds::store`], it finishes in a task of its own.
     pub async fn remove(
@@ -212,20 +220,15 @@ impl Backgrounds {
     /// not a user's number are not ours and stay.
     pub async fn reconcile(&self, core: &Core) -> Result<(), BackgroundError> {
         let _guard = self.lock.lock().await;
-        let rows: HashMap<i64, String> = db::interact(&core.db, |c| {
-            let mut stmt = c.prepare("SELECT user_id, id, mime FROM backgrounds")?;
-            let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })?;
+        let rows: HashMap<i64, Vec<String>> = db::interact(&core.db, |c| {
+            let mut stmt = c.prepare("SELECT user_id FROM backgrounds")?;
+            let users = stmt
+                .query_map([], |r| r.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
             let mut keep = HashMap::new();
-            for row in rows {
-                let (user_id, id, mime) = row?;
-                if let Some(kind) = Kind::from_mime(&mime) {
-                    keep.insert(user_id, file_name(&id, kind));
+            for user_id in users {
+                if let Some(row) = row_in(c, user_id)? {
+                    keep.insert(user_id, row.file_names());
                 }
             }
             Ok(keep)
@@ -258,6 +261,94 @@ impl Backgrounds {
     }
 }
 
+/// One picture of a user: its id, type and size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Picture {
+    id: String,
+    mime: String,
+    bytes: i64,
+}
+
+impl Picture {
+    fn file(&self) -> Option<String> {
+        Some(file_name(&self.id, Kind::from_mime(&self.mime)?))
+    }
+}
+
+/// The user's `backgrounds` row: the current picture, and the kept one (the
+/// picture the stored layout used before the latest upload).
+#[derive(Debug, Clone)]
+struct Row {
+    current: Picture,
+    kept: Option<Picture>,
+}
+
+impl Row {
+    fn pictures(&self) -> Vec<Picture> {
+        let mut all = vec![self.current.clone()];
+        all.extend(self.kept.clone());
+        all
+    }
+
+    /// The names of the files the row accounts for.
+    fn file_names(&self) -> Vec<String> {
+        self.pictures().iter().filter_map(Picture::file).collect()
+    }
+}
+
+/// Reads the user's row.
+fn row_in(c: &rusqlite::Connection, user_id: i64) -> rusqlite::Result<Option<Row>> {
+    c.query_row(
+        "SELECT id, mime, bytes, kept_id, kept_mime, kept_bytes
+         FROM backgrounds WHERE user_id = ?1",
+        params![user_id],
+        |r| {
+            let kept = match (
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+            ) {
+                (Some(id), Some(mime)) => Some(Picture {
+                    id,
+                    mime,
+                    bytes: r.get::<_, Option<i64>>(5)?.unwrap_or_default(),
+                }),
+                _ => None,
+            };
+            Ok(Row {
+                current: Picture {
+                    id: r.get(0)?,
+                    mime: r.get(1)?,
+                    bytes: r.get(2)?,
+                },
+                kept,
+            })
+        },
+    )
+    .optional()
+}
+
+/// The stored layout document of the user, if any.
+fn doc_in(c: &rusqlite::Connection, user_id: i64) -> rusqlite::Result<Option<String>> {
+    c.query_row(
+        "SELECT doc FROM layouts WHERE user_id = ?1",
+        params![user_id],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
+/// Whether the stored layout `doc` uses the picture `id`. A document that
+/// cannot be read may still name the picture, so it counts as use when the id
+/// appears in it.
+fn layout_uses(doc: Option<&str>, id: &str) -> bool {
+    doc.is_some_and(|doc| match serde_json::from_str::<Layout>(doc) {
+        Ok(layout) => {
+            matches!(&layout.background, Background::Image { id: used } if used == id)
+        }
+        Err(_) => doc.contains(id),
+    })
+}
+
 /// The body of [`Backgrounds::store`], with the lock held.
 async fn store_locked(
     core: &Core,
@@ -270,31 +361,57 @@ async fn store_locked(
     let name = file_name(&id, kind);
     write_atomically(dir, &name, data).await?;
 
-    let (row_id, mime) = (id.clone(), kind.mime());
-    let size = i64::try_from(data.len()).unwrap_or(i64::MAX);
+    let new = Picture {
+        id: id.clone(),
+        mime: kind.mime().to_string(),
+        bytes: i64::try_from(data.len()).unwrap_or(i64::MAX),
+    };
     let now = jiff::Timestamp::now().to_string();
     let stored = db::interact(&core.db, move |c| {
-        c.execute(
-            "INSERT INTO backgrounds (user_id, id, mime, bytes, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let doc = doc_in(&tx, user_id)?;
+        // The picture the stored layout uses stays (as the kept one) until a
+        // saved layout stops using it; anything else makes way for the new one.
+        let kept = row_in(&tx, user_id)?.and_then(|row| {
+            row.pictures()
+                .into_iter()
+                .find(|p| p.id != new.id && layout_uses(doc.as_deref(), &p.id))
+        });
+        tx.execute(
+            "INSERT INTO backgrounds
+                 (user_id, id, mime, bytes, created_at, kept_id, kept_mime, kept_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(user_id) DO UPDATE SET
                  id = excluded.id, mime = excluded.mime,
-                 bytes = excluded.bytes, created_at = excluded.created_at",
-            params![user_id, row_id, mime, size, now],
-        )
+                 bytes = excluded.bytes, created_at = excluded.created_at,
+                 kept_id = excluded.kept_id, kept_mime = excluded.kept_mime,
+                 kept_bytes = excluded.kept_bytes",
+            params![
+                user_id,
+                new.id,
+                new.mime,
+                new.bytes,
+                now,
+                kept.as_ref().map(|p| p.id.clone()),
+                kept.as_ref().map(|p| p.mime.clone()),
+                kept.as_ref().map(|p| p.bytes),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Row { current: new, kept }.file_names())
     })
     .await;
-    // What the row names is the one file to keep. After a failed upsert that
-    // is the previous picture, or nothing when there was none. When the row
-    // cannot be read either (a busy or broken database), nothing is known
-    // about what to keep, so nothing is removed: the next sweep decides.
+    // What the row names is what to keep. After a failed upsert that is what
+    // was there before, or nothing when there was nothing. When the row cannot
+    // be read either (a busy or broken database), nothing is known about what
+    // to keep, so nothing is removed: the next sweep decides.
     let keep = match &stored {
-        Ok(_) => Ok(Some(name)),
-        Err(_) => row_file(core, user_id).await,
+        Ok(files) => Ok(files.clone()),
+        Err(_) => row_files(core, user_id).await,
     };
     match keep {
-        Ok(Some(keep)) => prune(dir, &keep).await,
-        Ok(None) => remove_dir(dir).await,
+        Ok(files) if files.is_empty() => remove_dir(dir).await,
+        Ok(files) => prune(dir, &files).await,
         Err(err) => {
             tracing::warn!(
                 user = user_id,
@@ -316,67 +433,78 @@ async fn remove_locked(
     user_id: i64,
     id: String,
 ) -> Result<bool, BackgroundError> {
-    let removed = db::interact(&core.db, move |c| {
+    let outcome = db::interact(&core.db, move |c| {
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current: Option<String> = tx
-            .query_row(
-                "SELECT id FROM backgrounds WHERE user_id = ?1",
-                params![user_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if current.as_deref() != Some(id.as_str()) {
-            return Ok(false);
+        let Some(row) = row_in(&tx, user_id)? else {
+            return Ok(None);
+        };
+        if !row.pictures().iter().any(|p| p.id == id) {
+            return Ok(None);
         }
-        let doc: Option<String> = tx
-            .query_row(
-                "SELECT doc FROM layouts WHERE user_id = ?1",
-                params![user_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let used = doc.is_some_and(|doc| match serde_json::from_str::<Layout>(&doc) {
-            Ok(layout) => {
-                matches!(&layout.background, Background::Image { id: used } if *used == id)
+        if layout_uses(doc_in(&tx, user_id)?.as_deref(), &id) {
+            return Ok(None);
+        }
+        let left = if row.current.id == id {
+            // The kept picture, if any, becomes the current one.
+            match &row.kept {
+                Some(kept) => {
+                    tx.execute(
+                        "UPDATE backgrounds SET id = ?2, mime = ?3, bytes = ?4,
+                             kept_id = NULL, kept_mime = NULL, kept_bytes = NULL
+                         WHERE user_id = ?1",
+                        params![user_id, kept.id, kept.mime, kept.bytes],
+                    )?;
+                    Some(Row {
+                        current: kept.clone(),
+                        kept: None,
+                    })
+                }
+                None => {
+                    tx.execute(
+                        "DELETE FROM backgrounds WHERE user_id = ?1",
+                        params![user_id],
+                    )?;
+                    None
+                }
             }
-            // A document that cannot be read may still name the picture: keep it.
-            Err(_) => doc.contains(&id),
-        });
-        if used {
-            return Ok(false);
-        }
-        tx.execute(
-            "DELETE FROM backgrounds WHERE user_id = ?1",
-            params![user_id],
-        )?;
+        } else {
+            tx.execute(
+                "UPDATE backgrounds SET kept_id = NULL, kept_mime = NULL, kept_bytes = NULL
+                 WHERE user_id = ?1",
+                params![user_id],
+            )?;
+            Some(Row {
+                current: row.current.clone(),
+                kept: None,
+            })
+        };
         tx.commit()?;
-        Ok(true)
+        Ok(Some(left.map(|r| r.file_names()).unwrap_or_default()))
     })
     .await?;
-    if removed {
+    let Some(files) = outcome else {
+        return Ok(false);
+    };
+    if files.is_empty() {
         remove_dir(dir).await;
+    } else {
+        prune(dir, &files).await;
     }
-    Ok(removed)
+    Ok(true)
 }
 
-/// The file the user's row names: `Ok(None)` when there is no row (or it names
-/// a type Magpie does not keep), an error when the row could not be read.
-async fn row_file(core: &Core, user_id: i64) -> Result<Option<String>, DbError> {
-    let row = meta(core, user_id).await?;
-    Ok(row.and_then(|(id, mime)| Some(file_name(&id, Kind::from_mime(&mime)?))))
+/// The files the user's row accounts for: an empty list when there is no row,
+/// an error when the row could not be read.
+async fn row_files(core: &Core, user_id: i64) -> Result<Vec<String>, DbError> {
+    Ok(meta(core, user_id)
+        .await?
+        .map(|row| row.file_names())
+        .unwrap_or_default())
 }
 
-/// The user's row: id and mime type.
-async fn meta(core: &Core, user_id: i64) -> Result<Option<(String, String)>, DbError> {
-    db::interact(&core.db, move |c| {
-        c.query_row(
-            "SELECT id, mime FROM backgrounds WHERE user_id = ?1",
-            params![user_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()
-    })
-    .await
+/// The user's row.
+async fn meta(core: &Core, user_id: i64) -> Result<Option<Row>, DbError> {
+    db::interact(&core.db, move |c| row_in(c, user_id)).await
 }
 
 /// Writes `data` to `dir/name` so that the name never holds half a file: a
@@ -398,9 +526,9 @@ async fn write_atomically(dir: &Path, name: &str, data: &[u8]) -> io::Result<()>
     written
 }
 
-/// Removes everything in `dir` but the file `keep`. Failures are logged: a
+/// Removes everything in `dir` but the files `keep`. Failures are logged: a
 /// file that stays is found by the next sweep.
-async fn prune(dir: &Path, keep: &str) {
+async fn prune(dir: &Path, keep: &[String]) {
     let mut entries = match tokio::fs::read_dir(dir).await {
         Ok(entries) => entries,
         Err(err) => {
@@ -411,7 +539,7 @@ async fn prune(dir: &Path, keep: &str) {
         }
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
-        if entry.file_name() == keep {
+        if keep.iter().any(|name| entry.file_name() == name.as_str()) {
             continue;
         }
         let path = entry.path();

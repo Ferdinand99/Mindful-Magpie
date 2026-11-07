@@ -67,8 +67,10 @@ pub async fn load(core: &Core, user_id: i64) -> Result<Layout, StoreError> {
 /// the empty default at the stored version (so a save over the broken
 /// document is accepted), and `true` for "it was unreadable".
 ///
-/// A picture background that is not the user's current picture (it was
-/// replaced by an upload, or removed) is shown as the default preset: nobody
+/// A picture background that is not one of the user's pictures (the current one,
+/// or the kept one the stored layout used before the latest upload; it was
+/// removed, or replaced by an upload while the layout used another) is shown as
+/// the default preset: nobody
 /// who reads the layout (the page, the extension) sees a dead picture. The
 /// stored document and the version are left as they are, so what is saved over
 /// it carries the version it was loaded at, as always.
@@ -78,7 +80,8 @@ pub async fn load_or_default(core: &Core, user_id: i64) -> Result<(Layout, bool)
         let id = id.clone();
         let own: bool = db::interact(&core.db, move |c| {
             c.query_row(
-                "SELECT EXISTS (SELECT 1 FROM backgrounds WHERE user_id = ?1 AND id = ?2)",
+                "SELECT EXISTS (SELECT 1 FROM backgrounds
+                                WHERE user_id = ?1 AND (id = ?2 OR kept_id = ?2))",
                 params![user_id, id],
                 |r| r.get(0),
             )
@@ -122,9 +125,10 @@ enum Outcome {
 /// version (0 when nothing is stored), and returns the new version. The read,
 /// the comparison and the write happen in one transaction.
 ///
-/// An image background must be the picture the user has uploaded: [`validate`]
-/// checks the shape of the id, and the transaction checks it against the
-/// user's row, so a picture removed or replaced in between is never saved.
+/// An image background must be a picture the user has uploaded (the current or
+/// the kept one): [`validate`] checks the shape of the id, and the transaction
+/// checks it against the user's row, so a picture removed or replaced in
+/// between is never saved.
 /// That is a `bad_image` on `background.id`, before the version is looked at.
 pub async fn save(core: &Core, user_id: i64, layout: &Layout) -> Result<u64, SaveError> {
     validate(layout).map_err(SaveError::Invalid)?;
@@ -142,7 +146,8 @@ pub async fn save(core: &Core, user_id: i64, layout: &Layout) -> Result<u64, Sav
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(id) = image {
             let own: bool = tx.query_row(
-                "SELECT EXISTS (SELECT 1 FROM backgrounds WHERE user_id = ?1 AND id = ?2)",
+                "SELECT EXISTS (SELECT 1 FROM backgrounds
+                                WHERE user_id = ?1 AND (id = ?2 OR kept_id = ?2))",
                 params![user_id, id],
                 |r| r.get(0),
             )?;
