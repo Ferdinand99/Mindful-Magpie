@@ -112,12 +112,12 @@ export const LABEL_KEYS = [
   "bg_err_type",
   "bg_err_failed",
   "bg_gone",
-  "bg_gone_toast",
   // The next three are used by start.js (the notice for a kept draft), not by
   // edit.js: they are listed here so that one list covers every string.
   "restore_notice",
   "restore_yes",
   "restore_discard",
+  "restore_stale",
   "conflict",
   "reload",
   "save_failed",
@@ -425,8 +425,10 @@ export function startEditing(root, getLayout, save, opts = {}) {
     if (at < 0) return options;
     if (at > 0) options.push({ key: "up", label: L("move_up") });
     if (at < list.length - 1) options.push({ key: "down", label: L("move_down") });
-    if (at > 0) options.push({ key: "first", label: L("move_first") });
-    if (at < list.length - 1) options.push({ key: "last", label: L("move_last") });
+    // "Up" and "down" cover the first and last places; "first" and "last" are
+    // for a longer way, so they are offered only when they differ from those.
+    if (at > 1) options.push({ key: "first", label: L("move_first") });
+    if (at < list.length - 2) options.push({ key: "last", label: L("move_last") });
     return options;
   }
 
@@ -1110,7 +1112,9 @@ export function startEditing(root, getLayout, save, opts = {}) {
    * - The picture uploaded in this session goes unless `layout` uses it.
    * - After a save (`saved`), the picture the stored layout had goes too, unless
    *   the saved layout still uses it (it was removed in the draft).
-   * - A cancelled edit does not touch the picture the stored layout uses.
+   * - A cancelled edit does not touch the picture the stored layout uses. (The
+   *   server keeps that picture when an upload comes, and gives it back as the
+   *   current one when the upload is removed, so a Cancel leaves the page as it was.)
    */
   function cleanupPictures(layout, saved) {
     if (!background) return;
@@ -1122,20 +1126,6 @@ export function startEditing(root, getLayout, save, opts = {}) {
     for (const id of ids) {
       if (id !== used) background.remove(id).catch(() => {});
     }
-  }
-
-  /**
-   * The layout to draw when edit mode ends without a save. An upload replaced
-   * the stored layout's picture on the server, so that picture is gone: draw the
-   * default preset (a reload does the same, the server shows it so), not a dead
-   * background.
-   */
-  function shownAfterCancel(layout) {
-    const wanted = layout?.background;
-    if (uploadedId !== null && wanted?.kind === "image" && wanted.id !== uploadedId) {
-      return { ...layout, background: DEFAULT_PRESET };
-    }
-    return layout;
   }
 
   // -- actions --
@@ -1206,8 +1196,10 @@ export function startEditing(root, getLayout, save, opts = {}) {
       cancel();
     } else if (act === "reload") {
       // Off with the page guards first: the draft is given up, and the browser
-      // must not ask a second time.
+      // must not ask a second time. A kept copy of the draft (a restored one)
+      // goes too, or it would be offered again after the reload, and conflict again.
       finish(getLayout(), { focus: false });
+      onDiscard();
       reload();
     } else if (kind === "group") {
       const group = draft.groups.find((g) => g.id === id);
@@ -1377,9 +1369,7 @@ export function startEditing(root, getLayout, save, opts = {}) {
   function finish(layout, { focus = true, settle = true, saved = false } = {}) {
     if (!active) return;
     teardown();
-    const shown = settle && !saved ? shownAfterCancel(layout) : layout;
-    render(root, shown, { lang, labels: ui.labels });
-    if (shown !== layout) win.VV?.toast?.(L("bg_gone_toast"), "info");
+    render(root, layout, { lang, labels: ui.labels });
     if (settle) cleanupPictures(layout, saved);
     if (focus && editButton) editButton.focus();
   }

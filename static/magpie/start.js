@@ -332,6 +332,13 @@ export function initEditing(doc, deps = {}) {
     const notice = make("section", { class: "glass mm-notice", id: "mm-restore" });
     const message = make("div", {});
     message.appendChild(make("p", {}, labels.restore_notice));
+    // A draft kept at another version than the page has now would give a
+    // conflict when it is saved: still offered (it is the person's work), with a
+    // note saying so.
+    const pageVersion = readJson(doc, "mm-layout")?.version;
+    if (pageVersion !== kept.version && typeof labels.restore_stale === "string") {
+      message.appendChild(make("p", { class: "help" }, labels.restore_stale));
+    }
     const actions = make("div", { class: "mm-notice-actions" });
     const restore = make("button", { type: "button", class: "btn btn-primary" }, labels.restore_yes ?? "");
     const forget = make("button", { type: "button", class: "btn btn-secondary" }, labels.restore_discard ?? "");
@@ -379,34 +386,47 @@ export function initEditing(doc, deps = {}) {
   };
 }
 
-if (typeof document !== "undefined") {
-  const editing = initEditing(document);
+/**
+ * Wires a page: edit mode, the first draw and what htmx does to the body. Returns
+ * `{ editing, start }`; `start()` draws the page (call it when the document is
+ * ready). `deps` goes to `initEditing` and `reloadIfDataLost` (tests give it a
+ * clock, a storage and a `reload`).
+ *
+ * The start page asks htmx not to keep a snapshot of it (hx-history="false" on
+ * #groups): it holds one person's layout and htmx's cache outlives a sign-out in
+ * the same tab. Back to the page fetches it from the server (for whoever is
+ * signed in now); the draft kept by a dirty Back is in `initEditing`.
+ *
+ * A body htmx swaps in has no data blocks (see `reloadIfDataLost`): the page is
+ * reloaded in full.
+ */
+export function wirePage(doc, deps = {}) {
+  const editing = initEditing(doc, deps);
   const start = () => {
     // A start page with its data takes off the mark of an earlier reload.
-    reloadIfDataLost(document);
-    draw(document);
+    reloadIfDataLost(doc, deps);
+    draw(doc);
     editing.offerRestore();
   };
+  doc.addEventListener("htmx:afterSettle", () => {
+    if (reloadIfDataLost(doc, deps)) return;
+    editing.check();
+    drawIfNeeded(doc);
+    editing.offerRestore();
+  });
+  doc.addEventListener("htmx:historyRestore", () => {
+    if (reloadIfDataLost(doc, deps)) return;
+    drawIfNeeded(doc);
+    editing.offerRestore();
+  });
+  return { editing, start };
+}
+
+if (typeof document !== "undefined") {
+  const { start } = wirePage(document);
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", start);
   } else {
     start();
   }
-  // The start page asks htmx not to keep a snapshot of it (hx-history="false"
-  // on #groups): it holds one person's layout and htmx's cache outlives a
-  // sign-out in the same tab. Back to the page fetches it from the server (for
-  // whoever is signed in now); the draft kept by a dirty Back is in initEditing.
-  //
-  // A body htmx swaps in has no data blocks (see reloadIfDataLost): reload.
-  document.addEventListener("htmx:afterSettle", () => {
-    if (reloadIfDataLost(document)) return;
-    editing.check();
-    drawIfNeeded(document);
-    editing.offerRestore();
-  });
-  document.addEventListener("htmx:historyRestore", () => {
-    if (reloadIfDataLost(document)) return;
-    drawIfNeeded(document);
-    editing.offerRestore();
-  });
 }

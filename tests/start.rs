@@ -145,12 +145,17 @@ async fn boosted_navigation_loads_the_page_in_full() {
 }
 
 #[tokio::test]
-async fn boosted_navigation_from_the_start_page_is_not_reloaded() {
-    // The start page's head is already loaded when the request comes from `/`:
-    // the page is swapped in, with no redirect (that would reload it for nothing).
+async fn boosted_navigation_to_the_start_page_always_loads_it_in_full() {
+    // htmx drops the page's data blocks (they are scripts) from what it swaps
+    // in, so even from the start page itself a boosted request is answered with
+    // a redirect: the page is loaded in full, with its data.
     let app = App::new().await;
     let mut web = Web::new(&app, "ada", "admin").await;
-    for current in ["http://magpie.test:3010/", "http://magpie.test:3010/?x=1"] {
+    for current in [
+        "http://magpie.test:3010/",
+        "http://magpie.test:3010/?x=1",
+        "http://magpie.test:3010/settings/security",
+    ] {
         let req = Request::get("/")
             .header("hx-request", "true")
             .header("hx-boosted", "true")
@@ -159,27 +164,10 @@ async fn boosted_navigation_from_the_start_page_is_not_reloaded() {
             .unwrap();
         let res = web.send(req).await;
         assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-        assert_eq!(res.header("hx-redirect"), "", "redirected from {current}");
-        assert!(res.body.contains(r#"id="groups""#), "{}", res.body);
-        assert!(
-            res.header("vary").contains("HX-Boosted"),
-            "vary: {}",
-            res.header("vary")
-        );
+        assert_eq!(res.header("hx-redirect"), "/", "from {current}");
+        assert!(!res.body.contains(r#"id="groups""#), "{}", res.body);
+        assert_eq!(res.header("vary"), "HX-Boosted");
     }
-
-    // From any other page the redirect stays.
-    let req = Request::get("/")
-        .header("hx-request", "true")
-        .header("hx-boosted", "true")
-        .header(
-            "hx-current-url",
-            "http://magpie.test:3010/settings/security",
-        )
-        .body(Body::empty())
-        .unwrap();
-    let res = web.send(req).await;
-    assert_eq!(res.header("hx-redirect"), "/");
 }
 
 #[tokio::test]

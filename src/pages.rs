@@ -178,10 +178,10 @@ fn labels() -> BTreeMap<&'static str, &'static str> {
         "bg_err_type",
         "bg_err_failed",
         "bg_gone",
-        "bg_gone_toast",
         "restore_notice",
         "restore_yes",
         "restore_discard",
+        "restore_stale",
         "conflict",
         "reload",
         "save_failed",
@@ -234,19 +234,9 @@ fn clock_in(timezone: &str) -> (String, String) {
     (now.strftime("%H:%M").to_string(), date)
 }
 
-/// The answer to `/` depends on these request headers (a boosted request from
-/// another page gets a redirect), so a cache must not share it between them.
-const VARY: &str = "HX-Boosted, HX-Current-URL";
-
-/// Whether an htmx request comes from the start page itself (`HX-Current-URL`
-/// is the full address of the page that made the request).
-fn on_start_page(headers: &HeaderMap) -> bool {
-    headers
-        .get("hx-current-url")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| url::Url::parse(v).ok())
-        .is_some_and(|u| u.path() == "/")
-}
+/// The answer to `/` depends on this request header (a boosted request gets a
+/// redirect), so a cache must not share it between them.
+const VARY: &str = "HX-Boosted";
 
 async fn start(
     State(core): State<Core>,
@@ -254,13 +244,12 @@ async fn start(
     headers: HeaderMap,
     jar: SignedCookieJar,
 ) -> ApiResult<Response> {
-    // The page's stylesheet and clock script are linked from `<head>`, which a
+    // The page's stylesheet and scripts are linked from `<head>`, which a
     // boosted navigation (the Start link in the top bar and the tab bar) does
-    // not load, and htmx does not run scripts it swaps in. Reaching the page
-    // from another page that way makes the browser load it in full. From the
-    // start page itself (its head is already loaded) the boosted request just
-    // swaps in the fresh body: a redirect to `/` would reload it for nothing.
-    if headers.contains_key("hx-boosted") && !on_start_page(&headers) {
+    // not load, and htmx does not run scripts it swaps in (not even the page's
+    // data blocks). So a boosted request for the page, from wherever it is made,
+    // makes the browser load it in full.
+    if headers.contains_key("hx-boosted") {
         return Ok(([("hx-redirect", "/"), ("vary", VARY)], ()).into_response());
     }
     // A stored layout that cannot be read (it was changed outside Magpie)

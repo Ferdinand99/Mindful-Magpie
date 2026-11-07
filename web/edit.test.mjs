@@ -17,6 +17,7 @@ import {
   readStash,
   reloadIfDataLost,
   stashDraft,
+  wirePage,
 } from "../static/magpie/start.js";
 
 // The real English strings, so that the tests and the locale file cannot drift.
@@ -219,8 +220,9 @@ test("a_group_and_a_bookmark_can_be_moved_from_the_keyboard_too", async () => {
   const ed = t.start();
   click(act(item(t.root, "group", "g1"), "move"));
   let menu = sheet(t.document);
-  assert.deepEqual([...menu.querySelectorAll("button[data-move]")].map((b) => b.getAttribute("data-move")), ["down", "last"]);
-  click(menu.querySelector('[data-move="last"]'));
+  // Two groups: "down" is the last place already, so there is no "last".
+  assert.deepEqual([...menu.querySelectorAll("button[data-move]")].map((b) => b.getAttribute("data-move")), ["down"]);
+  click(menu.querySelector('[data-move="down"]'));
   await tick();
   assert.deepEqual(ed.draft().groups.map((g) => g.id), ["g2", "g1"]);
   assert.equal(t.focus.last.closest('[data-kind="group"]').getAttribute("data-id"), "g1");
@@ -1131,7 +1133,7 @@ test("a_hash_change_keeps_edit_mode_and_keeps_nothing", async () => {
   assert.equal(storage.map.size, 0);
 });
 
-test("a_failed_load_of_edit_mode_keeps_the_kept_draft", async () => {
+test("a_failed_load_of_edit_mode_keeps_the_kept_draft_and_a_second_try_works", async () => {
   const t = setup();
   const storage = fakeStorage();
   stashDraft(storage, keptDraft(), 7);
@@ -1139,9 +1141,12 @@ test("a_failed_load_of_edit_mode_keeps_the_kept_draft", async () => {
   const original = globalThis.console.error;
   globalThis.console.error = (...args) => errors.push(args);
   try {
+    let tries = 0;
     const editing = initEditing(t.document, {
       load: async () => {
-        throw new TypeError("Failed to fetch dynamically imported module");
+        tries += 1;
+        if (tries === 1) throw new TypeError("Failed to fetch dynamically imported module");
+        return { startEditing };
       },
       save: async () => ({ status: 200, body: { version: 4 } }),
       storage,
@@ -1153,13 +1158,15 @@ test("a_failed_load_of_edit_mode_keeps_the_kept_draft", async () => {
     assert.ok(readStash(storage, 7), "the draft survives");
     assert.ok(t.document.getElementById("mm-restore"), "and is still offered");
     assert.equal(t.root.hasAttribute("data-editing"), false);
-    // A second try works once the module loads.
-    const again = initEditing(t.document, {
-      load: async () => ({ startEditing }),
-      save: async () => ({ status: 200, body: { version: 4 } }),
-      storage,
-    });
-    void again;
+
+    // The module loads the second time: Restore works from the same notice.
+    click(t.document.querySelector("#mm-restore button"));
+    await tick();
+    assert.equal(tries, 2);
+    assert.ok(t.root.hasAttribute("data-editing"));
+    assert.equal(item(t.root, "card", "c1"), null, "the kept draft is on screen");
+    assert.equal(t.document.getElementById("mm-restore"), null);
+    assert.equal(errors.length, 1);
   } finally {
     globalThis.console.error = original;
   }
@@ -1686,10 +1693,10 @@ test("an_upload_that_finishes_after_cancel_is_taken_off_the_server_by_id", async
   assert.equal(t.root.hasAttribute("data-editing"), false);
 });
 
-test("cancel_after_an_upload_that_replaced_a_stored_picture_shows_hedgerow_and_says_so", async () => {
-  // The upload replaced the stored layout's picture on the server: that
-  // picture is gone. The page is not left with a dead background (a reload
-  // shows the same, the server serves the layout that way).
+test("cancel_after_an_upload_that_replaced_a_stored_picture_shows_the_old_picture_again", async () => {
+  // The server keeps the picture the stored layout uses when an upload comes,
+  // and gives it back when the upload is removed: after Cancel the page is as
+  // it was, picture and all.
   const toasts = [];
   const t = setup({ layout: withImage("old1") });
   t.window.VV = { toast: (message, kind) => toasts.push([message, kind]) };
@@ -1710,11 +1717,10 @@ test("cancel_after_an_upload_that_replaced_a_stored_picture_shows_hedgerow_and_s
   click(sheet(t.document).querySelector('[data-answer="yes"]'));
   await tick();
   assert.equal(ed.isActive(), false);
-  assert.equal(dataBg(t), "hedgerow", "no dead background");
-  assert.equal(toasts.length, 1);
-  assert.match(toasts[0][0], /back on Hedgerow/);
-  assert.deepEqual(bg.calls.remove, ["up1"]);
-  // The layout block was not touched: only a save writes it.
+  assert.equal(dataBg(t), "image", "the old picture is drawn again");
+  assert.match(t.document.documentElement.style.getPropertyValue("--mm-bg-image"), /old1/);
+  assert.equal(toasts.length, 0, "nothing was lost, so nothing to say");
+  assert.deepEqual(bg.calls.remove, ["up1"], "only the session's upload is asked to go");
   assert.equal(JSON.parse(t.document.getElementById("mm-layout").textContent).background.id, "old1");
 });
 
@@ -1841,4 +1847,153 @@ test("a_422_with_fields_of_an_unexpected_shape_does_not_break_the_editor", async
   assert.ok(t.root.hasAttribute("data-editing"), "still open, no exception");
   assert.equal(ed.isActive(), true);
   assert.ok(alertText(t.document).length > 0);
+});
+
+test("first_and_last_are_offered_only_when_up_and_down_do_not_reach_them", async () => {
+  const layout = layoutFixture();
+  layout.groups = ["a", "b", "c", "d"].map((id) => ({ id, title: id.toUpperCase(), cards: [] }));
+  const t = setup({ layout });
+  t.start();
+  const options = (id) => {
+    click(act(item(t.root, "group", id), "move"));
+    const found = [...sheet(t.document).querySelectorAll("button[data-move]")].map((b) => b.getAttribute("data-move"));
+    press(sheet(t.document), "Escape");
+    return found;
+  };
+  assert.deepEqual(options("a"), ["down", "last"]);
+  assert.deepEqual(options("b"), ["up", "down", "last"]);
+  assert.deepEqual(options("c"), ["up", "down", "first"]);
+  assert.deepEqual(options("d"), ["up", "first"]);
+  await tick();
+  // Three items: the only other places are one step away.
+  const three = layoutFixture();
+  three.bookmarks = ["x", "y", "z"].map((id) => ({ id, title: id, url: `https://${id}.example/` }));
+  const u = setup({ layout: three });
+  u.start();
+  click(act(item(u.root, "bookmark", "y"), "move"));
+  assert.deepEqual([...sheet(u.document).querySelectorAll("button[data-move]")].map((b) => b.getAttribute("data-move")), ["up", "down"]);
+});
+
+test("a_restored_draft_that_conflicts_is_not_offered_again_after_reload", async () => {
+  const t = setup();
+  const storage = fakeStorage();
+  // Kept at version 1, while the page is at version 3: it will conflict.
+  stashDraft(storage, { ...keptDraft(), version: 1 }, 7);
+  const first = wired(t, storage, async () => ({ status: 409, body: { error: "conflict", current: 3 } }));
+  first.offerRestore();
+  const notice = t.document.getElementById("mm-restore");
+  assert.match(notice.textContent, /The page has changed since – restoring may cause a conflict/, "the note is honest");
+  click(notice.querySelector("button"));
+  await tick();
+  click(act(bar(t.document), "done"));
+  await tick();
+  assert.match(alertText(t.document), /changed in another tab/);
+  assert.ok(readStash(storage, 7), "kept while the person decides");
+
+  // Reload gives the draft up, and the kept copy with it.
+  click(act(t.document.querySelector(".mm-edit-alert"), "reload"));
+  assert.equal(storage.map.size, 0, "the stash is cleared");
+
+  // The page after the reload does not offer it again.
+  const after = setup();
+  wired(after, storage).offerRestore();
+  assert.equal(after.document.getElementById("mm-restore"), null);
+});
+
+test("a_kept_draft_at_the_pages_own_version_is_offered_without_the_stale_note", () => {
+  const t = setup();
+  const storage = fakeStorage();
+  stashDraft(storage, { ...keptDraft(), version: 3 }, 7);
+  wired(t, storage).offerRestore();
+  const notice = t.document.getElementById("mm-restore");
+  assert.ok(notice);
+  assert.doesNotMatch(notice.textContent, /may cause a conflict/);
+  assert.equal(notice.querySelectorAll("p").length, 1);
+});
+
+// ---- the page wiring: what htmx does to the body ----------------------------
+
+function wiredPage(t, extra = {}) {
+  const reloads = [];
+  const storage = fakeStorage();
+  const page = wirePage(t.document, {
+    storage,
+    reload: () => reloads.push(1),
+    load: async () => ({ startEditing }),
+    save: async (next) => ({ status: 200, body: { version: next.version + 1 } }),
+    ...extra,
+  });
+  return { ...page, reloads, storage };
+}
+
+const fire = (t, type) => t.document.dispatchEvent(new t.window.Event(type, { bubbles: true }));
+
+test("htmx_afterSettle_on_a_body_without_data_blocks_reloads_and_draws_nothing", () => {
+  const t = setup();
+  const page = wiredPage(t);
+  page.start();
+  assert.ok(t.root.textContent.includes("Sonarr"));
+  // htmx swapped in a fresh start page body: no script blocks, #groups empty.
+  t.document.getElementById("mm-layout").remove();
+  t.document.getElementById("mm-labels").remove();
+  t.root.innerHTML = "";
+  fire(t, "htmx:afterSettle");
+  assert.equal(page.reloads.length, 1, "the page is loaded in full");
+  assert.equal(t.root.innerHTML, "", "nothing is drawn from the missing data");
+});
+
+test("htmx_historyRestore_on_a_body_without_data_blocks_reloads", () => {
+  const t = setup();
+  const page = wiredPage(t);
+  page.start();
+  t.document.getElementById("mm-layout").remove();
+  t.document.getElementById("mm-labels").remove();
+  t.document.documentElement.removeAttribute("data-bg");
+  fire(t, "htmx:historyRestore");
+  assert.equal(page.reloads.length, 1);
+  assert.equal(t.document.documentElement.hasAttribute("data-bg"), false, "not drawn empty over the page");
+});
+
+test("htmx_afterSettle_and_historyRestore_on_a_body_with_data_draw_it_and_offer_a_kept_draft", () => {
+  for (const type of ["htmx:afterSettle", "htmx:historyRestore"]) {
+    const t = setup();
+    const page = wiredPage(t);
+    stashDraft(page.storage, keptDraft(), 7);
+    t.root.innerHTML = "";
+    t.document.documentElement.removeAttribute("data-bg");
+    fire(t, type);
+    assert.equal(page.reloads.length, 0, type);
+    assert.ok(t.root.textContent.includes("Sonarr"), `${type}: drawn`);
+    assert.ok(t.document.documentElement.hasAttribute("data-bg"), `${type}: the background is back`);
+    assert.ok(t.document.getElementById("mm-restore"), `${type}: the kept draft is offered`);
+  }
+});
+
+test("htmx_afterSettle_on_another_page_cleans_up_and_does_not_reload", () => {
+  const t = setup();
+  const page = wiredPage(t);
+  page.start();
+  // A boosted visit to another page: the body is replaced, <html> keeps its data-bg.
+  t.document.body.innerHTML = "<main><h1>Settings</h1></main>";
+  fire(t, "htmx:afterSettle");
+  assert.equal(page.reloads.length, 0);
+  assert.equal(t.document.documentElement.hasAttribute("data-bg"), false, "the background goes with the page");
+});
+
+test("an_editor_whose_page_was_swapped_away_is_dropped_by_afterSettle", async () => {
+  const t = setup();
+  const page = wiredPage(t);
+  page.start();
+  click(t.document.getElementById("mm-edit"));
+  await tick();
+  assert.ok(t.root.hasAttribute("data-editing"));
+  // The body is replaced by a fresh start page (new #groups, with its data).
+  const fresh = t.document.createElement("section");
+  fresh.setAttribute("id", "groups");
+  fresh.setAttribute("class", "mm-root");
+  fresh.setAttribute("data-user", "7");
+  t.root.replaceWith(fresh);
+  fire(t, "htmx:afterSettle");
+  assert.ok(fresh.textContent.includes("Sonarr"), "the new body is drawn");
+  assert.equal(fresh.hasAttribute("data-editing"), false);
 });
