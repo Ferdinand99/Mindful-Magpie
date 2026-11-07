@@ -236,17 +236,27 @@ http_expected = "Use a status like 200, a range like 200-399, or a list like 200
 
 [kind]
 http = "Website"
+kk = "Keen Kestrel"
 
 [field]
 http_expected = "Expected status"
 http_expected_help = "Which answers count as working. Empty means 200-399."
 http_secret = "Token (optional)"
 http_secret_help = "Sent as Authorization: Bearer. Stored encrypted."
+kk_secret = "Read token"
+kk_secret_help = "Create a read token in Keen Kestrel under Settings → API tokens, scope «Read». Sent as Authorization: Bearer. Stored encrypted."
 
 [metric]
 http_status = "HTTP status"
 http_latency = "Response time (ms)"
 http_checked = "Last checked"
+kk_new_issues = "New issues"
+kk_regressed_issues = "Regressed issues"
+kk_unresolved_issues = "Unresolved issues"
+kk_crash_free = "Crash-free sessions"
+kk_visitors_today = "Visitors today"
+kk_app_users_today = "App users today"
+kk_newest_issue = "Newest issue"
 
 [fetch_err]
 config = "The settings can't be used"
@@ -259,7 +269,11 @@ too_large = "Response too large"
 invalid = "Unexpected answer"
 other = "The request failed"
 secret = "The secret can no longer be read - type it again"
+auth = "The key was refused"
+kk_too_old = "Requires Keen Kestrel 0.10 or newer"
 
 [need]
 http_down = "{name} is not answering"
 service_config = "{name} needs to be set up again"
+kk_regressed = "{count} regressions"
+kk_new = "{count} new issues"
