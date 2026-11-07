@@ -131,20 +131,35 @@ const DURATION_UNITS = [
   { seconds: 1, en: "s", nb: "s" },
 ];
 
-const formatters = new Map();
+// One cache per Intl constructor (keyed by the constructor itself), so a replaced Intl is not served
+// from an old entry.
+const formatterCaches = new WeakMap();
 
-/** A cached Intl formatter; a language tag the browser rejects gets its default language. */
+/** A formatter for `lang`, with a language the engine rejects retried in its default language, and an
+ * engine that rejects `signDisplay` retried without it. Null when nothing works (callers fall back to plain text). */
 function intl(Ctor, lang, options) {
-  const key = `${Ctor.name}|${lang ?? ""}|${JSON.stringify(options)}`;
-  let formatter = formatters.get(key);
-  if (!formatter) {
-    try {
-      formatter = new Ctor(lang || undefined, options);
-    } catch {
-      formatter = new Ctor(undefined, options);
-    }
-    formatters.set(key, formatter);
+  let cache = formatterCaches.get(Ctor);
+  if (!cache) {
+    cache = new Map();
+    formatterCaches.set(Ctor, cache);
   }
+  const key = `${lang ?? ""}|${JSON.stringify(options)}`;
+  if (cache.has(key)) return cache.get(key);
+  const { signDisplay, ...plain } = options;
+  const attempts = [options];
+  if (signDisplay !== undefined) attempts.push(plain);
+  let formatter = null;
+  outer: for (const opts of attempts) {
+    for (const tag of [lang || undefined, undefined]) {
+      try {
+        formatter = new Ctor(tag, opts);
+        break outer;
+      } catch {
+        // Try the next language, then the next option set.
+      }
+    }
+  }
+  cache.set(key, formatter);
   return formatter;
 }
 
@@ -172,9 +187,16 @@ function toMs(value) {
   return Math.abs(n) < 1e11 ? n * 1000 : n;
 }
 
-function formatNumber(n, lang, options) {
+/** `n` through Intl.NumberFormat; plain `String(n)` (plus `fallbackSuffix`) if the engine has nothing usable. */
+function formatNumber(n, lang, options, fallbackSuffix = "") {
   // signDisplay "negative": a tiny negative number reads 0, not -0.
-  return intl(Intl.NumberFormat, lang, { signDisplay: "negative", ...options }).format(n);
+  const formatter = intl(Intl.NumberFormat, lang, { signDisplay: "negative", ...options });
+  return formatter ? formatter.format(n) : `${n}${fallbackSuffix}`;
+}
+
+/** The minus sign the language uses ("-" in English, U+2212 in Norwegian). */
+function minusSign(lang) {
+  return formatNumber(-1, lang).replace(/\d.*$/, "") || "-";
 }
 
 function formatBytes(n, lang, suffix) {
@@ -183,7 +205,8 @@ function formatBytes(n, lang, suffix) {
   const top = BYTE_UNITS.length - 1;
   let unit = 0;
   while (unit < top && abs / 1024 ** (unit + 1) >= 1) unit += 1;
-  const digitsFor = (u, scaled) => (u === 0 || scaled >= 10 ? 0 : 1);
+  // The decimal is decided after rounding, so 9.97 KiB reads "10 KiB", not "10.0 KiB".
+  const digitsFor = (u, scaled) => (u === 0 || Math.round(scaled * 10) / 10 >= 10 ? 0 : 1);
   let scaled = abs / 1024 ** unit;
   let digits = digitsFor(unit, scaled);
   // 1023.97 KiB would show as 1,024 KiB: say 1.0 MiB.
@@ -201,15 +224,15 @@ function formatBytes(n, lang, suffix) {
 
 function formatPercent(n, lang) {
   const digits = Math.round(Math.abs(n) * 10) / 10 < 10 ? 1 : 0;
-  return formatNumber(n, lang, {
-    style: "unit",
-    unit: "percent",
-    minimumFractionDigits: digits,
-    maximumFractionDigits: digits,
-  });
+  return formatNumber(
+    n,
+    lang,
+    { style: "unit", unit: "percent", minimumFractionDigits: digits, maximumFractionDigits: digits },
+    "%",
+  );
 }
 
-/** Seconds as the two largest units that are not zero ("3 d 4 h"); "0 s" for none. */
+/** Seconds as the largest unit that is not zero and the next one if that is not zero either ("3 d 4 h", "1 d"); "0 s" for none. */
 function formatDuration(n, lang) {
   const letters = isNorwegian(lang) ? "nb" : "en";
   let rest = Math.round(Math.abs(n));
@@ -223,7 +246,7 @@ function formatDuration(n, lang) {
   const shown = [first, first + 1]
     .filter((i) => i < counts.length && counts[i] > 0)
     .map((i) => `${formatNumber(counts[i], lang)} ${DURATION_UNITS[i][letters]}`);
-  return (n < 0 ? "-" : "") + shown.join(" ");
+  return (n < 0 ? minusSign(lang) : "") + shown.join(" ");
 }
 
 /** "2 min. ago", "in 3 hr.", "now": the time from `thenMs` to `nowMs` in its biggest whole unit. */
@@ -236,7 +259,16 @@ function formatRelative(thenMs, nowMs, lang) {
   else if (abs >= 3600) [unit, size] = ["hour", 3600];
   else if (abs >= 60) [unit, size] = ["minute", 60];
   const count = abs < 5 ? 0 : Math.sign(seconds) * Math.floor(abs / size);
-  return intl(Intl.RelativeTimeFormat, lang, { numeric: "auto", style: "short" }).format(count, unit);
+  const formatter = intl(Intl.RelativeTimeFormat, lang, { numeric: "auto", style: "short" });
+  return formatter ? formatter.format(count, unit) : `${count} ${unit}`;
+}
+
+/** The moment a `since` value points at (ms), from its `num` (epoch seconds) or its `text` (ISO); else null. */
+function sinceMs(value) {
+  if (typeof value === "number") return toMs(value);
+  if (!value || typeof value !== "object") return typeof value === "string" ? toMs(value) : null;
+  if (typeof value.num === "number" && Number.isFinite(value.num)) return toMs(value.num);
+  return toMs(value.text);
 }
 
 /**
@@ -253,7 +285,7 @@ function formatRelative(thenMs, nowMs, lang) {
  *   percent        0-100 in; one decimal under 10 ("4.3%"), none from 10; not clamped
  *   bytes          binary units B, KiB, MiB, GiB, TiB ("1.5 GiB"); TiB is the top unit
  *   bytes_per_sec  the same with "/s" ("2.5 MiB/s")
- *   duration       seconds in; the two largest units ("3 d 4 h", nb "3 d 4 t")
+ *   duration       seconds in; the largest unit and the next one if not zero ("3 d 4 h", nb "3 d 4 t", "1 d")
  *   since          an ISO timestamp or epoch seconds, relative ("2 min. ago")
  *   text           as is
  *
@@ -277,7 +309,7 @@ export function formatValue(value, format, lang, now) {
     return finite ? formatNumber(num, lang, { maximumFractionDigits: 2 }) : DASH;
   }
   if (format === "since") {
-    const then = finite ? toMs(num) : toMs(str);
+    const then = sinceMs(value);
     return then === null ? fallback : formatRelative(then, toMs(now) ?? Date.now(), lang);
   }
   if (!finite) return fallback;
@@ -329,7 +361,8 @@ function isStale(fetchedMs, nowMs, intervalS) {
 
 /** The age line: "2 min. ago", or "Last updated 10 min. ago" once the value is stale. */
 function ageText(labels, lang, fetchedMs, nowMs, stale) {
-  const when = formatRelative(fetchedMs, nowMs, lang);
+  // A value fetched after `now` (clocks differ a little) is not "in 3 s": it is now.
+  const when = formatRelative(Math.min(fetchedMs, nowMs), nowMs, lang);
   const template = stale ? label(labels, "updated") : "";
   return template !== "" ? template.split("{when}").join(when) : when;
 }
@@ -338,8 +371,9 @@ function drawStatus(doc, labels, status) {
   const name = statusText(labels, status);
   const dot = make(doc, "span", "mm-status");
   dot.setAttribute("data-status", status);
-  dot.setAttribute("role", "img");
   if (name !== "") {
+    // Only a dot with a text is an image for a screen reader; without one it is decoration.
+    dot.setAttribute("role", "img");
     dot.setAttribute("aria-label", name);
     dot.setAttribute("title", name);
   }
@@ -351,6 +385,7 @@ function drawService(doc, el, ref, opts) {
   const labels = opts.labels;
   const svc = make(doc, "span", "mm-svc");
   el.setAttribute("data-service", String(ref.id));
+  el.setAttribute("data-metrics", JSON.stringify(ref.metrics));
 
   const service = opts.services.find((s) => isObject(s) && s.id === ref.id);
   if (!service) {
@@ -383,7 +418,8 @@ function drawService(doc, el, ref, opts) {
   for (const id of ref.metrics) {
     if (shown.length === 4) break;
     const metric = catalogue.find((m) => isObject(m) && m.id === id);
-    if (metric) shown.push(metric);
+    // A metric listed twice is drawn once.
+    if (metric && !shown.includes(metric)) shown.push(metric);
   }
   if (shown.length > 0) {
     const grid = make(doc, "span", "mm-metrics");
@@ -396,7 +432,13 @@ function drawService(doc, el, ref, opts) {
       // The cell truncates a long value; the title keeps all of it.
       cell.setAttribute("title", `${name}: ${value}`);
       cell.appendChild(isolated(doc, "span", "mm-metric-label", name));
-      cell.appendChild(isolated(doc, "span", "mm-metric-value", value));
+      const valueEl = isolated(doc, "span", "mm-metric-value", value);
+      if (metric.format === "since") {
+        // The text counts from `now`: keep the moment so that tickAges() can count on.
+        const then = sinceMs(stored[metric.id]);
+        if (then !== null) valueEl.setAttribute("data-since", String(then));
+      }
+      cell.appendChild(valueEl);
       grid.appendChild(cell);
     }
     svc.appendChild(grid);
@@ -412,8 +454,9 @@ function drawService(doc, el, ref, opts) {
 
 /**
  * Brings the ages on `root`'s bound cards up to date without drawing again:
- * rewrites each age line and sets or clears `data-stale` against `opts.now`
- * (epoch ms, epoch seconds or an ISO string; the wall clock by default).
+ * rewrites each age line and each `since` value, and sets or clears
+ * `data-stale`, against `opts.now` (epoch ms, epoch seconds or an ISO string;
+ * the wall clock by default).
  * `opts.lang` and `opts.labels` are the ones given to render(). The caller owns
  * the timer; the renderer has none.
  */
@@ -428,6 +471,15 @@ export function tickAges(root, opts = {}) {
     if (stale) el.setAttribute("data-stale", "");
     else el.removeAttribute("data-stale");
     age.textContent = ageText(labels, opts.lang, fetchedMs, nowMs, stale);
+  }
+  for (const valueEl of root.querySelectorAll(".mm-metric-value[data-since]")) {
+    const thenMs = Number(valueEl.getAttribute("data-since"));
+    if (!Number.isFinite(thenMs)) continue;
+    const shown = formatRelative(thenMs, nowMs, opts.lang);
+    valueEl.textContent = shown;
+    const cell = valueEl.parentNode;
+    const name = cell?.querySelector(".mm-metric-label")?.textContent ?? "";
+    cell?.setAttribute("title", `${name}: ${shown}`);
   }
 }
 
@@ -452,9 +504,68 @@ function drawCard(doc, card, opts) {
   el.appendChild(body);
   if (ref) {
     el.setAttribute("class", `${el.getAttribute("class")} mm-bound`);
+    // What updateValues() finds the card by.
+    if (typeof card.id === "string" && card.id !== "") el.setAttribute("data-card", card.id);
     el.appendChild(drawService(doc, el, ref, opts));
   }
   return el;
+}
+
+/**
+ * Brings the service part of every bound card up to date after new `opts.values`
+ * (or `opts.services`) without drawing the page again. Per card it replaces only
+ * `.mm-svc` and the `data-fetched`, `data-interval` and `data-stale` attributes;
+ * the card's own element, its tile and its text stay, so a focused link keeps
+ * focus. A card whose service or metrics changed is redrawn on its own (it loses
+ * focus). Plain cards are not touched.
+ *
+ * `layout` is the one given to the last render(); `opts` the same as for
+ * render(). Returns true when every bound card of the layout was found on the
+ * page and every bound card on the page is in the layout. False means the page
+ * and the layout differ in more than values (a card added, removed, bound or
+ * unbound): the caller should render() again, when it is safe to.
+ */
+export function updateValues(root, layout, opts = {}) {
+  const doc = root.ownerDocument;
+  const settings = {
+    lang: opts.lang,
+    labels: opts.labels ?? {},
+    imageBase: opts.imageBase,
+    services: opts.services,
+    values: opts.values,
+  };
+  const onPage = new Map();
+  for (const el of root.querySelectorAll(".mm-bound[data-card]")) {
+    onPage.set(el.getAttribute("data-card"), el);
+  }
+  const handled = new Set();
+  let complete = true;
+  for (const group of Array.isArray(layout?.groups) ? layout.groups : []) {
+    for (const card of Array.isArray(group?.cards) ? group.cards : []) {
+      if (!card || typeof card !== "object") continue;
+      const ref = Array.isArray(settings.services) ? serviceRef(card) : null;
+      if (!ref) continue;
+      const el = typeof card.id === "string" ? onPage.get(card.id) : undefined;
+      if (!el || handled.has(el)) {
+        complete = false;
+        continue;
+      }
+      handled.add(el);
+      if (
+        el.getAttribute("data-service") !== String(ref.id) ||
+        el.getAttribute("data-metrics") !== JSON.stringify(ref.metrics)
+      ) {
+        el.parentNode.replaceChild(drawCard(doc, card, settings), el);
+        continue;
+      }
+      for (const name of ["data-fetched", "data-interval", "data-stale"]) el.removeAttribute(name);
+      const old = el.querySelector(".mm-svc");
+      const fresh = drawService(doc, el, ref, settings);
+      if (old) el.replaceChild(fresh, old);
+      else el.appendChild(fresh);
+    }
+  }
+  return complete && handled.size === onPage.size;
 }
 
 function drawGroup(doc, group, opts) {
@@ -575,7 +686,9 @@ function applyBackground(doc, background, opts) {
  * age (`.mm-age`) and, older than three intervals, `data-stale`. The extra
  * labels: `service_missing`, `service_waiting`, `status_ok`, `status_warn`,
  * `status_bad`, `status_unknown` and `updated` (with `{when}`). tickAges()
- * keeps the ages current later; formatValue() is the number formatting.
+ * keeps the ages current later, updateValues() swaps new values in without
+ * touching the cards' own elements (so focus stays), and formatValue() is the
+ * number formatting.
  */
 export function render(root, layout, opts = {}) {
   const doc = root.ownerDocument;

@@ -14,9 +14,9 @@
   --text: light-dark(#1d1d1f, #f5f5f7);
   --muted: light-dark(#6e6e73, #a1a1a6);
   --brand: light-dark(#6656e8, #8b7dff);
-  --ok: light-dark(#34c759, #30d158);
-  --warn: light-dark(#ffcc00, #ffd60a);
-  --bad: light-dark(#ff3b30, #ff453a);
+  --ok-text: light-dark(#1f7a35, #30d158);
+  --warn-text: light-dark(#8f5000, #ffd60a);
+  --bad-text: light-dark(#d70015, #ff6961);
   --neutral: light-dark(#8e8e93, #8e8e93);
   --sp-1: 0.25rem;
   --sp-2: 0.5rem;

@@ -1,10 +1,11 @@
 // Tests for the service numbers on cards (static/magpie/render.js: formatValue, bound cards,
 // tickAges), run with `node --test` in web/. Fixture values stand in for the server's snapshots.
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { parseHTML } from "linkedom";
 
-import { formatValue, render, tickAges } from "../static/magpie/render.js";
+import { formatValue, render, tickAges, updateValues } from "../static/magpie/render.js";
 
 const LABELS_EN = {
   empty: "Your start page is empty.",
@@ -541,4 +542,311 @@ test("odd_values_and_services_do_not_throw", () => {
       assert.ok(p.root.querySelector(".mm-card"));
     }
   }
+});
+
+// ---- fix round 1 ----
+
+test("bytes_decide_the_decimal_after_rounding", () => {
+  assert.equal(formatValue(num(10209), "bytes", "en"), "10 KiB", "9.97 KiB rounds to 10");
+  assert.equal(formatValue(num(10 * 1024 - 1), "bytes", "en"), "10 KiB");
+  assert.equal(formatValue(num(10 * 1024 - 100), "bytes", "en"), "9.9 KiB");
+  assert.equal(formatValue(num(1024 ** 3 * 9.96), "bytes", "en"), "10 GiB");
+  assert.equal(formatValue(num(1024 ** 2 - 1), "bytes", "en"), "1.0 MiB");
+});
+
+test("one_minus_sign_everywhere_the_one_intl_uses", () => {
+  assert.equal(formatValue(num(-90), "duration", "en"), "-1 min 30 s");
+  assert.equal(formatValue(num(-90), "duration", "nb"), "−1 min 30 s");
+  assert.equal(formatValue(num(-1536), "bytes", "nb"), "−1,5 KiB");
+  assert.equal(formatValue(num(-42), "number", "nb"), "−42");
+  assert.equal(formatValue(num(-0.2), "duration", "nb"), "0 s", "no sign on zero");
+});
+
+test("a_rejected_signdisplay_or_a_missing_intl_never_throws", () => {
+  const Real = Intl.NumberFormat;
+  try {
+    // An engine without signDisplay: the number still gets its grouping.
+    Intl.NumberFormat = class {
+      constructor(lang, options) {
+        if (options?.signDisplay) throw new RangeError("signDisplay is not supported");
+        return new Real(lang, options);
+      }
+    };
+    assert.equal(formatValue(num(1234.5), "number", "en"), "1,234.5");
+    assert.equal(formatValue(num(1536), "bytes", "en"), "1.5 KiB");
+    assert.equal(formatValue(num(4.25), "percent", "en"), "4.3%");
+    // An engine with nothing usable: plain text, no throw.
+    Intl.NumberFormat = class {
+      constructor() {
+        throw new RangeError("no Intl");
+      }
+    };
+    assert.equal(formatValue(num(1234.5), "number", "en"), "1234.5");
+    assert.equal(formatValue(num(4.25), "percent", "en"), "4.25%");
+    assert.equal(formatValue(num(90), "duration", "en"), "1 min 30 s");
+    assert.equal(formatValue(num(1536), "bytes", "en"), "1.5 KiB");
+  } finally {
+    Intl.NumberFormat = Real;
+  }
+  assert.equal(formatValue(num(1234.5), "number", "en"), "1,234.5");
+});
+
+test("a_value_fetched_after_now_reads_as_now_and_never_stale", () => {
+  const entry = snapshot({ fetched_at: new Date(NOW_MS + 4000).toISOString() });
+  const { card } = draw(bound(["cpu"]), { values: valuesDoc(entry) });
+  assert.match(card.querySelector(".mm-age").textContent, /now/);
+  assert.doesNotMatch(card.querySelector(".mm-age").textContent, /in \d/);
+  assert.equal(card.hasAttribute("data-stale"), false);
+});
+
+test("a_metric_listed_twice_is_drawn_once", () => {
+  const { card } = draw(bound(["cpu", "cpu", "mem", "cpu"]));
+  assert.deepEqual(
+    cells(card).map(([label]) => label),
+    ["CPU", "Memory"],
+  );
+});
+
+test("a_dot_without_a_text_is_not_an_image", () => {
+  const labels = { ...LABELS_EN };
+  for (const key of ["status_ok", "status_warn", "status_bad", "status_unknown"]) delete labels[key];
+  const { card } = draw(bound(["cpu"]), { labels });
+  const dot = card.querySelector(".mm-status");
+  assert.equal(dot.getAttribute("role"), null);
+  assert.equal(dot.getAttribute("aria-label"), null);
+  assert.equal(dot.getAttribute("data-status"), "ok");
+});
+
+test("since_cells_count_on_with_tick_ages", () => {
+  const { root, card } = draw(bound(["seen"]));
+  const value = card.querySelector(".mm-metric-value");
+  assert.equal(value.getAttribute("data-since"), String(NOW_MS - 120000));
+  assert.match(value.textContent, /2 min/);
+  tickAges(root, { ...EN, now: NOW_MS + 3600 * 1000 });
+  assert.match(value.textContent, /1 hr|1 h/);
+  assert.match(card.querySelector(".mm-metric").getAttribute("title"), /^Seen: .*(1 hr|1 h)/);
+  // Norwegian, from the epoch-seconds form.
+  const fresh = draw(
+    bound(["seen"]),
+    { values: valuesDoc(snapshot({ values: { seen: { num: NOW_MS / 1000 - 600, text: null } } })) },
+    NB,
+  );
+  const nbValue = fresh.card.querySelector(".mm-metric-value");
+  assert.match(nbValue.textContent, /for 10 min.* siden/);
+  tickAges(fresh.root, { ...NB, now: NOW_MS + 60 * 60 * 1000 });
+  assert.match(nbValue.textContent, /for 1 t/);
+  // Other values have no data-since.
+  assert.equal(draw(bound(["cpu"])).card.querySelector("[data-since]"), null);
+  // A since value that cannot be read gets none either.
+  const bad = draw(bound(["seen"]), {
+    values: valuesDoc(snapshot({ values: { seen: { num: null, text: "later" } } })),
+  });
+  assert.equal(bad.card.querySelector("[data-since]"), null);
+  assert.equal(bad.card.querySelector(".mm-metric-value").textContent, "later");
+});
+
+// ---- updateValues ----
+
+function twoCards() {
+  return {
+    version: 1,
+    background: { kind: "preset", name: "hedgerow" },
+    groups: [
+      {
+        id: "g1",
+        title: "Home",
+        cards: [
+          bound(["cpu", "mem"]),
+          {
+            id: "plain",
+            title: "Plain",
+            description: "",
+            url: "https://p.example/",
+            icon: { emoji: null, colour: "teal" },
+          },
+          bound(["note"], { id: "c2", title: "Second" }),
+        ],
+      },
+    ],
+    bookmarks: [],
+  };
+}
+
+test("update_values_keeps_the_card_element_and_swaps_the_numbers", () => {
+  const p = page();
+  const layout = twoCards();
+  render(p.root, layout, { ...EN, services: SERVICES, values: valuesDoc() });
+  const [link, plain, second] = p.root.querySelectorAll(".mm-card");
+  const tile = link.querySelector(".mm-tile");
+  const body = link.querySelector(".mm-card-text");
+  const oldSvc = link.querySelector(".mm-svc");
+  assert.equal(link.hasAttribute("data-stale"), false);
+  assert.equal(cells(link)[0][1], "4.3%");
+
+  const calls = [];
+  for (const el of [link, plain, second, tile, body]) el.focus = () => calls.push("focus");
+  const later = {
+    now: new Date(NOW_MS + 3600 * 1000).toISOString(),
+    services: {
+      7: snapshot({
+        values: { cpu: { num: 55, text: null }, mem: { num: 1024, text: null } },
+        fetched_at: new Date(NOW_MS + 3570 * 1000).toISOString(),
+      }),
+    },
+  };
+  assert.equal(updateValues(p.root, layout, { ...EN, services: SERVICES, values: later }), true);
+
+  const after = p.root.querySelectorAll(".mm-card");
+  assert.ok(after[0] === link, "the very same <a>");
+  assert.ok(after[1] === plain);
+  assert.ok(after[2] === second);
+  assert.equal(link.isConnected, true);
+  assert.ok(link.querySelector(".mm-tile") === tile);
+  assert.ok(link.querySelector(".mm-card-text") === body);
+  assert.ok(link.querySelector(".mm-svc") !== oldSvc, "only the service part is new");
+  assert.equal(link.querySelectorAll(".mm-svc").length, 1);
+  assert.deepEqual(cells(link), [
+    ["CPU", "55%"],
+    ["Memory", "1.0 KiB"],
+  ]);
+  assert.equal(link.hasAttribute("data-stale"), false);
+  assert.equal(link.getAttribute("href"), "https://nas.example/");
+  assert.deepEqual(calls, [], "no focus call");
+});
+
+test("update_values_changes_staleness_both_ways", () => {
+  const p = page();
+  const layout = twoCards();
+  render(p.root, layout, { ...EN, services: SERVICES, values: valuesDoc() });
+  const link = p.root.querySelector(".mm-card");
+  assert.equal(link.hasAttribute("data-stale"), false);
+  const stale = valuesDoc(snapshot({ fetched_at: ago(1000) }));
+  assert.equal(updateValues(p.root, layout, { ...EN, services: SERVICES, values: stale }), true);
+  assert.equal(link.hasAttribute("data-stale"), true);
+  assert.match(link.querySelector(".mm-age").textContent, /^Last updated /);
+  assert.equal(updateValues(p.root, layout, { ...EN, services: SERVICES, values: valuesDoc() }), true);
+  assert.equal(link.hasAttribute("data-stale"), false);
+  assert.equal(link.getAttribute("data-fetched"), String((NOW_MS - 120000) / 1000));
+});
+
+test("update_values_handles_waiting_and_a_vanished_service_in_place", () => {
+  const p = page();
+  const layout = twoCards();
+  render(p.root, layout, { ...EN, services: SERVICES, values: valuesDoc() });
+  const link = p.root.querySelector(".mm-card");
+  updateValues(p.root, layout, { ...EN, services: SERVICES, values: { now: NOW, services: {} } });
+  assert.ok(p.root.querySelector(".mm-card") === link);
+  assert.equal(link.querySelector(".mm-svc-notice").textContent, "Waiting for the first answer");
+  assert.equal(link.hasAttribute("data-fetched"), false);
+  updateValues(p.root, layout, { ...EN, services: [], values: valuesDoc() });
+  assert.ok(p.root.querySelector(".mm-card") === link);
+  assert.equal(link.querySelector(".mm-svc-notice").textContent, "This service no longer exists");
+  assert.equal(link.getAttribute("href"), "https://nas.example/");
+});
+
+test("update_values_redraws_only_a_card_whose_binding_changed", () => {
+  const p = page();
+  const layout = twoCards();
+  render(p.root, layout, { ...EN, services: SERVICES, values: valuesDoc() });
+  const [first, plain, second] = p.root.querySelectorAll(".mm-card");
+  layout.groups[0].cards[0] = bound(["up"]);
+  assert.equal(updateValues(p.root, layout, { ...EN, services: SERVICES, values: valuesDoc() }), true);
+  const after = p.root.querySelectorAll(".mm-card");
+  assert.ok(after[0] !== first, "that card is a new element");
+  assert.ok(after[1] === plain);
+  assert.ok(after[2] === second, "the others stay");
+  assert.deepEqual(cells(after[0]), [["Uptime", "3 d 4 h"]]);
+});
+
+test("update_values_says_when_the_page_needs_a_full_render", () => {
+  const p = page();
+  const layout = twoCards();
+  const opts = { ...EN, services: SERVICES, values: valuesDoc() };
+  render(p.root, layout, opts);
+  // A bound card the page does not have (added in the layout).
+  const added = structuredClone(layout);
+  added.groups[0].cards.push(bound(["cpu"], { id: "new" }));
+  assert.equal(updateValues(p.root, added, opts), false);
+  // A bound card on the page that the layout no longer binds.
+  const unbound = structuredClone(layout);
+  unbound.groups[0].cards[0].service = null;
+  assert.equal(updateValues(p.root, unbound, opts), false);
+  // No services list: nothing to draw, nothing to update.
+  assert.equal(updateValues(p.root, layout, { ...EN, values: valuesDoc() }), false);
+  // A plain page is trivially complete and untouched.
+  const q = page();
+  render(q.root, plainLayout(undefined), EN);
+  assert.equal(updateValues(q.root, plainLayout(undefined), EN), true);
+  assert.equal(q.root.innerHTML, GOLDEN);
+});
+
+// ---- the look ----
+
+function cssBlock(css, selector) {
+  const start = css.indexOf(`${selector} {`);
+  assert.ok(start >= 0, `${selector} is in render.css`);
+  return css.slice(start, css.indexOf("}", start));
+}
+
+function channel(c) {
+  const v = c / 255;
+  return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+}
+function luminance([r, g, b]) {
+  return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b);
+}
+function contrast(a, b) {
+  const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+}
+const hex = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
+const over = (fg, alpha, bg) => fg.map((c, i) => Math.round(c * alpha + bg[i] * (1 - alpha)));
+
+test("status_colours_keep_three_to_one_on_the_glass_in_both_themes", () => {
+  const tokens = readFileSync(new URL("./kit-tokens.css", import.meta.url), "utf8");
+  const pair = (name) => {
+    const m = tokens.match(new RegExp(`^\\s*${name}: light-dark\\((#[0-9a-f]{6}), (#[0-9a-f]{6})\\);`, "m"));
+    assert.ok(m, `${name} is a light-dark pair in kit-tokens.css`);
+    return { light: hex(m[1]), dark: hex(m[2]) };
+  };
+  // The glass over the plainest and the lightest page: light = white 62% over the page, dark = the
+  // card colour 55% over the page. Plain white and a tinted page bracket the real backgrounds.
+  const white = hex("#ffffff");
+  const lightGlass = [white, over(white, 0.62, hex("#f5f5f7")), over(white, 0.62, hex("#e8e8ee"))];
+  const darkCard = hex("#1c1c1f");
+  const darkGlass = [over(darkCard, 0.55, hex("#0b0b0d")), over(darkCard, 0.55, hex("#2a2a3a")), darkCard];
+  for (const name of ["--ok-text", "--warn-text", "--bad-text", "--neutral"]) {
+    const { light, dark } = pair(name);
+    for (const bg of lightGlass) assert.ok(contrast(light, bg) >= 3, `${name} light ${contrast(light, bg).toFixed(2)}`);
+    for (const bg of darkGlass) assert.ok(contrast(dark, bg) >= 3, `${name} dark ${contrast(dark, bg).toFixed(2)}`);
+  }
+  // The yellow the dot used before would not have.
+  assert.ok(contrast(hex("#ffcc00"), lightGlass[1]) < 2);
+  // Labels, the age line and stale values use --muted: 4.5:1.
+  const { light, dark } = pair("--muted");
+  for (const bg of lightGlass) assert.ok(contrast(light, bg) >= 4.5, `muted light ${contrast(light, bg).toFixed(2)}`);
+  for (const bg of darkGlass) assert.ok(contrast(dark, bg) >= 4.5, `muted dark ${contrast(dark, bg).toFixed(2)}`);
+});
+
+test("the_status_dot_has_a_different_shape_for_every_state", () => {
+  const css = readFileSync(new URL("../static/magpie/render.css", import.meta.url), "utf8");
+  const ok = cssBlock(css, ".mm-status");
+  const warn = cssBlock(css, '.mm-status[data-status="warn"]');
+  const bad = cssBlock(css, '.mm-status[data-status="bad"]');
+  const unknown = cssBlock(css, '.mm-status[data-status="unknown"]');
+  assert.match(ok, /border-radius: 50%/);
+  assert.match(warn, /clip-path: polygon/);
+  assert.doesNotMatch(bad, /50%|clip-path/);
+  assert.match(bad, /border-radius: 2px/);
+  assert.match(unknown, /box-shadow: inset/);
+  assert.match(unknown, /background: transparent/);
+});
+
+test("a_bound_card_is_a_grid_so_the_text_keeps_the_tile_row", () => {
+  const css = readFileSync(new URL("../static/magpie/render.css", import.meta.url), "utf8");
+  const card = cssBlock(css, ".mm-card.mm-bound");
+  assert.match(card, /display: grid/);
+  assert.match(card, /grid-template-columns: auto minmax\(0, 1fr\)/);
+  assert.doesNotMatch(card, /flex-wrap/);
+  assert.match(cssBlock(css, ".mm-svc"), /grid-column: 1 \/ -1/);
 });
