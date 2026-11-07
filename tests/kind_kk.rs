@@ -28,6 +28,8 @@ const TOKEN: &str = "kk-read-token-8f3a91c2d7";
 
 /// What the stub saw and what it answers.
 struct Stub {
+    /// The path the stub lives under (`/stub-N`), taken off every request.
+    prefix: String,
     status: StatusCode,
     body: String,
     hits: AtomicUsize,
@@ -40,7 +42,10 @@ type Shared = Arc<Stub>;
 async fn answer(State(stub): State<Shared>, uri: Uri, headers: HeaderMap) -> Response {
     stub.hits.fetch_add(1, Ordering::SeqCst);
     stub.seen.lock().unwrap().push((
-        uri.path().to_string(),
+        uri.path()
+            .strip_prefix(&stub.prefix)
+            .unwrap_or_else(|| uri.path())
+            .to_string(),
         uri.query().unwrap_or("").to_string(),
     ));
     stub.auth.lock().unwrap().push(
@@ -58,10 +63,15 @@ async fn answer(State(stub): State<Shared>, uri: Uri, headers: HeaderMap) -> Res
         .into_response()
 }
 
+// Each stub lives under a path of its own (`/stub-N`), so no address is ever
+// the same as an earlier test's: the kinds remember a 404 and the like per
+// address, and the operating system hands a freed port to a later stub.
 /// Serves `body` with `status` for any path. Returns the base address and the
 /// stub's record.
 async fn serve(status: u16, body: impl Into<String>) -> (String, Shared) {
+    static N: AtomicUsize = AtomicUsize::new(0);
     let stub = Arc::new(Stub {
+        prefix: format!("/stub-{}", N.fetch_add(1, Ordering::Relaxed)),
         status: StatusCode::from_u16(status).unwrap(),
         body: body.into(),
         hits: AtomicUsize::new(0),
@@ -77,7 +87,7 @@ async fn serve(status: u16, body: impl Into<String>) -> (String, Shared) {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (format!("http://{addr}"), stub)
+    (format!("http://{addr}{}", stub.prefix), stub)
 }
 
 fn ctx(url: &str, secret: Option<&str>) -> FetchCtx {
@@ -854,41 +864,46 @@ async fn the_newest_issues_are_listed_newest_first_with_project_level_and_age() 
 }
 
 #[tokio::test]
-async fn the_facts_of_today_follow_the_totals() {
+async fn the_numbers_of_the_summary_are_not_repeated_in_a_block() {
+    // The totals are the card's metrics; with no issue anywhere there is
+    // nothing for a block to say.
     let (url, _) = serve(200, summary(totals(0, 0, 4), vec![])).await;
-    let blocks = stored(fetch(&url, Some(TOKEN)).await.unwrap());
-    let Some(Block::Facts { title_key, rows }) =
-        blocks.iter().find(|b| matches!(b, Block::Facts { .. }))
-    else {
-        panic!("facts: {blocks:?}")
-    };
-    assert_eq!(title_key, "kk_today");
-    let pairs: Vec<(&str, &str)> = rows
-        .iter()
-        .map(|r| (r.label_key.as_deref().unwrap(), r.value.as_str()))
-        .collect();
-    assert_eq!(
-        pairs,
-        [
-            ("kk_visitors_today", "120"),
-            ("kk_app_users_today", "33"),
-            ("kk_crash_free", "99.5 %"),
-        ]
-    );
-    // No issue anywhere: no list.
-    assert!(list(&blocks, "kk_newest_issues").is_none());
+    let snapshot = fetch(&url, Some(TOKEN)).await.unwrap();
+    assert_eq!(num(&snapshot, "visitors_today"), Some(120.0));
+    assert!(stored(snapshot).is_empty());
+}
 
-    // Totals that are null leave their rows out; none left, no block.
+#[tokio::test]
+async fn issues_are_ordered_by_their_time_and_not_their_text() {
+    // Written as text, "2026-11-09 …" sorts before "2026-11-1…" only by luck;
+    // an RFC 3339 time with an offset shows the order is the time's.
     let body = summary(
-        json!({
-            "projects": 0, "new_issues": 0, "regressed_issues": 0, "unresolved_issues": 0,
-            "crash_free_sessions": null, "sessions": 0,
-            "visitors_today": null, "app_users_today": null,
-        }),
-        vec![],
+        totals(2, 0, 2),
+        vec![
+            named(1, "later", {
+                let mut i = issue_at(2, "Later in UTC", "error", 10);
+                i["first_seen"] = json!("2026-11-07T23:00:00-05:00");
+                i
+            }),
+            named(2, "earlier", {
+                let mut i = issue_at(3, "Earlier in UTC", "error", 10);
+                i["first_seen"] = json!("2026-11-08T01:00:00Z");
+                i
+            }),
+            named(3, "unreadable", {
+                let mut i = issue_at(4, "No time", "error", 10);
+                i["first_seen"] = json!("sometime");
+                i
+            }),
+        ],
     );
     let (url, _) = serve(200, body).await;
-    assert!(stored(fetch(&url, Some(TOKEN)).await.unwrap()).is_empty());
+    let blocks = stored(fetch(&url, Some(TOKEN)).await.unwrap());
+    let items = list(&blocks, "kk_newest_issues").expect("the list");
+    let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+    // 23:00 at -05:00 is 04:00 UTC the next day: after 01:00 UTC.
+    assert_eq!(texts, ["Later in UTC", "Earlier in UTC", "No time"]);
+    assert_eq!(items[2].right, None);
 }
 
 #[tokio::test]

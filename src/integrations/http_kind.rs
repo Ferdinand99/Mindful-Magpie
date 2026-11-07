@@ -6,9 +6,10 @@
 //! The service's secret, when it has one, is sent as `Authorization: Bearer`,
 //! and then a redirect to another origin is refused.
 //!
-//! **Details.** Facts of the last check (status, response time, when), and,
-//! for a stored service, the shortest, mean and longest response time of the
-//! last hour. The hour is a small window kept in memory per service (at most
+//! **Details.** For a stored service, the shortest, mean and longest response
+//! time of the last hour (the status, the response time and when it was
+//! checked are metrics already). The hour is a small window kept in memory per
+//! service (at most
 //! [`WINDOW_MAX`] answers; forgotten when the service is saved or tested, see
 //! [`api::on_forget`]) until history is kept in the database.
 
@@ -44,7 +45,7 @@ const WINDOW_FOR: SignedDuration = SignedDuration::from_hours(1);
 /// interval, makes 240 in an hour).
 pub const WINDOW_MAX: usize = 300;
 /// Most services whose window is kept; past that the one used longest ago goes.
-pub const MEMORY_MAX: usize = 64;
+pub const MEMORY_MAX: usize = 256;
 
 /// A service as the window knows it: its address (see [`api::service_prefix`])
 /// and its number.
@@ -187,44 +188,25 @@ fn fact(label_key: &str, value: String) -> Fact {
     }
 }
 
-/// The blocks of a check: its facts, and the last hour's range when the window
-/// holds at least two answers (one says nothing a range could).
-fn details(
-    code: Option<u16>,
-    latency_ms: Option<f64>,
-    at: Timestamp,
-    hour: Option<Range>,
-) -> Vec<Block> {
-    let mut rows = Vec::new();
-    if let Some(code) = code {
-        rows.push(fact("http_status", code.to_string()));
-    }
-    if let Some(ms) = latency_ms {
-        rows.push(fact("http_latency", format!("{ms:.0} ms")));
-    }
-    // UTC, in a form every language reads; the renderer does not know this
-    // text is a time.
-    rows.push(fact(
-        "http_checked",
-        at.strftime("%Y-%m-%d %H:%M UTC").to_string(),
-    ));
-    let mut blocks = vec![Block::Facts {
-        title_key: "http_last_check".to_string(),
-        rows,
-    }];
-    if let Some(hour) = hour.filter(|r| r.count >= 2) {
-        blocks.push(Block::Facts {
-            title_key: "http_last_hour".to_string(),
-            rows: vec![
-                fact(
-                    "http_latency_range",
-                    format!("{:.0} / {:.0} / {:.0} ms", hour.min, hour.mean, hour.max),
-                ),
-                fact("http_samples", hour.count.to_string()),
-            ],
-        });
-    }
-    blocks
+/// The block of the last hour's range: shortest, mean and longest response
+/// time, and how many answers the window holds. Nothing until it holds at
+/// least two answers (one says nothing a range could). The status, the
+/// response time and when it was checked are the card's metrics, so no block
+/// repeats them.
+fn details(hour: Option<Range>) -> Vec<Block> {
+    let Some(hour) = hour.filter(|r| r.count >= 2) else {
+        return Vec::new();
+    };
+    vec![Block::Facts {
+        title_key: "http_last_hour".to_string(),
+        rows: vec![
+            fact(
+                "http_latency_range",
+                format!("{:.0} / {:.0} / {:.0} ms", hour.min, hour.mean, hour.max),
+            ),
+            fact("http_samples", hour.count.to_string()),
+        ],
+    }]
 }
 
 /// `snapshot` with the `checked` metric: when the reading was taken, also when
@@ -326,8 +308,7 @@ impl Integration for HttpKind {
                     let hour = key
                         .as_ref()
                         .and_then(|key| window(key, snapshot.fetched_at, None));
-                    let blocks = details(None, None, snapshot.fetched_at, hour);
-                    return Ok(snapshot.with_details(blocks));
+                    return Ok(snapshot.with_details(details(hour)));
                 }
             };
             let code = response.status().as_u16();
@@ -351,8 +332,7 @@ impl Integration for HttpKind {
             let hour = key
                 .as_ref()
                 .and_then(|key| window(key, snapshot.fetched_at, Some(latency_ms)));
-            let blocks = details(Some(code), Some(latency_ms), snapshot.fetched_at, hour);
-            Ok(snapshot.with_details(blocks))
+            Ok(snapshot.with_details(details(hour)))
         })
     }
 }

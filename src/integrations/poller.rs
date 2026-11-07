@@ -332,6 +332,15 @@ struct Running {
     service: Service,
 }
 
+/// The address of a service as the kinds' memory keys it (see
+/// [`super::api::service_prefix`]); `None` when `url` is not an address.
+fn address_of(url: &str) -> Option<String> {
+    let url = url::Url::parse(url.trim()).ok()?;
+    url.origin()
+        .is_tuple()
+        .then(|| super::api::service_prefix(&url))
+}
+
 /// Whether a restart of the task would change nothing: the same kind, name,
 /// address, settings, interval and secret (a replaced secret changes
 /// `updated_at`).
@@ -472,10 +481,24 @@ impl Supervisor {
     }
 
     async fn remove(&mut self, id: i64) {
-        if let Some(task) = self.running.remove(&id) {
+        let removed = self.running.remove(&id);
+        if let Some(task) = &removed {
             task.abort.abort();
         }
         self.shared.forget(id);
+        // What the kinds remember of the address (a 404, the monitors that
+        // came back, a window of response times) goes with the last service
+        // there; while another one still polls the same address it is theirs.
+        if let Some(url) = removed
+            .as_ref()
+            .and_then(|task| task.service.url.as_deref())
+            && let Some(address) = address_of(url)
+            && !self.running.values().any(|other| {
+                other.service.url.as_deref().and_then(address_of) == Some(address.clone())
+            })
+        {
+            super::api::forget_all_for(url);
+        }
         // Normally the row went with the service already.
         let deleted = db::interact(&self.core.db, move |c| {
             c.execute(

@@ -18,9 +18,9 @@
 //! **Details.** The newest issue of each project becomes the list «Newest
 //! issues» (newest first; project name below the title, the level as the
 //! status dot, how long ago it was first seen at the right; no link, since
-//! this kind has no public address of the app), and today's visitors, app
-//! users and crash-free sessions become a block of facts. Titles and project
-//! names come from outside and go only into the blocks.
+//! this kind has no public address of the app). The numbers of the summary
+//! are the card's metrics, so no block repeats them. Titles and project names
+//! come from outside and go only into the blocks.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -29,8 +29,7 @@ use jiff::Timestamp;
 use serde_json::Value as Json;
 
 use super::api::{self, OldAddresses, Reply};
-use super::block::{Block, Fact, ListItem, MAX_ITEMS, TEXT_CHARS};
-use super::vv::{age_text, parse_time};
+use super::block::{Block, ListItem, MAX_ITEMS, TEXT_CHARS};
 use super::{
     BoxFuture, FetchCtx, FetchError, Field, FieldKind, Format, Integration, Level, MetricDef, Need,
     Snapshot, Status, Value,
@@ -129,10 +128,11 @@ fn level_status(level: &str) -> Option<Status> {
 }
 
 /// The list of each project's newest issue, newest first (the later
-/// `first_seen`, then the higher id). `None` when no project has one.
+/// `first_seen` by its time, not its text, then the higher id; one whose time
+/// can't be read goes last). `None` when no project has one.
 fn newest_issues(doc: &Json, now: Timestamp) -> Option<Block> {
     let projects = doc.get("projects")?.as_array()?;
-    let mut issues: Vec<(&str, i64, ListItem)> = projects
+    let mut issues: Vec<(Option<Timestamp>, i64, ListItem)> = projects
         .iter()
         .filter_map(|p| {
             let issue = p.get("newest_issue")?;
@@ -142,23 +142,28 @@ fn newest_issues(doc: &Json, now: Timestamp) -> Option<Block> {
             if title.is_empty() {
                 return None;
             }
+            let first_seen = api::parse_time(first_seen);
             Some((
                 first_seen,
                 id,
                 ListItem {
                     text: title,
-                    sub: p.get("name").and_then(Json::as_str).map(str::to_string),
+                    sub: p
+                        .get("name")
+                        .and_then(Json::as_str)
+                        .map(|name| api::clean_text(name, TEXT_CHARS))
+                        .filter(|name| !name.is_empty()),
                     status: issue
                         .get("level")
                         .and_then(Json::as_str)
                         .and_then(level_status),
-                    right: parse_time(first_seen).map(|at| age_text(at, now)),
+                    right: first_seen.map(|at| api::age_text(at, now)),
                     href: None,
                 },
             ))
         })
         .collect();
-    issues.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+    issues.sort_by_key(|(at, id, _)| std::cmp::Reverse((*at, *id)));
     (!issues.is_empty()).then(|| Block::List {
         title_key: "kk_newest_issues".to_string(),
         items: issues
@@ -166,35 +171,6 @@ fn newest_issues(doc: &Json, now: Timestamp) -> Option<Block> {
             .take(MAX_ITEMS)
             .map(|(_, _, item)| item)
             .collect(),
-    })
-}
-
-/// The facts of today: visitors, app users and crash-free sessions, as far
-/// as the summary has them.
-fn today_facts(values: &BTreeMap<String, Value>) -> Option<Block> {
-    let mut rows = Vec::new();
-    for (id, label_key) in [
-        ("visitors_today", "kk_visitors_today"),
-        ("app_users_today", "kk_app_users_today"),
-    ] {
-        if let Some(n) = values.get(id).and_then(|v| v.num) {
-            rows.push(Fact {
-                label_key: Some(label_key.to_string()),
-                label: None,
-                value: format!("{n:.0}"),
-            });
-        }
-    }
-    if let Some(pct) = values.get("crash_free").and_then(|v| v.num) {
-        rows.push(Fact {
-            label_key: Some("kk_crash_free".to_string()),
-            label: None,
-            value: format!("{pct:.1} %"),
-        });
-    }
-    (!rows.is_empty()).then(|| Block::Facts {
-        title_key: "kk_today".to_string(),
-        rows,
     })
 }
 
@@ -266,7 +242,6 @@ fn read_summary(doc: &Json) -> Result<Snapshot, FetchError> {
     let mut snapshot = Snapshot::new(status);
     snapshot.details = newest_issues(doc, snapshot.fetched_at)
         .into_iter()
-        .chain(today_facts(&values))
         .collect();
     snapshot.values = values;
     snapshot.needs = needs;

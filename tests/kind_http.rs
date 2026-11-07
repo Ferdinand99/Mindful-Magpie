@@ -66,22 +66,6 @@ fn range(text: &str) -> [f64; 3] {
 }
 
 #[tokio::test]
-async fn a_check_gives_the_status_the_response_time_and_when() {
-    let (base, site) = serve().await;
-    site.route("/", Answer::Status(200));
-    let blocks = stored(check(&format!("{base}/"), Some(1)).await);
-    let rows = facts(&blocks, "http_last_check").expect("the facts");
-    let keys: Vec<&str> = rows.iter().map(|r| r.0).collect();
-    assert_eq!(keys, ["http_status", "http_latency", "http_checked"]);
-    assert_eq!(rows[0].1, "200");
-    assert!(rows[1].1.ends_with(" ms"), "{}", rows[1].1);
-    // UTC, minute precision.
-    assert!(rows[2].1.ends_with(" UTC") && rows[2].1.len() == "2026-11-08 14:03 UTC".len());
-    // One answer makes no range.
-    assert!(facts(&blocks, "http_last_hour").is_none());
-}
-
-#[tokio::test]
 async fn the_last_hour_is_kept_per_stored_service_and_forgotten_on_save() {
     let (base, site) = serve().await;
     site.route("/", Answer::Status(200));
@@ -116,24 +100,27 @@ async fn the_last_hour_is_kept_per_stored_service_and_forgotten_on_save() {
 }
 
 #[tokio::test]
-async fn a_bad_status_still_has_its_facts_and_a_site_that_does_not_answer_only_the_time() {
+async fn one_answer_makes_no_range_and_the_card_numbers_are_not_repeated() {
+    let (base, site) = serve().await;
+    site.route("/", Answer::Status(200));
+    let snapshot = check(&format!("{base}/"), Some(1)).await;
+    assert_eq!(snapshot.values["status"].num, Some(200.0));
+    assert!(stored(snapshot).is_empty());
+}
+
+#[tokio::test]
+async fn a_bad_status_still_has_a_window_and_a_silent_site_does_not_break_it() {
     let (base, site) = serve().await;
     site.route("/", Answer::Status(503));
-    let snapshot = check(&format!("{base}/"), Some(21)).await;
+    let url = format!("{base}/");
+    check(&url, Some(21)).await;
+    let snapshot = check(&url, Some(21)).await;
     assert_eq!(snapshot.status, Status::Bad);
     let blocks = stored(snapshot);
-    assert_eq!(
-        facts(&blocks, "http_last_check").unwrap()[0],
-        ("http_status", "503")
-    );
+    assert_eq!(facts(&blocks, "http_last_hour").unwrap()[1].1, "2");
 
-    let down = check("http://127.0.0.1:1/", Some(22)).await;
-    assert_eq!(down.status, Status::Bad);
-    let blocks = stored(down);
-    let rows = facts(&blocks, "http_last_check").expect("the facts");
-    assert_eq!(
-        rows.iter().map(|r| r.0).collect::<Vec<_>>(),
-        ["http_checked"]
-    );
-    assert!(facts(&blocks, "http_last_hour").is_none());
+    // A site that does not answer has no window yet: nothing to show.
+    let snapshot = check("http://127.0.0.1:1/", Some(22)).await;
+    assert_eq!(snapshot.status, Status::Bad);
+    assert!(stored(snapshot).is_empty());
 }

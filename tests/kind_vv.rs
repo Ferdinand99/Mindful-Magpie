@@ -83,6 +83,8 @@ struct Hit {
 
 #[derive(Clone)]
 struct Stub {
+    /// The path the stub lives under (`/stub-N`), taken off every request.
+    prefix: String,
     summary: Answer,
     health: Answer,
     hits: Arc<Mutex<Vec<Hit>>>,
@@ -104,15 +106,20 @@ const SUMMARY: &str = "/api/v1/summary";
 const HEALTH: &str = "/api/v1/health";
 
 async fn answer(State(stub): State<Stub>, uri: Uri, headers: HeaderMap) -> Response {
+    let path = uri
+        .path()
+        .strip_prefix(&stub.prefix)
+        .unwrap_or_else(|| uri.path())
+        .to_string();
     stub.hits.lock().unwrap().push(Hit {
-        path: uri.path().to_string(),
+        path: path.clone(),
         query: uri.query().map(str::to_string),
         authorization: headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string),
     });
-    let what = match uri.path() {
+    let what = match path.as_str() {
         SUMMARY => stub.summary.clone(),
         HEALTH => stub.health.clone(),
         _ => Answer::Status(404),
@@ -132,9 +139,17 @@ async fn answer(State(stub): State<Stub>, uri: Uri, headers: HeaderMap) -> Respo
     }
 }
 
+// Each stub lives under a path of its own (`/stub-N`), so no address is ever
+// the same as an earlier test's: the kinds remember a 404 and the like per
+// address, and the operating system hands a freed port to a later stub.
 /// Starts a stub on a free port; its address (no trailing slash) and handle.
 async fn serve(summary: Answer, health: Answer) -> (String, Stub) {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let stub = Stub {
+        prefix: format!(
+            "/stub-{}",
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
         summary,
         health,
         hits: Arc::new(Mutex::new(Vec::new())),
@@ -143,7 +158,7 @@ async fn serve(summary: Answer, health: Answer) -> (String, Stub) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (format!("http://{addr}"), stub)
+    (format!("http://{addr}{}", stub.prefix), stub)
 }
 
 fn kind() -> &'static dyn Integration {

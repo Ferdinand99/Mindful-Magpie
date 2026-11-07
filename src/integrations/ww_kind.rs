@@ -24,15 +24,13 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use jiff::tz::TimeZone;
-use jiff::{SignedDuration, Timestamp, civil};
+use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use url::Url;
 
 use super::api;
 use super::block::{Block, Fact, ListItem, MAX_ITEMS, TEXT_CHARS};
-use super::vv::age_text;
 use super::{
     BoxFuture, FetchCtx, FetchError, Field, FieldKind, Format, Integration, Level, MetricDef, Need,
     Snapshot, Status, Value,
@@ -231,18 +229,8 @@ impl Run {
         [&self.finished_at, &self.started_at, &self.created_at]
             .into_iter()
             .flatten()
-            .find_map(|text| parse_time(text))
+            .find_map(|text| api::parse_time(text))
     }
-}
-
-/// A time as Wise Wren writes it (`2026-10-23 10:00:00`, UTC) or as RFC 3339.
-fn parse_time(text: &str) -> Option<Timestamp> {
-    let text = text.trim();
-    if let Ok(at) = text.parse::<Timestamp>() {
-        return Some(at);
-    }
-    let at: civil::DateTime = text.parse().ok()?;
-    Some(at.to_zoned(TimeZone::UTC).ok()?.timestamp())
 }
 
 /// One call to `/api/v1/<last>`. A 404 is an error too: there is nothing to
@@ -448,7 +436,7 @@ fn last_run_facts(runs: &[Run], now: Timestamp) -> Option<Block> {
     let value = [
         text(newest.target.as_ref().and_then(|t| t.name.as_deref())),
         text(newest.server.as_ref().and_then(|s| s.name.as_deref())),
-        newest.time().map(|at| age_text(at, now)),
+        newest.time().map(|at| api::age_text(at, now)),
     ]
     .into_iter()
     .flatten()
@@ -505,14 +493,14 @@ fn agents_list(servers: &[Server], now: Timestamp) -> Option<Block> {
                 Some("offline") => Status::Bad,
                 _ => Status::Unknown,
             };
-            let seen = s.last_seen_at.as_deref().and_then(parse_time);
+            let seen = s.last_seen_at.as_deref().and_then(api::parse_time);
             Some(ListItem {
                 text: text(s.name.as_deref())?,
                 sub: None,
                 status: Some(status),
                 right: seen
                     .filter(|_| status != Status::Ok)
-                    .map(|at| age_text(at, now)),
+                    .map(|at| api::age_text(at, now)),
                 href: None,
             })
         })

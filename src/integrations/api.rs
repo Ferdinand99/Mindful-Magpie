@@ -14,6 +14,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
+use jiff::tz::TimeZone;
+use jiff::{Timestamp, civil};
 use reqwest::header::{ACCEPT, HeaderName, HeaderValue};
 use reqwest::{RequestBuilder, Response};
 use serde::de::DeserializeOwned;
@@ -388,6 +390,31 @@ pub fn clean_text(text: &str, max: usize) -> String {
     line.trim().to_string()
 }
 
+/// A time as an API writes it: RFC 3339, or `YYYY-MM-DD HH:MM:SS` in UTC.
+/// `None` when it is neither.
+pub fn parse_time(text: &str) -> Option<Timestamp> {
+    let text = text.trim();
+    if let Ok(at) = text.parse::<Timestamp>() {
+        return Some(at);
+    }
+    let at: civil::DateTime = text.parse().ok()?;
+    Some(at.to_zoned(TimeZone::UTC).ok()?.timestamp())
+}
+
+/// How long ago `then` was, as one short text that reads the same in every
+/// language: `45 s`, `12 min`, `3 h`, `2 d`. Blocks are stored once per
+/// service, not per user, so no language goes in. (The age is as old as the
+/// reading, up to one interval.) A time in the future is `0 s`.
+pub fn age_text(then: Timestamp, now: Timestamp) -> String {
+    let secs = now.as_second().saturating_sub(then.as_second()).max(0);
+    match secs {
+        0..=59 => format!("{secs} s"),
+        60..=3599 => format!("{} min", secs / 60),
+        3600..=86399 => format!("{} h", secs / 3600),
+        _ => format!("{} d", secs / 86400),
+    }
+}
+
 /// The largest count taken as one (a thousand billion): a number past it is
 /// not a count of anything real and would only break the page's layout.
 pub const MAX_COUNT: f64 = 1e15;
@@ -416,6 +443,40 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_second(1_800_000_000 + secs).unwrap()
+    }
+
+    #[test]
+    fn ages_are_short_and_the_same_in_every_language() {
+        let now = at(100_000);
+        for (secs, text) in [
+            (0, "0 s"),
+            (59, "59 s"),
+            (60, "1 min"),
+            (3599, "59 min"),
+            (3600, "1 h"),
+            (86_399, "23 h"),
+            (86_400, "1 d"),
+            (5 * 86_400, "5 d"),
+            // A time in the future (clocks differ) is not negative.
+            (-30, "0 s"),
+        ] {
+            assert_eq!(age_text(at(100_000 - secs), now), text, "{secs}");
+        }
+    }
+
+    #[test]
+    fn times_are_read_as_rfc_3339_or_utc_text() {
+        assert_eq!(
+            parse_time("2026-11-07T08:01:00Z"),
+            parse_time("2026-11-07 08:01:00")
+        );
+        assert!(parse_time("2026-11-07T08:01:00Z").is_some());
+        assert_eq!(parse_time("yesterday"), None);
+        assert_eq!(parse_time(""), None);
+    }
 
     #[test]
     fn the_address_is_checked() {
