@@ -317,17 +317,22 @@ test("fetchBackground times out into null when the server never answers", async 
 
 // ---- labels ----
 
-test("labels: the keys are the server's #mm-labels keys and the texts the server's strings", () => {
+test("labels: the keys are the ones render.js reads, and the texts the server's strings", () => {
+  // The server's #mm-labels block also carries the editor's strings; the extension does not edit,
+  // so it ships only what the renderer reads: the keys of its label(...) calls.
+  const used = [...new Set([...repo("static/magpie/render.js").matchAll(/label\((?:opts\.)?labels,\s*"(\w+)"\)/g)].map((m) => m[1]))];
+  assert.ok(used.length >= 4, `only ${used.length} keys found in render.js`);
   const rust = repo("src/pages.rs");
   const block = rust.slice(rust.indexOf("fn labels()"));
-  const keys = [...block.slice(0, block.indexOf("]);")).matchAll(/\("(\w+)", i18n::t\("start\.(\w+)"\)\)/g)];
-  assert.ok(keys.length >= 4);
+  const all = block.slice(0, block.indexOf("\n}"));
+  // `label_map!(` lists the keys as string literals; a key the renderer reads must be one of them.
+  const keys = used.map((key) => {
+    assert.ok(all.includes(`"${key}",`), `the server's labels() has ${key}`);
+    return [null, key, key];
+  });
   for (const lang of ["en", "nb"]) {
     const toml = repo(`locales/${lang}.toml`);
-    assert.deepEqual(
-      Object.keys(shipped[lang]).sort(),
-      keys.map((k) => k[1]).sort(),
-    );
+    assert.deepEqual(Object.keys(shipped[lang]).sort(), [...used].sort());
     for (const [, key, tomlKey] of keys) {
       const line = toml.match(new RegExp(`^${tomlKey} = "(.*)"$`, "m"));
       assert.ok(line, `${lang}.toml has start.${tomlKey}`);

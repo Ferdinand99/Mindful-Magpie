@@ -21,6 +21,10 @@
     <p class="clock" id="clock" data-tz="{{ timezone }}" data-lang="{{ ctx.lang }}">{{ time }}</p>
     <p class="date" id="date">{{ date }}</p>
   </div>
+  {#- Hidden until the page script has run: without scripts the button would do nothing. -#}
+  <div class="start-actions" hidden>
+    <button type="button" class="btn btn-secondary" id="mm-edit" aria-pressed="false">{{ m::icon("pencil") }}<span>{{ tr("start.edit") }}</span></button>
+  </div>
 </div>
 
 {#- "Needs you": a row of alerts, shown only when something needs attention. -#}
@@ -39,8 +43,10 @@
 {% endif %}
 
 {#- The renderer (static/magpie/render.js) draws the groups, the bookmarks and the
-    empty state into this element from the data blocks below. -#}
-<section id="groups" class="mm-root" aria-label="{{ tr("start.groups") }}"></section>
+    empty state into this element from the data blocks below. data-user is the
+    signed-in user's number: an unsaved draft kept in the browser belongs to one
+    user only (static/magpie/start.js). -#}
+<section id="groups" class="mm-root" aria-label="{{ tr("start.groups") }}" data-user="{{ user_id }}" hx-history="false"></section>
 <noscript>{{ m::callout("info", tr("start.noscript")) }}</noscript>
 
 {#- Data, not script: the browser never runs these blocks. The JSON is written so

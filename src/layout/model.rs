@@ -30,6 +30,10 @@ pub const MAX_ID: usize = 40;
 /// of combining marks.
 pub const MAX_EMOJI_BYTES: usize = 64;
 
+/// Longest id of an uploaded background image, in characters (the renderer
+/// accepts the same shape, `render.js`).
+pub const MAX_IMAGE_ID: usize = 64;
+
 /// The background presets.
 pub const PRESETS: [&str; 4] = ["hedgerow", "natt", "skumring", "hav"];
 
@@ -256,9 +260,9 @@ impl Checker {
 /// found (at most 100), so a form can mark them at once. A document over a
 /// count limit (`too_many`) is not checked further.
 ///
-/// Until backgrounds with images arrive, an image background is refused
-/// (`bad_image`): the check needs the database, which this function never
-/// touches.
+/// An image background must name an id of the right shape (`bad_image`).
+/// Whether it is the user's own uploaded image needs the database, which this
+/// function never touches: the save checks that (see `store::save`).
 pub fn validate(layout: &Layout) -> Result<(), Vec<FieldError>> {
     let mut c = Checker {
         errors: Vec::new(),
@@ -271,7 +275,16 @@ pub fn validate(layout: &Layout) -> Result<(), Vec<FieldError>> {
                 c.err("background.name", "bad_preset");
             }
         }
-        Background::Image { .. } => c.err("background.id", "bad_image"),
+        Background::Image { id } => {
+            let ok = !id.is_empty()
+                && id.len() <= MAX_IMAGE_ID
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+            if !ok {
+                c.err("background.id", "bad_image");
+            }
+        }
     }
 
     if layout.groups.len() > MAX_GROUPS {
