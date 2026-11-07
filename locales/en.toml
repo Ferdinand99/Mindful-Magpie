@@ -155,3 +155,86 @@ back = "Back to the start page"
 [general]
 sub = "How this instance names itself, where it is reached and how it tells time."
 base_url_help = "Where people reach this instance: used in links. If MM_PUBLIC_URL is set on the server, it replaces this at every start."
+
+# Services (Settings → Services, admins) and the kinds of service.
+
+[nav]
+services = "Services"
+
+[service]
+sub = "The websites and apps Magpie fetches numbers from. Only admins set them up; the secret is stored encrypted and never shown again."
+new = "New service"
+edit = "Edit service"
+choose_kind = "What kind of service is it?"
+none_title = "No services yet"
+none_text = "Add a service so the start page can show its numbers."
+name = "Name"
+name_help = "What the service is called on the start page."
+url = "Address"
+url_help = "Starts with http:// or https://. No user name or password in it: use the secret field."
+secret_saved = "Saved – type to replace"
+secret_saved_badge = "Secret saved"
+clear_secret = "Remove the saved secret"
+interval = "Fetch every (seconds)"
+interval_help = "Empty means {default} seconds. At least {min}."
+visibility = "Who sees it"
+visibility_help = "Admins always see every service."
+vis_admin = "Only admins"
+vis_users = "Chosen users"
+vis_all = "Everyone"
+vis_users_count = "{n} chosen"
+users = "Users who can see it"
+users_none = "There are no users other than admins yet."
+test = "Test"
+test_help = "Fetches once with what is in the form. Nothing is saved."
+test_run = "Test"
+test_ok = "Working"
+test_warn = "Warning"
+test_bad = "Not working"
+test_unknown = "Could not test"
+secret_unreadable = "The saved secret can no longer be opened (the instance key changed). Type it again."
+delete = "Delete service"
+delete_q = "Delete this service?"
+delete_msg = "Cards that show it will say the service no longer exists."
+created = "Service added."
+saved = "Service saved."
+deleted = "Service deleted."
+
+[err]
+name = "Give the service a name of at most 80 characters."
+kind = "Choose a kind of service."
+interval = "Use a whole number of seconds, not shorter than the kind allows and at most 86400."
+url = "Use an address that starts with http:// or https://."
+url_required = "The address is required."
+url_userinfo = "Leave the user name and password out of the address and use the secret field."
+secret = "The secret can't hold line breaks and must be at most 2048 characters."
+required = "This is required."
+number = "Use a whole number."
+visibility = "Choose who sees the service."
+too_long = "This is too long."
+http_expected = "Use a status like 200, a range like 200-399, or a list like 200, 301-308."
+
+[kind]
+http = "Website"
+
+[field]
+http_expected = "Expected status"
+http_expected_help = "Which answers count as working. Empty means 200-399."
+http_secret = "Token (optional)"
+http_secret_help = "Sent as Authorization: Bearer. Stored encrypted."
+
+[metric]
+http_status = "HTTP status"
+http_latency = "Response time (ms)"
+http_checked = "Last checked"
+
+[fetch_err]
+config = "The settings can't be used"
+forbidden = "Address not allowed"
+timeout = "Timeout"
+connect = "Could not connect"
+redirects = "Too many redirects"
+redirect_scheme = "Redirect not allowed"
+too_large = "Response too large"
+invalid = "Unexpected answer"
+other = "The request failed"

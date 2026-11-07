@@ -8,7 +8,7 @@ use vole_kit::config::KitConfig;
 use vole_kit::docs::{DocsSpec, RouteDoc};
 use vole_kit::http::assets::StaticFile;
 use vole_kit::notify::webhook::Wording;
-use vole_kit::page::{NavItem, SettingsTab, Ui};
+use vole_kit::page::{NavItem, SettingsTab, TabAccess, Ui};
 use vole_kit::settings::GeneralSettings;
 
 /// The product's version (`CARGO_PKG_VERSION`), reported by the OpenAPI
@@ -79,6 +79,16 @@ pub static DOCS: DocsSpec = DocsSpec {
     strict_access: true,
 };
 
+/// The admin's page for services (`/settings/services`; its routes check for an
+/// admin too, the tab is only the link).
+pub const SERVICES_TAB: SettingsTab = SettingsTab {
+    id: "services",
+    href: "/settings/services",
+    label: "nav.services",
+    icon: "plug",
+    access: TabAccess::Admins,
+};
+
 pub static KIT: KitConfig = KitConfig {
     product: NAME,
     slug: "mindful-magpie",
@@ -129,6 +139,7 @@ pub static KIT: KitConfig = KitConfig {
         ],
         settings_tabs: &[
             SettingsTab::GENERAL,
+            SERVICES_TAB,
             SettingsTab::USERS,
             SettingsTab::SECURITY,
             SettingsTab::TOKENS,

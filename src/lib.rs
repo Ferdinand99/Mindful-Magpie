@@ -11,10 +11,12 @@ pub mod api;
 pub mod config;
 pub mod connect;
 pub mod db;
+pub mod integrations;
 pub mod layout;
 pub mod pages;
 pub mod product;
 pub mod server;
+pub mod services;
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -47,6 +49,10 @@ pub struct Magpie {
     /// The users' uploaded start page backgrounds (files under the data
     /// directory).
     pub backgrounds: Arc<layout::Backgrounds>,
+    /// Announces a service that was created, changed or deleted, after the
+    /// change is stored. The poller subscribes; with no subscriber a send is
+    /// dropped.
+    pub service_events: tokio::sync::broadcast::Sender<services::ServiceEvent>,
 }
 
 /// Installs the configuration, opens and migrates the database in
@@ -101,6 +107,7 @@ pub async fn start_with(
         token_budget: Arc::new(TokenBuckets::new()),
         extension_hosts: Arc::new(connect::allowed_hosts(extension_ids)),
         backgrounds,
+        service_events: tokio::sync::broadcast::channel(64).0,
     })
 }
 
@@ -114,6 +121,7 @@ pub fn router(magpie: Magpie) -> Router {
         .merge(pages::router())
         .merge(connect::router())
         .merge(api::router())
+        .merge(services::pages::router())
         .merge(kit_pages::router())
         // Inside the sign-in guard: sees who is signed in (see the function).
         .route_layer(from_fn(pages::sweep_after_user_delete))
