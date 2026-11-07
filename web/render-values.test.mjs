@@ -137,16 +137,38 @@ test("format_number_groups_by_locale", () => {
   assert.equal(formatValue(num(1e15), "number", "en"), "1,000,000,000,000,000");
 });
 
-test("format_percent_has_one_decimal_under_ten", () => {
-  assert.equal(formatValue(num(4.25), "percent", "en"), "4.3%");
-  assert.equal(formatValue(num(0), "percent", "en"), "0.0%");
-  assert.equal(formatValue(num(9.94), "percent", "en"), "9.9%");
-  assert.equal(formatValue(num(9.96), "percent", "en"), "10%", "rounds up past ten: no decimal");
-  assert.equal(formatValue(num(42.4), "percent", "en"), "42%");
+test("format_percent_whole_numbers_have_no_decimals_a_fraction_has_one", () => {
   assert.equal(formatValue(num(100), "percent", "en"), "100%");
-  assert.equal(formatValue(num(4.25), "percent", "nb"), `4,3${NBSP}%`);
+  assert.equal(formatValue(num(45), "percent", "en"), "45%");
+  assert.equal(formatValue(num(0), "percent", "en"), "0%");
+  assert.equal(formatValue(num(45.3), "percent", "en"), "45.3%");
+  assert.equal(formatValue(num(4.25), "percent", "en"), "4.3%", "half up");
+  assert.equal(formatValue(num(9.94), "percent", "en"), "9.9%");
+  assert.equal(formatValue(num(9.96), "percent", "en"), "10%", "rounds to a whole number: no decimal");
+  assert.equal(formatValue(num(42.04), "percent", "en"), "42%");
   assert.equal(formatValue(num(250), "percent", "en"), "250%", "not clamped");
-  assert.match(formatValue(num(-5), "percent", "en"), /^[-−]5\.0%$/);
+  assert.equal(formatValue(num(100.04), "percent", "en"), "100%");
+  assert.match(formatValue(num(-5), "percent", "en"), /^[-−]5%$/);
+  assert.match(formatValue(num(-5.5), "percent", "en"), /^[-−]5\.5%$/);
+  assert.equal(formatValue(num(-0.04), "percent", "en"), "0%", "no minus on zero");
+  assert.equal(formatValue(num(4.25), "percent", "nb"), `4,3${NBSP}%`);
+  assert.equal(formatValue(num(45), "percent", "nb"), `45${NBSP}%`);
+  assert.equal(formatValue(num(100), "percent", "nb"), `100${NBSP}%`);
+});
+
+test("format_percent_from_99_up_to_100_has_two_decimals_and_never_reads_100", () => {
+  assert.equal(formatValue(num(99.87), "percent", "en"), "99.87%");
+  assert.equal(formatValue(num(99.87), "percent", "nb"), `99,87${NBSP}%`);
+  assert.equal(formatValue(num(99), "percent", "en"), "99%", "a whole number has none");
+  assert.equal(formatValue(num(99.5), "percent", "en"), "99.50%");
+  assert.equal(formatValue(num(99.865), "percent", "en"), "99.87%", "half up on the decimal text");
+  assert.equal(formatValue(num(99.994), "percent", "en"), "99.99%");
+  assert.equal(formatValue(num(99.996), "percent", "en"), "99.99%", "capped: only an exact 100 reads 100");
+  assert.equal(formatValue(num(99.99999), "percent", "nb"), `99,99${NBSP}%`);
+  assert.equal(formatValue(num(99.001), "percent", "en"), "99%");
+  // Below 99 it is one decimal, even where it rounds up to 99.
+  assert.equal(formatValue(num(98.96), "percent", "en"), "99%");
+  assert.equal(formatValue(num(98.84), "percent", "en"), "98.8%");
 });
 
 test("format_bytes_uses_binary_units", () => {
@@ -581,7 +603,7 @@ test("a_rejected_signdisplay_or_a_missing_intl_never_throws", () => {
       }
     };
     assert.equal(formatValue(num(1234.5), "number", "en"), "1234.5");
-    assert.equal(formatValue(num(4.25), "percent", "en"), "4.25%");
+    assert.equal(formatValue(num(4.25), "percent", "en"), "4.3%");
     assert.equal(formatValue(num(90), "duration", "en"), "1 min 30 s");
     assert.equal(formatValue(num(1536), "bytes", "en"), "1.5 KiB");
   } finally {

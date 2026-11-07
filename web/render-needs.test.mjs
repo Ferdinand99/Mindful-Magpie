@@ -114,6 +114,28 @@ test("the_row_sits_before_the_groups_and_chips_read_service_text_age", () => {
   assert.match(chips(nb.root)[0].querySelector(".mm-need-chip").textContent, /^Blog · nede · for 2 min siden$/);
 });
 
+test("a_chip_breaks_between_its_parts_never_inside_the_name", () => {
+  const { root } = draw([need({ service_name: "KK", label: "needs to be set up again" })]);
+  const chip = root.querySelector(".mm-need-chip");
+  // The dot, the name and its separator are one part; the text and its separator another; then the age.
+  assert.deepEqual([...chip.children].map((el) => el.className), ["mm-need-lead", "mm-need-main", "mm-need-age"]);
+  const lead = chip.querySelector(".mm-need-lead");
+  assert.deepEqual([...lead.children].map((el) => el.className), ["mm-status", "mm-need-name", "mm-need-sep"]);
+  assert.deepEqual([...chip.querySelector(".mm-need-main").children].map((el) => el.className), ["mm-need-text", "mm-need-sep"]);
+  assert.equal(chip.textContent, "KK · needs to be set up again · 2 min. ago");
+  // Without a time there is nothing to separate the text from.
+  const bare = draw([need({ since: undefined })]);
+  assert.deepEqual([...bare.root.querySelector(".mm-need-main").children].map((el) => el.className), ["mm-need-text"]);
+  // The style that keeps the name whole (a one-letter name must not wrap letter by letter).
+  const css = readFileSync(new URL("../static/magpie/render.css", import.meta.url), "utf8");
+  const rule = (selector) => {
+    const at = css.indexOf(`\n${selector} {`);
+    return at === -1 ? "" : css.slice(at, css.indexOf("}", at));
+  };
+  assert.match(rule(".mm-need-lead"), /white-space:\s*nowrap/);
+  assert.match(rule(".mm-need-lead"), /flex:\s*none/);
+});
+
 test("the_shape_tells_the_level_as_well_as_the_colour", () => {
   const { root } = draw([need(), need({ service_id: 2, key: "disk", level: "warn", label: "w" })]);
   const [red, yellow] = chips(root);
