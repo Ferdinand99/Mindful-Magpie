@@ -421,6 +421,7 @@ fn down_need(name: &str) -> Need {
         label_key: "need.http_down".into(),
         params: [("name".to_string(), name.to_string())].into(),
         score: 1.0,
+        since: None,
     }
 }
 

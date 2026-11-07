@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { parseHTML } from "linkedom";
 
 import { startEditing } from "../static/magpie/edit.js";
-import { LIVE_URL, RETRY_MS, TICK_MS, draw, initLive, mergeServices, mergeValues, wirePage } from "../static/magpie/start.js";
+import { LIVE_URL, RETRY_MS, TICK_MS, draw, initLive, initNeeds, mergeServices, mergeValues, wirePage } from "../static/magpie/start.js";
 
 function readStartStrings(path) {
   const strings = {};
@@ -399,12 +399,13 @@ test("a_partial_event_keeps_the_entries_it_does_not_mention", () => {
   assert.equal(values.services[2].values.latency_ms.num, 25);
 });
 
-test("a_removed_service_is_dropped_from_the_values_and_the_services_and_its_card_says_so", () => {
+test("a_removed_service_is_dropped_from_the_values_and_its_card_says_so_and_from_the_services_when_not_visible", () => {
   const p = page();
   draw(p.document);
   const live = initLive(p.document, p.deps);
   live.sync();
-  p.ES.all[0].emit("values", { now: NOW + 5, full: false, services: {}, removed: [1] });
+  // Unbound or hidden, its values go. It leaves the list the editor offers only when it is not visible.
+  p.ES.all[0].emit("values", { now: NOW + 5, full: false, services: {}, removed: [1], services_visible: [] });
   assert.deepEqual(block(p, "mm-values").services, {});
   assert.deepEqual(block(p, "mm-services"), []);
   assert.ok(p.root.querySelector(".mm-svc-notice")?.textContent.includes(LABELS.service_missing));
@@ -418,7 +419,7 @@ test("a_service_that_comes_back_is_drawn_with_numbers_not_the_missing_notice", (
   draw(p.document);
   const live = initLive(p.document, p.deps);
   live.sync();
-  p.ES.all[0].emit("values", { now: NOW + 5, full: false, services: {}, removed: [1], services_add: [] });
+  p.ES.all[0].emit("values", { now: NOW + 5, full: false, services: {}, removed: [1], services_visible: [], services_add: [] });
   assert.ok(p.root.querySelector(".mm-svc-notice")?.textContent.includes(LABELS.service_missing));
   assert.deepEqual(block(p, "mm-services"), []);
 
@@ -454,7 +455,7 @@ test("mergeServices_adds_replaces_removes_and_keeps_the_order_by_name", () => {
     { id: 3, name: "Zed" },
   ];
   const values = { services: {} };
-  const merged = mergeServices(list, values, [3], [{ id: 2, name: "alpha" }, { id: 1, name: "Blog 2" }, null, {}]);
+  const merged = mergeServices(list, values, [1], [{ id: 2, name: "alpha" }, { id: 1, name: "Blog 2" }, null, {}]);
   assert.deepEqual(
     merged.map((s) => [s.id, s.name]),
     [
@@ -463,9 +464,48 @@ test("mergeServices_adds_replaces_removes_and_keeps_the_order_by_name", () => {
     ],
   );
   assert.equal(list.length, 2, "the list is not changed");
+  // Without a list of visible ids (an event that did not change it) nobody is dropped.
   assert.deepEqual(
-    mergeServices(list, values, [], undefined).map((s) => s.id),
+    mergeServices(list, values, undefined, undefined).map((s) => s.id),
     [1, 3],
+  );
+  assert.deepEqual(
+    mergeServices(list, values, null, undefined).map((s) => s.id),
+    [1, 3],
+  );
+  // An empty list is a list: nobody is visible.
+  assert.deepEqual(mergeServices(list, values, [], undefined), []);
+  // Ids compare as numbers or text.
+  assert.deepEqual(
+    mergeServices(list, values, ["3"], undefined).map((s) => s.id),
+    [3],
+  );
+});
+
+test("an_unbound_service_stays_in_the_editors_list_after_a_removed_event", () => {
+  const wiki = { id: 2, name: "Wiki", kind: "http", interval_s: 60, metrics: [] };
+  const p = page({ services: [SERVICES[0], wiki] });
+  draw(p.document);
+  const live = initLive(p.document, p.deps);
+  live.sync();
+  // The card is unbound elsewhere (Blog's values go), and an unbound Wiki was never in the values.
+  p.ES.all[0].emit("values", { now: NOW + 5, full: false, services: {}, removed: [1], services_add: [] });
+  assert.deepEqual(
+    block(p, "mm-services").map((s) => s.id),
+    [1, 2],
+    "both are still offered",
+  );
+  // A set of visible ids that leaves Wiki out takes it away, and only it.
+  p.ES.all[0].emit("values", { now: NOW + 6, full: false, services: {}, removed: [], services_visible: [1], services_add: [] });
+  assert.deepEqual(
+    block(p, "mm-services").map((s) => s.id),
+    [1],
+  );
+  // A service that became visible (an unbound one too) is offered.
+  p.ES.all[0].emit("values", { now: NOW + 7, full: false, services: {}, removed: [], services_visible: [1, 2], services_add: [wiki] });
+  assert.deepEqual(
+    block(p, "mm-services").map((s) => s.id).sort(),
+    [1, 2],
   );
 });
 
@@ -477,7 +517,7 @@ test("a_full_event_replaces_what_the_page_had", () => {
   p.ES.all[0].emit("values", { now: NOW + 9, full: true, services: { 1: entry(7) }, removed: [] });
   assert.equal(block(p, "mm-values").services[1].values.latency_ms.num, 7);
   // A full event without the service: it is gone.
-  p.ES.all[0].emit("values", { now: NOW + 10, full: true, services: {}, removed: [] });
+  p.ES.all[0].emit("values", { now: NOW + 10, full: true, services: {}, removed: [], services_visible: [] });
   assert.deepEqual(block(p, "mm-values").services, {});
   assert.deepEqual(block(p, "mm-services"), []);
 });
@@ -594,12 +634,18 @@ test("mergeValues_does_not_change_its_arguments_and_reports_what_went", () => {
   const frozen = JSON.stringify(current);
   const update = { now: 2, full: false, services: { 3: { name: "c" } }, removed: [2] };
   const merged = mergeValues(current, update);
-  assert.deepEqual(merged.values, { now: 2, services: { 1: { name: "a" }, 3: { name: "c" } } });
+  assert.deepEqual(merged.values, { now: 2, services: { 1: { name: "a" }, 3: { name: "c" } }, needs: [] });
   assert.deepEqual(merged.removed, ["2"]);
   assert.equal(JSON.stringify(current), frozen);
 
   const full = mergeValues(current, { now: 3, full: true, services: { 1: { name: "a2" } }, removed: [] });
-  assert.deepEqual(full.values, { now: 3, services: { 1: { name: "a2" } } });
+  assert.deepEqual(full.values, { now: 3, services: { 1: { name: "a2" } }, needs: [] });
+  // The needs list is replaced when an event brings one and kept when it does not.
+  const withNeeds = { now: 1, services: {}, needs: [{ key: "a" }] };
+  assert.deepEqual(mergeValues(withNeeds, { now: 2, services: {} }).values.needs, [{ key: "a" }]);
+  assert.deepEqual(mergeValues(withNeeds, { now: 2, services: {}, needs: [] }).values.needs, []);
+  assert.deepEqual(mergeValues(withNeeds, { now: 2, services: {}, needs: [{ key: "b" }] }).values.needs, [{ key: "b" }]);
+  assert.deepEqual(mergeValues(withNeeds, { now: 2, services: {}, needs: "junk" }).values.needs, [{ key: "a" }]);
   assert.deepEqual(full.removed, ["2"], "an id the full document no longer has is removed");
 
   // Missing or odd input does not throw.
@@ -676,3 +722,163 @@ test("draw_hands_the_embedded_values_to_the_renderer", () => {
   assert.equal(q.root.querySelector(".mm-metric"), null);
 });
 
+
+// ---- «Trenger deg» ----------------------------------------------------------
+
+const NEED = {
+  service_id: 1,
+  service_name: "Blog",
+  key: "down",
+  level: "bad",
+  label: "Blog is not answering",
+  since: NOW - 120,
+  acked: false,
+};
+const NEED2 = { ...NEED, key: "disk", level: "warn", label: "Blog: disk almost full" };
+
+const needsPage = (needs, extra = {}) => page({ values: { ...valuesFixture(), needs }, ...extra });
+const chipKeys = (p) => [...p.root.querySelectorAll(".mm-needs-list:not(.mm-needs-acked) .mm-need")].map((li) => li.getAttribute("data-key"));
+
+test("the_page_draws_the_needs_of_the_embedded_values_with_kvitter_buttons", () => {
+  const p = needsPage([NEED, NEED2]);
+  draw(p.document);
+  assert.deepEqual(chipKeys(p), ["down", "disk"]);
+  assert.equal(p.root.querySelectorAll("button.mm-need-ack").length, 2, "the page can acknowledge");
+});
+
+test("an_event_brings_a_need_into_the_row_in_place_and_announces_it_without_moving_focus", () => {
+  const p = needsPage([]);
+  draw(p.document);
+  const live = initLive(p.document, p.deps);
+  live.sync();
+  assert.equal(p.root.querySelector(".mm-needs"), null);
+  const before = p.focus.count;
+  p.ES.all[0].emit("values", { now: NOW + 3, full: false, services: {}, removed: [], needs: [NEED] });
+  assert.deepEqual(chipKeys(p), ["down"]);
+  assert.equal(p.root.querySelector(".mm-needs-live").textContent, "Blog is not answering");
+  assert.equal(p.focus.count, before, "no focus call");
+  assert.deepEqual(block(p, "mm-values").needs, [NEED], "the page's data block follows");
+  // An event without a needs list leaves the row alone.
+  p.ES.all[0].emit("values", { now: NOW + 4, full: false, services: { 1: entry(9) }, removed: [] });
+  assert.deepEqual(chipKeys(p), ["down"]);
+  // A full event replaces it.
+  p.ES.all[0].emit("values", { now: NOW + 5, full: true, services: { 1: entry(9) }, removed: [], needs: [] });
+  assert.equal(p.root.querySelector(".mm-needs"), null);
+});
+
+function needsDeps(p, answer) {
+  const calls = [];
+  const live = initLive(p.document, p.deps);
+  live.sync();
+  const fetchFn = async (url, init) => {
+    calls.push({ url, init });
+    return typeof answer === "function" ? answer(url, init) : answer;
+  };
+  const needs = initNeeds(p.document, { apply: live.apply, fetch: fetchFn });
+  return { calls, live, needs };
+}
+
+const ok = (needs) => ({ status: 200, json: async () => ({ needs }) });
+
+test("kvitter_posts_the_service_and_key_with_the_pages_proof_and_the_row_follows_the_answer", async () => {
+  const p = needsPage([NEED, NEED2]);
+  draw(p.document);
+  const { calls } = needsDeps(p, ok([NEED, { ...NEED2, acked: true }]));
+  const button = p.root.querySelectorAll("button.mm-need-ack")[1];
+  button.dispatchEvent(new p.window.Event("click", { bubbles: true }));
+  await tick();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "/start/needs/ack");
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(calls[0].init.credentials, "same-origin");
+  assert.equal(calls[0].init.headers["HX-Request"], "true");
+  assert.equal(calls[0].init.headers["Content-Type"], "application/json");
+  assert.deepEqual(JSON.parse(calls[0].init.body), { service_id: 1, key: "disk" });
+  // The row now has one chip and the toggle.
+  assert.deepEqual(chipKeys(p), ["down"]);
+  assert.equal(p.root.querySelector(".mm-needs-toggle").textContent, "1 acknowledged");
+  assert.deepEqual(block(p, "mm-values").needs.map((n) => n.acked), [false, true]);
+});
+
+test("after_kvitter_the_focus_goes_to_the_next_chip_not_to_the_top_of_the_page", async () => {
+  const p = needsPage([NEED, NEED2]);
+  draw(p.document);
+  needsDeps(p, ok([NEED2]));
+  p.root.querySelector("button.mm-need-ack").dispatchEvent(new p.window.Event("click", { bubbles: true }));
+  await tick();
+  // The first chip went; the one that took its place has the focus (the person asked for the change).
+  assert.equal(p.focus.active?.className, "mm-need-chip");
+  assert.equal(p.focus.active?.closest(".mm-need")?.getAttribute("data-key"), "disk");
+});
+
+test("after_kvitter_of_the_last_chip_the_focus_goes_to_the_toggle", async () => {
+  const p = needsPage([NEED]);
+  draw(p.document);
+  needsDeps(p, ok([{ ...NEED, acked: true }]));
+  p.root.querySelector("button.mm-need-ack").dispatchEvent(new p.window.Event("click", { bubbles: true }));
+  await tick();
+  assert.equal(p.focus.active?.className, "mm-needs-toggle");
+});
+
+test("undo_posts_to_unack_and_a_failed_ack_is_said_in_the_live_region", async () => {
+  const p = needsPage([{ ...NEED, acked: true }]);
+  draw(p.document);
+  const { calls } = needsDeps(p, ok([NEED]));
+  const toggle = p.root.querySelector(".mm-needs-toggle");
+  toggle.dispatchEvent(new p.window.Event("click", { bubbles: true }));
+  assert.equal(toggle.getAttribute("aria-expanded"), "true", "the toggle works through the page's handler");
+  p.root.querySelector("button.mm-need-unack").dispatchEvent(new p.window.Event("click", { bubbles: true }));
+  await tick();
+  assert.equal(calls[0].url, "/start/needs/unack");
+  assert.deepEqual(chipKeys(p), ["down"]);
+
+  // A refusal (the need is gone, or the session): nothing changes, and the person is told.
+  const q = needsPage([NEED]);
+  draw(q.document);
+  const failing = needsDeps(q, { status: 404, json: async () => ({ error: "not_found" }) });
+  q.root.querySelector("button.mm-need-ack").dispatchEvent(new q.window.Event("click", { bubbles: true }));
+  await tick();
+  assert.equal(failing.calls.length, 1);
+  assert.deepEqual(chipKeys(q), ["down"]);
+  assert.equal(q.root.querySelector(".mm-needs-live").textContent, LABELS.need_ack_failed);
+  // A network failure too.
+  const r = needsPage([NEED]);
+  draw(r.document);
+  needsDeps(r, () => {
+    throw new TypeError("network");
+  });
+  r.root.querySelector("button.mm-need-ack").dispatchEvent(new p.window.Event("click", { bubbles: true }));
+  await tick();
+  assert.equal(r.root.querySelector(".mm-needs-live").textContent, LABELS.need_ack_failed);
+});
+
+test("a_second_click_while_the_first_is_on_its_way_posts_nothing_more", async () => {
+  const p = needsPage([NEED]);
+  draw(p.document);
+  let release;
+  const gate = new Promise((resolve) => (release = resolve));
+  const { calls } = needsDeps(p, async () => {
+    await gate;
+    return ok([{ ...NEED, acked: true }]);
+  });
+  const button = p.root.querySelector("button.mm-need-ack");
+  button.dispatchEvent(new p.window.Event("click", { bubbles: true }));
+  button.dispatchEvent(new p.window.Event("click", { bubbles: true }));
+  release();
+  await tick();
+  assert.equal(calls.length, 1);
+});
+
+test("wirePage_wires_the_needs_buttons", async () => {
+  const p = needsPage([NEED]);
+  const calls = [];
+  const wired = wirePage(p.document, {
+    live: p.deps,
+    needs: { fetch: async (url) => (calls.push(url), ok([{ ...NEED, acked: true }])) },
+  });
+  wired.start();
+  p.root.querySelector("button.mm-need-ack").dispatchEvent(new p.window.Event("click", { bubbles: true }));
+  await tick();
+  assert.deepEqual(calls, ["/start/needs/ack"]);
+  assert.equal(chipKeys(p).length, 0);
+});

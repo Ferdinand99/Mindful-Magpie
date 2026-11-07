@@ -24,7 +24,9 @@ async fn start_page_renders_for_signed_in_user() {
     let res = start_page(&mut web, "nb").await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert!(res.body.contains(r#"id="groups""#), "{}", res.body);
-    assert!(res.body.contains(r#"id="needs""#), "{}", res.body);
+    // The row «Trenger deg» is drawn by the renderer into #groups, not
+    // placed in the page.
+    assert!(!res.body.contains(r#"id="needs""#), "{}", res.body);
     assert!(res.body.contains(r#"id="clock""#), "{}", res.body);
     assert!(
         res.body.contains(r#"href="/static/magpie/render.css""#),

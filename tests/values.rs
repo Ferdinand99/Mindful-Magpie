@@ -420,7 +420,9 @@ async fn an_entry_carries_the_snapshot_and_a_translated_reason() {
     assert_eq!(a["fetched_at"], 1_760_000_000);
     assert_eq!(a["values"]["latency_ms"]["num"], 88.5);
     assert_eq!(a["values"]["note"]["text"], "slow");
-    assert_eq!(a["needs"], json!([]));
+    // Needs are the document's list (per user), not an entry's.
+    assert!(a.get("needs").is_none(), "{a}");
+    assert_eq!(values["needs"], json!([]));
     assert!(a.get("error_label").is_none(), "{a}");
 
     let b = &values["services"][w.b.to_string()];
@@ -437,7 +439,7 @@ async fn an_entry_carries_the_snapshot_and_a_translated_reason() {
     assert_eq!(c["fetched_at"], Value::Null);
     assert_eq!(c["status"], "unknown");
     assert_eq!(c["values"], json!({}));
-    assert_eq!(c["needs"], json!([]));
+    assert!(c.get("needs").is_none(), "{c}");
 }
 
 #[tokio::test]
@@ -1204,7 +1206,9 @@ async fn the_first_event_carries_a_view_of_each_entry_and_later_ones_only_new_se
     }
     let mut live = open_live(&bob, "nb").await;
     let first = live.event().await;
-    assert_eq!(add_ids(&first), sorted_ids(&[w.a, w.b]));
+    // Every service Bob may see, the unbound Printer too: the editor's picker
+    // offers it.
+    assert_eq!(add_ids(&first), sorted_ids(&[w.a, w.b, w.c]));
     // The view has what #mm-services has: name, kind, interval, labelled metrics.
     let view = first["services_add"]
         .as_array()
@@ -1299,7 +1303,8 @@ async fn a_service_hidden_at_load_arrives_with_its_view_once_it_is_visible() {
     let mut live = open_live(&bob, "en").await;
     let first = live.event().await;
     assert_eq!(ids(&first), sorted([w.a]));
-    assert_eq!(add_ids(&first), vec![w.a]);
+    // The services Bob may see: Blog and the unbound Printer, not Wiki.
+    assert_eq!(add_ids(&first), sorted_ids(&[w.a, w.c]));
     assert!(!first.to_string().contains("Wiki"));
     tokio::time::pause();
 

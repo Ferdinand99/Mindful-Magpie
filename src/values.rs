@@ -10,32 +10,46 @@
 //! produces nothing: not even a name. The save keeps old bindings without
 //! checking them again, so this filter is what keeps them quiet.
 //!
-//! **An entry** is `{ name, kind, interval_s, status, values, needs,
-//! fetched_at, error_label? }`. A visible bound service that has no snapshot
-//! yet is there with `status: "unknown"`, no values or needs and
-//! `fetched_at: null` (the renderer shows "waiting"); an entry is therefore
+//! **An entry** is `{ name, kind, interval_s, status, values, fetched_at,
+//! error_label? }`. A visible bound service that has no snapshot yet is there
+//! with `status: "unknown"`, no values and `fetched_at: null` (the renderer
+//! shows "waiting"); an entry is therefore
 //! absent only when the user must not know of the service. `error_label` is the
 //! reason of a failed reading in the request's language, taken from the closed
 //! set of texts (see [`error_label`]); the raw error never goes out. Times are
 //! Unix seconds.
 //!
+//! **Needs** («Trenger deg») are the document's own list, `needs`, one
+//! [`NeedView`] per need of the services above, with the user's
+//! acknowledgements applied (see [`crate::needs`]): the `config` need of a
+//! service is there for an admin only, and an acknowledged need is there with
+//! `acked: true`. The list is per user, so it is the document's, not an
+//! entry's.
+//!
 //! **The stream.** One event name, `values`, whose data is
-//! `{ now, full, services, removed, services_add }`: the first event of a stream has
-//! `full: true` and holds every entry (the page replaces what it has); after
-//! that an event holds the entries that changed since the last one and, in
-//! `removed`, the ids the user no longer gets (the service was deleted, hidden
-//! from them or is no longer bound). `services_add` lists the views (the
-//! `#mm-services` shape: id, name, kind, interval, metrics with labels) of the
-//! services this stream has not sent one of yet (all of them in the first
-//! event), so that a service that became visible after the page was made can
-//! be drawn; it is built from the same bindings-and-visibility list as the
-//! entries, so it never names a hidden service. The server remembers what it sent, so a
+//! `{ now, full, services, removed, services_add, services_visible?, needs? }`:
+//! the first event of a stream has `full: true` and holds every entry (the
+//! page replaces what it has); after that an event holds the entries that
+//! changed since the last one and, in `removed`, the ids whose *values* the
+//! user no longer gets (the service was deleted, hidden from them or is no
+//! longer bound). `removed` says nothing of the page's list of services (the
+//! editor's picker): a service that is visible but unbound is still offered.
+//! That list follows `services_visible`, every id the user may see, sent when
+//! it is the first event or the set has changed (a service was hidden or
+//! deleted: drop the ids not in it), and `services_add`, the views (the
+//! `#mm-services` shape: id, name, kind, interval, metrics with labels) of
+//! the visible services this stream has not sent one of yet (all of them in
+//! the first event), so that a service that became visible after the page was
+//! made can be offered and drawn; both are built from the visibility list
+//! alone, so they never name a hidden service. `needs` is the document's
+//! list, sent when it is the first event or it has changed (also when only an
+//! acknowledgement did). The server remembers what it sent, so a
 //! change is compared with the document the client actually has, not guessed
 //! from which service announced it. The visibility and the layout are read
 //! again at every wake, the account too: a signed-out, disabled or demoted
 //! user loses the stream or the services.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -58,8 +72,9 @@ use vole_kit::state::Core;
 
 use crate::Magpie;
 use crate::integrations::poller::{Change, PollerHandle};
-use crate::integrations::{self, Need, Status, Value};
+use crate::integrations::{self, Status, Value};
 use crate::layout::{self, Layout};
+use crate::needs::{self, NeedView};
 use crate::services::{ServiceEvent, ServiceSummary, ServiceView, Viewer, store, view_of};
 
 /// Streams open at once, across all users.
@@ -71,21 +86,26 @@ pub const QUIET: Duration = Duration::from_secs(1);
 pub const MAX_STREAMS_PER_USER: usize = 8;
 
 static STREAMS: StreamLimit = StreamLimit::new(MAX_STREAMS);
-static USER_STREAMS: std::sync::LazyLock<std::sync::Mutex<HashMap<i64, usize>>> =
+/// Open streams per (running Magpie, user). A server runs one Magpie, so this
+/// is per user; the key's first part tells apart the several Magpies of one
+/// test process, whose users number from 1 each, so that the streams of one
+/// test never count against another's.
+static USER_STREAMS: std::sync::LazyLock<std::sync::Mutex<HashMap<(usize, i64), usize>>> =
     std::sync::LazyLock::new(Default::default);
 
 /// One of a user's places under [`MAX_STREAMS_PER_USER`], given back on drop.
-struct UserSlot(i64);
+struct UserSlot((usize, i64));
 
 impl UserSlot {
-    fn acquire(user_id: i64) -> Option<UserSlot> {
+    fn acquire(instance: usize, user_id: i64) -> Option<UserSlot> {
+        let key = (instance, user_id);
         let mut open = USER_STREAMS.lock().unwrap_or_else(|e| e.into_inner());
-        let n = open.entry(user_id).or_insert(0);
+        let n = open.entry(key).or_insert(0);
         if *n >= MAX_STREAMS_PER_USER {
             return None;
         }
         *n += 1;
-        Some(UserSlot(user_id))
+        Some(UserSlot(key))
     }
 }
 
@@ -109,7 +129,6 @@ pub struct ServiceValues {
     pub interval_s: i64,
     pub status: Status,
     pub values: BTreeMap<String, Value>,
-    pub needs: Vec<Need>,
     /// Unix seconds, `null` while the service has no snapshot.
     pub fetched_at: Option<i64>,
     /// Why the reading failed, translated; absent when it did not.
@@ -124,6 +143,9 @@ pub struct ValuesDoc {
     /// Unix seconds on the server's clock, for the page's age arithmetic.
     pub now: i64,
     pub services: BTreeMap<String, ServiceValues>,
+    /// The needs of those services for this user, acknowledgements applied
+    /// (see [`crate::needs`]).
+    pub needs: Vec<NeedView>,
 }
 
 /// The ids of the services the layout's cards are bound to.
@@ -158,7 +180,6 @@ fn entry(summary: &ServiceSummary, poller: &PollerHandle) -> ServiceValues {
             interval_s: summary.interval_s,
             status: snapshot.status,
             values: snapshot.values.clone(),
-            needs: snapshot.needs.clone(),
             fetched_at: Some(snapshot.fetched_at.as_second()),
             error_label: snapshot.error.as_deref().map(error_label),
         },
@@ -168,7 +189,6 @@ fn entry(summary: &ServiceSummary, poller: &PollerHandle) -> ServiceValues {
             interval_s: summary.interval_s,
             status: Status::Unknown,
             values: BTreeMap::new(),
-            needs: Vec::new(),
             fetched_at: None,
             error_label: None,
         },
@@ -184,13 +204,14 @@ pub async fn values_for(
     viewer: impl Into<Viewer>,
     layout: &Layout,
 ) -> Result<ValuesDoc, DbError> {
+    let viewer = viewer.into();
     let summaries = bound_visible(core, viewer, layout).await?;
-    Ok(doc_of(&summaries, poller))
+    doc_of(core, viewer, &summaries, poller).await
 }
 
 /// The services bound on `layout` that `viewer` may see: the intersection
-/// everything here is built from. Nothing outside it is ever named.
-async fn bound_visible(
+/// the values and the needs are built from. Nothing outside it is ever named.
+pub(crate) async fn bound_visible(
     core: &Core,
     viewer: impl Into<Viewer>,
     layout: &Layout,
@@ -204,14 +225,20 @@ async fn bound_visible(
     Ok(visible)
 }
 
-fn doc_of(summaries: &[ServiceSummary], poller: &PollerHandle) -> ValuesDoc {
-    ValuesDoc {
+async fn doc_of(
+    core: &Core,
+    viewer: Viewer,
+    summaries: &[ServiceSummary],
+    poller: &PollerHandle,
+) -> Result<ValuesDoc, DbError> {
+    Ok(ValuesDoc {
         now: jiff::Timestamp::now().as_second(),
         services: summaries
             .iter()
             .map(|s| (s.id.to_string(), entry(s, poller)))
             .collect(),
-    }
+        needs: needs::needs_of(core, poller, viewer, summaries).await?,
+    })
 }
 
 pub fn router() -> Router<Core> {
@@ -230,17 +257,20 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Wakes one stream (`wake`) for what the poller or the services announce.
+/// Wakes one stream (`wake`) for what the poller or the services announce, and
+/// for an acknowledgement of `user_id`'s (the others' are not its business).
 /// A channel that fell behind is noted in `lagged`: the stream then sends
-/// everything again. Ends when the stream is gone or both sources are closed.
+/// everything again. Ends when the stream is gone or every source is closed.
 async fn forward(
     mut readings: broadcast::Receiver<Change>,
     mut services: broadcast::Receiver<ServiceEvent>,
+    mut acks: broadcast::Receiver<i64>,
+    user_id: i64,
     wake: broadcast::Sender<()>,
     lagged: Arc<AtomicBool>,
 ) {
-    let (mut readings_open, mut services_open) = (true, true);
-    while readings_open || services_open {
+    let (mut readings_open, mut services_open, mut acks_open) = (true, true, true);
+    while readings_open || services_open || acks_open {
         let lag = tokio::select! {
             r = readings.recv(), if readings_open => match r {
                 Ok(_) => false,
@@ -251,6 +281,12 @@ async fn forward(
                 Ok(_) => false,
                 Err(RecvError::Lagged(_)) => true,
                 Err(RecvError::Closed) => { services_open = false; continue }
+            },
+            r = acks.recv(), if acks_open => match r {
+                Ok(id) if id == user_id => false,
+                Ok(_) => continue,
+                Err(RecvError::Lagged(_)) => true,
+                Err(RecvError::Closed) => { acks_open = false; continue }
             },
         };
         if lag {
@@ -270,9 +306,13 @@ struct Open {
     changes: Changes<()>,
     /// What the client has: each entry as it was sent.
     sent: HashMap<i64, String>,
-    /// The services this stream has sent a view of (`services_add`); an id
-    /// leaves it when it is removed, so it is sent again if it comes back.
-    viewed: HashSet<i64>,
+    /// The ids of the services the user could see at the last wake, that is, the
+    /// services this stream has sent a view of (`services_add`); an id leaves
+    /// it when the service is hidden or deleted, so a view is sent again if it
+    /// comes back.
+    viewed: BTreeSet<i64>,
+    /// The needs list as last sent, serialised.
+    sent_needs: String,
     first: bool,
     lagged: Arc<AtomicBool>,
     shutdown: watch::Receiver<bool>,
@@ -302,19 +342,26 @@ impl Open {
             }
         };
         let viewer = Viewer::new(user.id, user.role.is_admin());
-        let summaries = match layout::load_or_default(&self.core, id).await {
-            Ok((layout, _)) => bound_visible(&self.core, viewer, &layout).await,
-            Err(err) => Err(err),
+        let read = async {
+            let (layout, _) = layout::load_or_default(&self.core, id).await?;
+            let visible = store::visible_to(&self.core, viewer).await?;
+            let bound = bound_ids(&layout);
+            let summaries: Vec<ServiceSummary> = visible
+                .iter()
+                .filter(|s| bound.contains(&s.id))
+                .cloned()
+                .collect();
+            let doc = doc_of(&self.core, viewer, &summaries, &self.poller).await?;
+            Ok::<_, DbError>((visible, doc))
         };
-        let summaries = match summaries {
-            Ok(list) => list,
+        let (visible, doc) = match read.await {
+            Ok(read) => read,
             Err(err) => {
                 tracing::warn!(%err, "live values: could not read the values; ending the stream");
                 return Turn::End;
             }
         };
 
-        let doc = doc_of(&summaries, &self.poller);
         // (Not `full || take(..)`: that would leave `first` set.)
         let first = std::mem::take(&mut self.first);
         let full = full || first;
@@ -340,23 +387,34 @@ impl Open {
         removed.sort_unstable();
         // The views the client has not been given: the services list it holds
         // (the page's `#mm-services`) may lack a service that has become visible.
-        let add: Vec<ServiceView> = summaries
+        let now_visible: BTreeSet<i64> = visible.iter().map(|s| s.id).collect();
+        let add: Vec<ServiceView> = visible
             .iter()
             .filter(|s| full || !self.viewed.contains(&s.id))
             .map(view_of)
             .collect();
-        self.viewed = current.keys().copied().collect();
+        let visible_changed = full || self.viewed != now_visible;
+        let needs_text = serde_json::to_string(&doc.needs).unwrap_or_default();
+        let needs_changed = full || self.sent_needs != needs_text;
+        self.viewed = now_visible;
         self.sent = current;
-        if !full && entries.is_empty() && removed.is_empty() {
+        self.sent_needs = needs_text;
+        if !full && entries.is_empty() && removed.is_empty() && !visible_changed && !needs_changed {
             return Turn::Nothing;
         }
-        let data = serde_json::json!({
+        let mut data = serde_json::json!({
             "now": doc.now,
             "full": full,
             "services": entries,
             "removed": removed,
             "services_add": add,
         });
+        if visible_changed {
+            data["services_visible"] = serde_json::json!(self.viewed);
+        }
+        if needs_changed {
+            data["needs"] = serde_json::json!(doc.needs);
+        }
         Turn::Send(Event::default().event("values").data(data.to_string()))
     }
 }
@@ -380,7 +438,8 @@ async fn live_values(
         return live::busy();
     };
     let id = user.id;
-    let Some(user_slot) = UserSlot::acquire(id) else {
+    let instance = Arc::as_ptr(&magpie.shutdown) as usize;
+    let Some(user_slot) = UserSlot::acquire(instance, id) else {
         tracing::warn!(user = id, "too many live value streams for one user");
         return live::busy();
     };
@@ -397,6 +456,8 @@ async fn live_values(
     let forwarder = tokio::spawn(forward(
         magpie.poller.subscribe(),
         magpie.service_events.subscribe(),
+        magpie.ack_events.subscribe(),
+        id,
         wake,
         lagged.clone(),
     ));
@@ -409,7 +470,8 @@ async fn live_values(
         session_version,
         changes: Changes::all(wake_rx).quiet(QUIET),
         sent: HashMap::new(),
-        viewed: HashSet::new(),
+        viewed: BTreeSet::new(),
+        sent_needs: String::new(),
         first: true,
         lagged,
         shutdown,

@@ -543,6 +543,9 @@ impl Job {
             {
                 snapshot.needs.push(need);
             }
+            let before = self.shared.read().snapshots.get(&self.service.id).cloned();
+            date_needs(&mut snapshot, before.as_deref());
+            self.clear_acks(&snapshot, before.as_deref()).await;
             tracing::debug!(
                 service_id = self.service.id,
                 kind = %self.service.kind,
@@ -554,6 +557,26 @@ impl Job {
             self.shared
                 .publish(self.service.id, self.generation, Arc::new(snapshot));
             tokio::time::sleep(jitter(next_wait(interval, failures))).await;
+        }
+    }
+
+    /// Deletes everybody's acknowledgements of the needs that are gone from
+    /// `snapshot` (an acknowledgement is of one run of a need: one that comes
+    /// back is shown again). Only when a need has gone since the snapshot
+    /// before it, or when there is none to compare with.
+    async fn clear_acks(&self, snapshot: &Snapshot, before: Option<&Snapshot>) {
+        let gone = before.is_none_or(|before| {
+            before
+                .needs
+                .iter()
+                .any(|n| snapshot.needs.iter().all(|m| m.key != n.key))
+        });
+        if !gone {
+            return;
+        }
+        let keys = snapshot.needs.iter().map(|n| n.key.clone()).collect();
+        if let Err(err) = crate::needs::clear_gone(&self.core, self.service.id, keys).await {
+            tracing::warn!(service_id = self.service.id, %err, "poller can't clear acknowledgements");
         }
     }
 
@@ -632,6 +655,26 @@ impl Job {
     }
 }
 
+/// Gives each need of `snapshot` the time it began: the one it has, else the
+/// one the same need had in the reading before, else the time of this reading.
+/// A need that was not in the reading before begins now, also when it was
+/// there earlier and went.
+fn date_needs(snapshot: &mut Snapshot, before: Option<&Snapshot>) {
+    let fetched_at = snapshot.fetched_at;
+    for need in &mut snapshot.needs {
+        if need.since.is_some() {
+            continue;
+        }
+        let carried = before.and_then(|b| {
+            b.needs
+                .iter()
+                .find(|n| n.key == need.key)
+                .map(|n| n.since.unwrap_or(b.fetched_at))
+        });
+        need.since = Some(carried.unwrap_or(fetched_at));
+    }
+}
+
 /// Whether the reading failed because the settings or the secret can't be
 /// used, which an admin has to fix.
 fn is_config_error(snapshot: &Snapshot) -> bool {
@@ -656,6 +699,7 @@ fn bad_need(service: &Service, snapshot: &Snapshot) -> Option<Need> {
         // Constant: the service is down or it is not, so an acknowledgement
         // is not undone by the next fetch.
         score: 1.0,
+        since: None,
     })
 }
 

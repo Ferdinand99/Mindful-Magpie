@@ -335,6 +335,8 @@ export function startEditing(root, getLayout, save, opts = {}) {
     return {
       lang,
       labels: ui.labels,
+      // The start page can acknowledge needs; its script wires the buttons.
+      canAck: true,
       ...(Array.isArray(opts.services) ? { services: opts.services } : {}),
       ...(values && typeof values === "object" ? { values } : {}),
     };

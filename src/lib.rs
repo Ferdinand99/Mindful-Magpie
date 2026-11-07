@@ -13,6 +13,7 @@ pub mod connect;
 pub mod db;
 pub mod integrations;
 pub mod layout;
+pub mod needs;
 pub mod pages;
 pub mod product;
 pub mod server;
@@ -57,6 +58,10 @@ pub struct Magpie {
     /// The latest snapshot of every service (see [`integrations::poller`]).
     /// Idle until the server starts the poller; pages only read from it.
     pub poller: integrations::poller::PollerHandle,
+    /// Announces the id of a user who acknowledged a need or took an
+    /// acknowledgement back, so that their open streams (see [`values`])
+    /// send the new list. With no stream a send is dropped.
+    pub ack_events: tokio::sync::broadcast::Sender<i64>,
     /// Set when the server is told to stop: open event streams (see
     /// [`values`]) end, because the server waits for every connection to
     /// finish before it exits.
@@ -130,6 +135,7 @@ pub async fn start_with(
         backgrounds,
         service_events: tokio::sync::broadcast::channel(64).0,
         poller: integrations::poller::PollerHandle::idle(),
+        ack_events: tokio::sync::broadcast::channel(64).0,
         shutdown: Arc::new(tokio::sync::watch::channel(false).0),
     })
 }
@@ -146,6 +152,7 @@ pub fn router(magpie: Magpie) -> Router {
         .merge(api::router())
         .merge(services::pages::router())
         .merge(values::router())
+        .merge(needs::router())
         .merge(kit_pages::router())
         // Inside the sign-in guard: sees who is signed in (see the function).
         .route_layer(from_fn(pages::sweep_after_user_delete))

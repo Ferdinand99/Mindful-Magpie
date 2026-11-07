@@ -3,8 +3,9 @@
 // draws them with the shared renderer. It never moves focus. Edit mode (edit.js)
 // is loaded only when the person presses the Edit button. Numbers of bound
 // cards come from #mm-values and stay current through an event stream (see
-// initLive).
-import { render, tickAges, updateValues } from "./render.js";
+// initLive); so does the «Trenger deg» row, whose «Kvitter» buttons are wired in
+// initNeeds.
+import { render, tickAges, toggleAckedNeeds, updateValues } from "./render.js";
 
 function readJson(doc, id) {
   const block = doc.getElementById(id);
@@ -56,7 +57,7 @@ export function draw(doc) {
   // An unreadable layout draws as the empty page; the notice above says why.
   const layout = readJson(doc, "mm-layout");
   const labels = readJson(doc, "mm-labels") ?? {};
-  render(root, layout, { lang: doc.documentElement.lang, labels, ...servicesOpt(doc), ...valuesOpt(doc) });
+  render(root, layout, { lang: doc.documentElement.lang, labels, canAck: true, ...servicesOpt(doc), ...valuesOpt(doc) });
 }
 
 /**
@@ -445,10 +446,12 @@ function toMs(value) {
 /**
  * Merges a stream event into the values the page has. A `full` event replaces
  * them; any other event adds and replaces the entries it carries and drops the
- * ids in `removed`. Returns `{ values, removed }`, `removed` being every id the
- * person no longer gets (the service was deleted, hidden or unbound), so that
- * the caller can drop it from the services list too. Neither argument is
- * changed.
+ * ids in `removed`. The needs list (the person's «Trenger deg», acknowledgements
+ * applied) is replaced when the event carries one and kept when it does not.
+ * Returns `{ values, removed }`, `removed` being every id whose values the person
+ * no longer gets (the service was deleted, hidden or unbound). It says nothing of
+ * the services list the editor offers: that follows `services_visible` (see
+ * mergeServices). Neither argument is changed.
  */
 export function mergeValues(current, update) {
   const before = current && typeof current.services === "object" && current.services ? current.services : {};
@@ -461,18 +464,23 @@ export function mergeValues(current, update) {
   if (update?.full) {
     for (const id of Object.keys(before)) if (!(id in sent)) removed.add(id);
   }
-  return { values: { now: update?.now ?? current?.now, services }, removed: [...removed] };
+  const needs = Array.isArray(update?.needs) ? update.needs : Array.isArray(current?.needs) ? current.needs : [];
+  return { values: { now: update?.now ?? current?.now, services, needs }, removed: [...removed] };
 }
 
 /**
- * The services list after an event: the removed ones gone, the views the event
- * adds (`services_add`: a service that became visible while the page was open)
- * put in, or replacing the one the list has, and names and intervals as the
- * event's entries have them. By name, as the server lists them.
+ * The services list after an event (the list the editor's picker offers): when
+ * the event says which services the person may see (`visible`, its
+ * `services_visible`: every id, sent when the set changed), the others gone;
+ * the views the event adds (`services_add`: a service that became visible while
+ * the page was open) put in, or replacing the one the list has, and names and
+ * intervals as the event's entries have them. By name, as the server lists them.
+ * Without `visible` nobody is dropped: a service that is visible but not bound to
+ * a card (its values were removed) is still to be offered.
  */
-export function mergeServices(list, values, removed, add = []) {
-  const gone = new Set(removed.map(String));
-  const out = list.filter((s) => !gone.has(String(s?.id)));
+export function mergeServices(list, values, visible, add = []) {
+  const keep = Array.isArray(visible) ? new Set(visible.map(String)) : null;
+  const out = list.filter((s) => keep === null || keep.has(String(s?.id)));
   for (const view of Array.isArray(add) ? add : []) {
     if (!view || typeof view !== "object" || view.id === undefined) continue;
     const at = out.findIndex((s) => String(s?.id) === String(view.id));
@@ -657,11 +665,11 @@ export function initLive(doc, deps = {}) {
 
   /** Takes an update (an event's data) into the page: the blocks first, then the cards. */
   function apply(update) {
-    const { values, removed } = mergeValues(readJson(doc, "mm-values"), update);
+    const { values } = mergeValues(readJson(doc, "mm-values"), update);
     writeBlock(doc, "mm-values", values);
     const listed = readJson(doc, "mm-services");
     if (Array.isArray(listed)) {
-      writeBlock(doc, "mm-services", mergeServices(listed, values, removed, update.services_add));
+      writeBlock(doc, "mm-services", mergeServices(listed, values, update.services_visible, update.services_add));
     }
     learnClock(values);
     // Edit mode owns the page; the blocks are current for when it ends.
@@ -672,6 +680,7 @@ export function initLive(doc, deps = {}) {
     const options = {
       lang: doc.documentElement.lang,
       labels: readJson(doc, "mm-labels") ?? {},
+      canAck: true,
       ...servicesOpt(doc),
       values,
     };
@@ -693,9 +702,109 @@ export function initLive(doc, deps = {}) {
   return { sync, close, tick, apply, isOpen: () => source !== null };
 }
 
+// ---- «Trenger deg» --------------------------------------------------------------
+
+export const NEEDS_ACK_URL = "/start/needs/ack";
+export const NEEDS_UNACK_URL = "/start/needs/unack";
+
+/**
+ * Wires the buttons of the «Trenger deg» row (found at click time, one listener on
+ * the document, so a row that is drawn again needs no new wiring): «Kvitter» and
+ * the undo button post `{ service_id, key }` to `/start/needs/ack` and
+ * `/start/needs/unack` (with the `HX-Request` header, the same-origin proof the
+ * server asks for besides the cookie), and the toggle «N kvittert» shows and hides
+ * the acknowledged ones. The server answers with the person's new list; it goes
+ * through `deps.apply` (initLive's, which writes `#mm-values` and updates the row
+ * in place) at once, and the person's other tabs get it from their streams. A
+ * refusal or a failure changes nothing and is said in the row's live region.
+ *
+ * The one place focus is moved: the person pressed the button, so it is given to
+ * what took its place (the next chip, or the toggle when none is left), not left on
+ * a button that is gone. A second press while one is on its way does nothing.
+ *
+ * `deps` (for tests): `apply` (required for any change), `fetch`.
+ */
+export function initNeeds(doc, deps = {}) {
+  const win = doc.defaultView;
+  const request = deps.fetch ?? ((...args) => (win?.fetch ?? globalThis.fetch)(...args));
+  let busy = false;
+
+  function fail() {
+    const labels = readJson(doc, "mm-labels") ?? {};
+    const live = doc.querySelector("#groups .mm-needs-live");
+    if (live) live.textContent = typeof labels.need_ack_failed === "string" ? labels.need_ack_failed : "";
+  }
+
+  /** Gives the focus to what took the place of the need the person pressed the button of. */
+  function refocus(index, key, service, acknowledged) {
+    const root = doc.getElementById("groups");
+    if (!root) return;
+    const shown = [...root.querySelectorAll(".mm-needs-list:not(.mm-needs-acked) .mm-need")];
+    const inner = (li) => li?.querySelector("a.mm-need-chip") ?? li?.querySelector("button");
+    let target = null;
+    if (acknowledged) {
+      target = inner(shown[index] ?? shown[index - 1]) ?? root.querySelector(".mm-needs-toggle");
+    } else {
+      const back = shown.find((li) => li.getAttribute("data-key") === key && li.getAttribute("data-service") === service);
+      target = inner(back) ?? root.querySelector(".mm-needs-toggle");
+    }
+    target?.focus?.();
+  }
+
+  async function change(button, url, acknowledged) {
+    const item = button.closest(".mm-need");
+    const service = item?.getAttribute("data-service") ?? "";
+    const key = item?.getAttribute("data-key") ?? "";
+    const serviceId = Number(service);
+    if (!item || !Number.isSafeInteger(serviceId) || key === "" || busy || typeof deps.apply !== "function") return;
+    const index = [...doc.querySelectorAll("#groups .mm-needs-list:not(.mm-needs-acked) .mm-need")].indexOf(item);
+    busy = true;
+    button.setAttribute("aria-disabled", "true");
+    try {
+      const response = await request(url, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "HX-Request": "true" },
+        body: JSON.stringify({ service_id: serviceId, key }),
+      });
+      let body = null;
+      try {
+        body = await response.json();
+      } catch {
+        // Not JSON (a proxy's error page): the status says enough.
+      }
+      if (response.status === 200 && Array.isArray(body?.needs)) {
+        deps.apply({ full: false, services: {}, removed: [], needs: body.needs });
+        refocus(index, key, service, acknowledged);
+      } else {
+        fail();
+      }
+    } catch {
+      fail();
+    } finally {
+      busy = false;
+      button.removeAttribute("aria-disabled");
+    }
+  }
+
+  doc.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!target?.closest) return;
+    const toggle = target.closest(".mm-needs-toggle");
+    if (toggle) return toggleAckedNeeds(toggle);
+    const ack = target.closest(".mm-need-ack");
+    const unack = target.closest(".mm-need-unack");
+    const button = ack ?? unack;
+    if (!button || button.getAttribute("aria-disabled") === "true") return;
+    change(button, ack ? NEEDS_ACK_URL : NEEDS_UNACK_URL, Boolean(ack)).catch((error) => globalThis.console?.error?.(error));
+  });
+
+  return { change };
+}
+
 /**
  * Wires a page: edit mode, the first draw and what htmx does to the body. Returns
- * `{ editing, start }`; `start()` draws the page (call it when the document is
+ * `{ editing, start, live, needs }`; `start()` draws the page (call it when the document is
  * ready). `deps` goes to `initEditing` and `reloadIfDataLost` (tests give it a
  * clock, a storage and a `reload`).
  *
@@ -711,6 +820,7 @@ export function wirePage(doc, deps = {}) {
   // `deps.live` goes to `initLive`; edit mode tells it when it opens and closes.
   const live = initLive(doc, deps.live ?? {});
   const editing = initEditing(doc, { ...deps, onEditingChange: () => live.sync() });
+  const needs = initNeeds(doc, { ...deps.needs, apply: live.apply });
   const start = () => {
     // A start page with its data takes off the mark of an earlier reload.
     reloadIfDataLost(doc, deps);
@@ -731,7 +841,7 @@ export function wirePage(doc, deps = {}) {
     editing.offerRestore();
     live.sync();
   });
-  return { editing, start, live };
+  return { editing, start, live, needs };
 }
 
 if (typeof document !== "undefined") {

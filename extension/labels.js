@@ -1,7 +1,7 @@
 // The interface strings of the shared renderer, in English and Norwegian. The keys are the ones
 // the server writes into the start page's #mm-labels block (src/pages.rs, labels()); the texts
 // are the same as in locales/en.toml and locales/nb.toml (start.empty, start.invalid_link,
-// start.group_label, start.bookmarks_label and the service strings), so the new tab reads like the web page. A test keeps
+// start.group_label, start.bookmarks_label, the service strings and the «Trenger deg» strings), so the new tab reads like the web page. A test keeps
 // the key lists equal to the server's.
 
 export const labels = {
@@ -17,6 +17,13 @@ export const labels = {
     status_bad: "Status: problem",
     status_unknown: "Status: unknown",
     updated: "Last updated {when}",
+    needs: "Needs you",
+    need_ack: "Acknowledge",
+    need_ack_for: "Acknowledge: {text}",
+    need_unack: "Undo",
+    need_unack_for: "Undo the acknowledgement: {text}",
+    needs_acked: "{n} acknowledged",
+    needs_show_acked: "Show acknowledged",
   },
   nb: {
     empty: "Startsiden er tom. Rediger den for å legge til tjenester og bokmerker.",
@@ -30,6 +37,13 @@ export const labels = {
     status_bad: "Status: feil",
     status_unknown: "Status: ukjent",
     updated: "Sist oppdatert {when}",
+    needs: "Trenger deg",
+    need_ack: "Kvitter",
+    need_ack_for: "Kvitter: {text}",
+    need_unack: "Angre",
+    need_unack_for: "Angre kvitteringen: {text}",
+    needs_acked: "{n} kvittert",
+    needs_show_acked: "Vis kvitterte",
   },
 };
 

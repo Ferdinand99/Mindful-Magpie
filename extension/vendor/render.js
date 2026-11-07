@@ -472,6 +472,10 @@ export function tickAges(root, opts = {}) {
     else el.removeAttribute("data-stale");
     age.textContent = ageText(labels, opts.lang, fetchedMs, nowMs, stale);
   }
+  for (const age of root.querySelectorAll(".mm-need-age[data-since]")) {
+    const thenMs = Number(age.getAttribute("data-since"));
+    if (Number.isFinite(thenMs)) age.textContent = formatRelative(Math.min(thenMs, nowMs), nowMs, opts.lang);
+  }
   for (const valueEl of root.querySelectorAll(".mm-metric-value[data-since]")) {
     const thenMs = Number(valueEl.getAttribute("data-since"));
     if (!Number.isFinite(thenMs)) continue;
@@ -533,6 +537,7 @@ export function updateValues(root, layout, opts = {}) {
     imageBase: opts.imageBase,
     services: opts.services,
     values: opts.values,
+    canAck: opts.canAck === true,
   };
   const onPage = new Map();
   for (const el of root.querySelectorAll(".mm-bound[data-card]")) {
@@ -565,7 +570,241 @@ export function updateValues(root, layout, opts = {}) {
       else el.appendChild(fresh);
     }
   }
+  updateNeeds(root, layout, settings);
   return complete && handled.size === onPage.size;
+}
+
+// ---- «Trenger deg» -----------------------------------------------------------------
+
+const NEED_LEVELS = ["warn", "bad"];
+
+function isNeed(item) {
+  return (
+    isObject(item) &&
+    Number.isSafeInteger(item.service_id) &&
+    typeof item.key === "string" &&
+    item.key !== "" &&
+    NEED_LEVELS.includes(item.level) &&
+    typeof item.label === "string" &&
+    typeof item.service_name === "string"
+  );
+}
+
+/** The well-formed needs of `values.needs`, or null when the values carry no needs list. */
+function needList(values) {
+  if (!isObject(values) || !Array.isArray(values.needs)) return null;
+  return values.needs.filter(isNeed);
+}
+
+/** The address of the first card of the layout that is bound to the service and has an http(s) link. */
+function needHref(layout, serviceId) {
+  for (const group of Array.isArray(layout?.groups) ? layout.groups : []) {
+    for (const card of Array.isArray(group?.cards) ? group.cards : []) {
+      if (!card || typeof card !== "object") continue;
+      const ref = serviceRef(card);
+      if (!ref || ref.id !== serviceId) continue;
+      const href = safeHref(card.url);
+      if (href) return href;
+    }
+  }
+  return null;
+}
+
+function separator(doc) {
+  const sep = make(doc, "span", "mm-need-sep", " · ");
+  sep.setAttribute("aria-hidden", "true");
+  return sep;
+}
+
+function needButton(doc, className, text, template, item) {
+  const button = make(doc, "button", className, text);
+  button.setAttribute("type", "button");
+  // The name holds the visible word and says which need it is for.
+  if (template !== "") button.setAttribute("aria-label", template.split("{text}").join(item.label));
+  return button;
+}
+
+/** One need: the chip (a link to the bound card when there is one), then its button. */
+function drawNeed(doc, item, href, opts, nowMs) {
+  const labels = opts.labels;
+  const li = make(doc, "li", item.acked ? "mm-need mm-need-acked" : "mm-need");
+  li.setAttribute("data-level", item.level);
+  li.setAttribute("data-service", String(item.service_id));
+  li.setAttribute("data-key", item.key);
+  const chip = make(doc, href ? "a" : "span", "mm-need-chip");
+  if (href) {
+    chip.setAttribute("href", href);
+    chip.setAttribute("rel", "noreferrer");
+  }
+  chip.appendChild(drawStatus(doc, labels, item.level));
+  chip.appendChild(isolated(doc, "span", "mm-need-name", item.service_name));
+  chip.appendChild(separator(doc));
+  chip.appendChild(isolated(doc, "span", "mm-need-text", item.label));
+  const sinceMs = toMs(item.since);
+  if (sinceMs !== null) {
+    chip.appendChild(separator(doc));
+    const age = make(doc, "span", "mm-need-age", formatRelative(Math.min(sinceMs, nowMs), nowMs, opts.lang));
+    // What tickAges() counts from.
+    age.setAttribute("data-since", String(sinceMs));
+    chip.appendChild(age);
+  }
+  li.appendChild(chip);
+  if (opts.canAck) {
+    li.appendChild(
+      item.acked
+        ? needButton(doc, "mm-need-unack", label(labels, "need_unack"), label(labels, "need_unack_for"), item)
+        : needButton(doc, "mm-need-ack", label(labels, "need_ack"), label(labels, "need_ack_for"), item),
+    );
+  }
+  return li;
+}
+
+function needItems(doc, className, items, hrefs, opts, nowMs) {
+  const list = make(doc, "ul", className);
+  items.forEach((item) => list.appendChild(drawNeed(doc, item, hrefs.get(item.service_id) ?? null, opts, nowMs)));
+  return list;
+}
+
+/** What decides whether the row on the page is the row to draw: everything it shows. */
+function needsSignature(items, hrefs, opts) {
+  return JSON.stringify([
+    opts.canAck === true,
+    items.map((i) => [i.service_id, i.service_name, i.key, i.level, i.label, i.since ?? null, i.acked === true, hrefs.get(i.service_id) ?? null]),
+  ]);
+}
+
+/** The row: the title, the chips that still need the person, the toggle and the acknowledged ones. */
+function drawNeeds(doc, items, layout, opts, open) {
+  const nowMs = toMs(opts.values?.now) ?? Date.now();
+  const hrefs = new Map();
+  for (const item of items) hrefs.set(item.service_id, needHref(layout, item.service_id));
+  const section = make(doc, "section", "mm-needs glass");
+  const title = label(opts.labels, "needs");
+  if (title !== "") section.setAttribute("aria-label", title);
+  section.setAttribute("data-open", open ? "true" : "false");
+  section.setAttribute("data-sig", needsSignature(items, hrefs, opts));
+  section.appendChild(make(doc, "h2", "mm-needs-title", title));
+  const showing = items.filter((i) => i.acked !== true);
+  const hidden = items.filter((i) => i.acked === true);
+  if (showing.length > 0) section.appendChild(needItems(doc, "mm-needs-list", showing, hrefs, opts, nowMs));
+  if (hidden.length > 0) {
+    const toggle = make(
+      doc,
+      "button",
+      "mm-needs-toggle",
+      label(opts.labels, "needs_acked").split("{n}").join(String(hidden.length)),
+    );
+    toggle.setAttribute("type", "button");
+    toggle.setAttribute("aria-expanded", open ? "true" : "false");
+    const hint = label(opts.labels, "needs_show_acked");
+    if (hint !== "") toggle.setAttribute("title", hint);
+    section.appendChild(toggle);
+    const list = needItems(doc, "mm-needs-list mm-needs-acked", hidden, hrefs, opts, nowMs);
+    if (!open) list.setAttribute("hidden", "");
+    section.appendChild(list);
+  }
+  return section;
+}
+
+/** The region a screen reader hears new needs from. It is on the page before anything is put in it. */
+function drawNeedsLive(doc) {
+  const live = make(doc, "div", "mm-needs-live mm-vh");
+  live.setAttribute("role", "status");
+  live.setAttribute("aria-live", "polite");
+  return live;
+}
+
+const child = (root, className) => [...root.children].find((el) => el.classList.contains(className));
+
+/** The keys of the needs the row shows as still needing the person. */
+function showingKeys(section) {
+  const keys = new Set();
+  if (!section) return keys;
+  for (const li of section.querySelectorAll(".mm-needs-list:not(.mm-needs-acked) .mm-need")) {
+    keys.add(`${li.getAttribute("data-service")}:${li.getAttribute("data-key")}`);
+  }
+  return keys;
+}
+
+/** What the row's focus stands on, so that it can be given back to the same thing in a new row. */
+function focusMark(doc, section) {
+  const active = doc.activeElement;
+  if (!section || !active || active === section || !section.contains(active)) return null;
+  const item = active.closest?.(".mm-need");
+  const kind = ["mm-need-chip", "mm-need-ack", "mm-need-unack", "mm-needs-toggle"].find((c) => active.classList.contains(c));
+  if (!kind) return null;
+  return { kind, service: item?.getAttribute("data-service"), key: item?.getAttribute("data-key") };
+}
+
+function giveFocusBack(section, mark) {
+  if (!mark) return;
+  let target = null;
+  if (mark.kind === "mm-needs-toggle") {
+    target = section.querySelector(".mm-needs-toggle");
+  } else {
+    for (const li of section.querySelectorAll(".mm-need")) {
+      if (li.getAttribute("data-service") === mark.service && li.getAttribute("data-key") === mark.key) {
+        target = li.querySelector(`.${mark.kind}`);
+      }
+    }
+  }
+  target?.focus?.();
+}
+
+/**
+ * Brings the row up to date with `settings.values.needs` without drawing the page
+ * again: nothing is touched when the row shows what it should; otherwise the row is
+ * replaced (its toggle keeps its state, and focus that stood in it goes back to the same
+ * chip or button if it is still there) and the needs that are new are put into the live
+ * region for a screen reader. No other focus is moved.
+ */
+function updateNeeds(root, layout, settings) {
+  const items = needList(settings.values);
+  // Values that carry no needs list say nothing about them (an older server).
+  if (items === null) return;
+  const doc = root.ownerDocument;
+  const old = child(root, "mm-needs");
+  let live = child(root, "mm-needs-live");
+  if (items.length === 0) {
+    if (old) old.parentNode.removeChild(old);
+    if (live) live.textContent = "";
+    return;
+  }
+  const fresh = drawNeeds(doc, items, layout, settings, old?.getAttribute("data-open") === "true");
+  if (old && old.getAttribute("data-sig") === fresh.getAttribute("data-sig")) return;
+  const mark = focusMark(doc, old);
+  const before = showingKeys(old);
+  if (old) {
+    root.replaceChild(fresh, old);
+  } else {
+    root.insertBefore(fresh, live ? live.nextSibling : root.firstChild);
+  }
+  if (!live) {
+    live = drawNeedsLive(doc);
+    root.insertBefore(live, root.firstChild);
+  }
+  live.textContent = items
+    .filter((i) => i.acked !== true && !before.has(`${i.service_id}:${i.key}`))
+    .map((i) => i.label)
+    .join(". ");
+  giveFocusBack(fresh, mark);
+}
+
+/**
+ * The toggle «N kvittert» of the row: shows or hides the needs that are
+ * acknowledged. `button` is the toggle (`.mm-needs-toggle`); the renderer has no
+ * handlers, the page wires this to a click.
+ */
+export function toggleAckedNeeds(button) {
+  const section = button?.closest?.(".mm-needs");
+  if (!section) return;
+  const open = button.getAttribute("aria-expanded") !== "true";
+  button.setAttribute("aria-expanded", open ? "true" : "false");
+  section.setAttribute("data-open", open ? "true" : "false");
+  const list = section.querySelector(".mm-needs-acked");
+  if (!list) return;
+  if (open) list.removeAttribute("hidden");
+  else list.setAttribute("hidden", "");
 }
 
 function drawGroup(doc, group, opts) {
@@ -689,6 +928,22 @@ function applyBackground(doc, background, opts) {
  * keeps the ages current later, updateValues() swaps new values in without
  * touching the cards' own elements (so focus stays), and formatValue() is the
  * number formatting.
+ *
+ * «Trenger deg»: `opts.values.needs` is `[{ service_id, service_name, key, level
+ * (warn|bad), label, since (epoch seconds), acked }]`, the server's list for this
+ * person (it applies the acknowledgements and leaves out what the person may not see).
+ * When the list is there, an empty live region (`.mm-needs-live`, role status) comes
+ * first in `root`; when it holds anything, so does the row (`.mm-needs`) right after
+ * it, before the groups. A need that is not acknowledged is a chip, "service · text ·
+ * age" with the status shape of its level, a link to the first card bound to the
+ * service (same tab) or plain text, and, with `opts.canAck`, a «Kvitter» button
+ * after it (`.mm-need-ack`; off unless `canAck` is true: the extension is read-only).
+ * Acknowledged ones are behind the toggle «N kvittert» (`.mm-needs-toggle`, wired with
+ * toggleAckedNeeds()) with an undo button each (`.mm-need-unack`, canAck only). The
+ * row is absent when there is no need at all. Labels: `needs`, `need_ack`,
+ * `need_ack_for` (with `{text}`), `need_unack`, `need_unack_for`, `needs_acked`
+ * (with `{n}`) and `needs_show_acked`. updateValues() brings the row up to date in
+ * place and announces new needs in the live region; focus is never moved.
  */
 export function render(root, layout, opts = {}) {
   const doc = root.ownerDocument;
@@ -698,6 +953,7 @@ export function render(root, layout, opts = {}) {
     imageBase: opts.imageBase,
     services: opts.services,
     values: opts.values,
+    canAck: opts.canAck === true,
   };
 
   applyBackground(doc, layout?.background, settings);
@@ -710,6 +966,13 @@ export function render(root, layout, opts = {}) {
   );
 
   const fragment = doc.createDocumentFragment();
+  // «Trenger deg» comes first: the region for a screen reader (empty, so that nothing is
+  // announced on load, and there before a need appears), then the row if there is a need.
+  const needs = needList(settings.values);
+  if (needs !== null) {
+    fragment.appendChild(drawNeedsLive(doc));
+    if (needs.length > 0) fragment.appendChild(drawNeeds(doc, needs, layout, settings, false));
+  }
   if (groups.length === 0 && bookmarks.length === 0) {
     fragment.appendChild(drawEmpty(doc, settings));
   } else {

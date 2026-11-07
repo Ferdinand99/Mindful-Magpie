@@ -8,8 +8,8 @@
    #groups) and lays out nothing but what is in it.
 
    Contents: glass, backgrounds (presets and image), groups and cards, tiles,
-   cards bound to a service (status dot, metric cells, age), bookmark pills,
-   the empty state. */
+   cards bound to a service (status dot, metric cells, age), the «Trenger deg»
+   row, bookmark pills, the empty state. */
 
 /* Glass: a translucent card over the background. */
 .glass,
@@ -314,6 +314,135 @@ a.mm-card {
 .mm-card[data-stale] .mm-metric-value {
   color: var(--muted);
   font-weight: 400;
+}
+
+/* «Trenger deg» -----------------------------------------------------------------
+   One glass row above the groups (render() draws it only when something needs the
+   person): the title, a chip for each need that is not acknowledged, and the toggle
+   for the ones that are. A chip is "service, text, age" with the dot of its level (the
+   same shapes as a card's: warn a triangle, bad a square), so the level never rests on
+   colour alone, and a small button after it. The live region is for screen readers. */
+.mm-needs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2) var(--sp-3);
+  margin-block-end: var(--sp-5);
+  padding: var(--sp-3) var(--sp-4);
+}
+.mm-needs-title {
+  margin: 0;
+  margin-inline-end: var(--sp-1);
+  color: var(--muted);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+.mm-needs-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.mm-needs-list[hidden] {
+  display: none;
+}
+/* The acknowledged ones, when shown, take a line of their own. */
+.mm-needs-acked {
+  flex-basis: 100%;
+}
+.mm-need {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  min-width: 0;
+  max-width: 100%;
+  padding: 0.1875rem 0.1875rem 0.1875rem 0.625rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+}
+.mm-need[data-level="bad"] {
+  border-color: var(--bad-text);
+}
+.mm-need[data-level="warn"] {
+  border-color: var(--warn-text);
+}
+.mm-need-acked .mm-need-chip {
+  color: var(--muted);
+}
+.mm-need-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  min-width: 0;
+  color: var(--text);
+  font-size: 0.8125rem;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+@media (hover: hover) and (pointer: fine) {
+  a.mm-need-chip:hover {
+    text-decoration: underline;
+  }
+}
+.mm-need-sep,
+.mm-need-age {
+  color: var(--muted);
+}
+.mm-need-age {
+  white-space: nowrap;
+}
+.mm-need-ack,
+.mm-need-unack,
+.mm-needs-toggle {
+  flex: none;
+  padding: 0.25rem 0.625rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.75rem;
+  line-height: 1.2;
+  cursor: pointer;
+}
+.mm-needs-toggle {
+  color: var(--muted);
+}
+@media (hover: hover) and (pointer: fine) {
+  .mm-need-ack:hover,
+  .mm-need-unack:hover,
+  .mm-needs-toggle:hover {
+    border-color: var(--brand);
+    color: var(--text);
+  }
+}
+.mm-need-chip:focus-visible,
+.mm-need-ack:focus-visible,
+.mm-need-unack:focus-visible,
+.mm-needs-toggle:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+.mm-need-ack[aria-disabled="true"],
+.mm-need-unack[aria-disabled="true"] {
+  opacity: 0.6;
+  cursor: progress;
+}
+/* Hidden from the eye, read by a screen reader. */
+.mm-vh {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 /* Bookmark pills ---------------------------------------------------------------- */

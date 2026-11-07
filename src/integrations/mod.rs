@@ -242,8 +242,8 @@ impl Value {
     }
 }
 
-/// How serious a [`Need`] is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// How serious a [`Need`] is. `Warn` is less than `Bad`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Level {
     Warn,
@@ -262,6 +262,13 @@ pub struct Need {
     /// Higher is worse.
     #[serde(default)]
     pub score: f64,
+    /// When the need began. A kind may set it, to a time that stays the same
+    /// while the need does (an acknowledgement stops hiding a need whose
+    /// `since` is later than the acknowledgement); the poller fills it in for
+    /// a need that has none (the time of the reading that first had it) and
+    /// carries it over from one reading to the next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<Timestamp>,
 }
 
 /// Why a fetch gave no reading. The texts are fixed (they end up on pages and

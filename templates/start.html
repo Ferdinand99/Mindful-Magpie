@@ -27,11 +27,6 @@
   </div>
 </div>
 
-{#- "Needs you": a row of alerts, shown only when something needs attention. -#}
-<section class="glass needs" id="needs" aria-labelledby="needs-title" hidden>
-  <h2 class="needs-title" id="needs-title">{{ tr("start.needs") }}</h2>
-</section>
-
 {#- The stored layout could not be read. The button is a plain form post, so it works without scripts. -#}
 {% if corrupt %}
 <section class="glass mm-notice" id="mm-corrupt" aria-labelledby="mm-corrupt-text">
