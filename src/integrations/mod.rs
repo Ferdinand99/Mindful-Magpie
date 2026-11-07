@@ -22,6 +22,7 @@ pub mod http_kind;
 pub mod kk;
 pub mod poller;
 pub mod vv;
+pub mod ww_kind;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -80,7 +81,12 @@ pub trait Integration: Send + Sync + 'static {
 
 /// The kinds compiled into this build.
 pub fn registry() -> &'static [&'static dyn Integration] {
-    static KINDS: [&dyn Integration; 3] = [&http_kind::HTTP, &vv::VV, &kk::KK];
+    static KINDS: [&dyn Integration; 4] = [
+        &http_kind::HTTP,
+        &vv::VV,
+        &kk::KK,
+        &ww_kind::WW,
+    ];
     &KINDS
 }
 

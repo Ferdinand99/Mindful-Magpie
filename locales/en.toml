@@ -238,6 +238,7 @@ http_expected = "Use a status like 200, a range like 200-399, or a list like 200
 http = "Website"
 vv = "Vigilant Vole"
 kk = "Keen Kestrel"
+ww = "Wise Wren"
 
 [field]
 http_expected = "Expected status"
@@ -248,6 +249,8 @@ vv_token = "API token"
 vv_token_help = "Create a read token in Vigilant Vole under Settings → API tokens, with the scope \"Read\". Stored encrypted."
 kk_secret = "Read token"
 kk_secret_help = "Create a read token in Keen Kestrel under Settings → API tokens, scope «Read». Sent as Authorization: Bearer. Stored encrypted."
+ww_secret = "Read token"
+ww_secret_help = "In Wise Wren, create a token under Settings → API tokens with the scope \"Read\" and paste it here. Sent as Authorization: Bearer. Stored encrypted."
 
 [metric]
 http_status = "HTTP status"
@@ -266,6 +269,11 @@ kk_crash_free = "Crash-free sessions"
 kk_visitors_today = "Visitors today"
 kk_app_users_today = "App users today"
 kk_newest_issue = "Newest issue"
+ww_updates_ready = "Updates ready"
+ww_agents_online = "Agents online"
+ww_agents_total = "Agents total"
+ww_last_run = "Last run"
+ww_failed_targets = "Failed updates"
 
 [fetch_err]
 config = "The settings can't be used"
@@ -283,6 +291,8 @@ kk_too_old = "Requires Keen Kestrel 0.10 or newer"
 
 [need]
 http_down = "{name} is not answering"
+ww_failed = "{count} updates failed"
+ww_offline = "{count} agents offline"
 service_config = "{name} needs to be set up again"
 vv_down = "{count} down"
 kk_regressed = "{count} regressions"
