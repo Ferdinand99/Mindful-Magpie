@@ -64,6 +64,16 @@ jobs:
         working-directory: web
         run: node --test
 
+      # extension/vendor/ holds the renderer that the extension ships (copied from static/magpie/
+      # by web/build-extension.mjs). Fail when the committed copies are out of date with their
+      # sources: build again and expect no change, new file or missing file.
+      - name: The extension's vendored renderer is up to date
+        working-directory: web
+        run: |
+          npm run build:extension
+          git diff --exit-code -- ../extension/vendor
+          test -z "$(git status --porcelain -- ../extension/vendor)"
+
       # Mozilla's manifest and code checks for the extension. Errors fail the job. The extension
       # is signed unlisted (see extension.yml), so this is the self-hosted lint profile.
       - name: Lint the extension
