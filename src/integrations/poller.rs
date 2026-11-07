@@ -45,7 +45,7 @@
 //! an address or a secret: log lines carry the service id, the kind and a
 //! [`FetchError`] text, which is a fixed set.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -56,6 +56,7 @@ use vole_kit::db;
 use vole_kit::state::Core;
 
 use super::{FetchError, Integration, Level, Need, Snapshot, Status};
+use crate::history::{self, History, Point};
 use crate::services::{Service, ServiceEvent, store};
 
 /// How long one fetch may take before the poller gives up on it. The HTTP
@@ -123,6 +124,8 @@ struct State {
 
 struct Shared {
     state: RwLock<State>,
+    /// The series of every number the services report (see [`crate::history`]).
+    history: History,
     changes: broadcast::Sender<Change>,
 }
 
@@ -130,6 +133,7 @@ impl Shared {
     fn new() -> Arc<Self> {
         Arc::new(Shared {
             state: RwLock::new(State::default()),
+            history: History::default(),
             changes: broadcast::channel(256).0,
         })
     }
@@ -146,19 +150,36 @@ impl Shared {
         let mut state = self.write();
         state.live.remove(&id);
         state.snapshots.remove(&id);
+        drop(state);
+        self.history.forget(id);
     }
 
-    /// Stores `snapshot` and announces `id`, unless `generation` is no longer
-    /// the service's.
-    fn publish(&self, id: i64, generation: u64, snapshot: Arc<Snapshot>) {
-        {
+    /// Stores `snapshot`, records its numbers in the history (before the
+    /// announcement, so whoever wakes for it sees the new point) and announces
+    /// `id`, unless `generation` is no longer the service's. Returns what the
+    /// history tables are to be given for a good reading.
+    fn publish(
+        &self,
+        id: i64,
+        generation: u64,
+        interval_s: i64,
+        snapshot: Arc<Snapshot>,
+    ) -> Option<history::Write> {
+        let write = {
             let mut state = self.write();
             if state.live.get(&id) != Some(&generation) {
-                return;
+                return None;
             }
+            let numbers = history::numbers(&snapshot);
+            let write = (!numbers.is_empty()).then(|| {
+                self.history
+                    .record(id, interval_s, snapshot.fetched_at.as_second(), numbers)
+            });
             state.snapshots.insert(id, snapshot);
-        }
+            write
+        };
         let _ = self.changes.send(Change::Snapshot(id));
+        write
     }
 }
 
@@ -238,11 +259,39 @@ impl PollerHandle {
         self.shared.read().snapshots.get(&service_id).cloned()
     }
 
+    /// The last 24 hours of the numbers `metrics` of the service, by metric,
+    /// oldest point first (see [`crate::history`]). Never waits on the database.
+    pub fn history(
+        &self,
+        service_id: i64,
+        metrics: &BTreeSet<String>,
+        now: i64,
+    ) -> BTreeMap<String, Vec<Point>> {
+        self.shared.history.series(service_id, metrics, now)
+    }
+
     /// A [`Change`] each time a service gets a new snapshot or is removed (also
     /// when its deletion arrives as a service event). A receiver that falls far
     /// behind gets `Lagged` and should read every snapshot again.
     pub fn subscribe(&self) -> broadcast::Receiver<Change> {
         self.shared.changes.subscribe()
+    }
+
+    /// Records the numbers of `snapshot` in the service's history as a fetch
+    /// of a service with this interval would, without storing them. Call it
+    /// before [`PollerHandle::set_snapshot_for_tests`], which announces the
+    /// snapshot. **For tests only** (hidden from the docs).
+    #[doc(hidden)]
+    pub fn record_history_for_tests(&self, service_id: i64, interval_s: i64, snapshot: &Snapshot) {
+        let numbers = history::numbers(snapshot);
+        if !numbers.is_empty() {
+            self.shared.history.record(
+                service_id,
+                interval_s,
+                snapshot.fetched_at.as_second(),
+                numbers,
+            );
+        }
     }
 
     /// Puts `snapshot` in as the service's latest, as a fetch would (and
@@ -393,6 +442,11 @@ impl Supervisor {
 
     /// Puts the stored snapshots in memory, before the first fetch.
     async fn load_stored(&self) {
+        let now = jiff::Timestamp::now().as_second();
+        match db::interact(&self.core.db, move |c| history::load_rows(c, now)).await {
+            Ok(rows) => self.shared.history.load(rows),
+            Err(err) => tracing::warn!(%err, "poller can't read the stored history"),
+        }
         let rows = db::interact(&self.core.db, |c| {
             let mut stmt = c.prepare("SELECT service_id, json FROM service_snapshots")?;
             stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
@@ -478,6 +532,14 @@ impl Supervisor {
         self.shared.forget(id);
         // Normally the row went with the service already.
         let deleted = db::interact(&self.core.db, move |c| {
+            c.execute(
+                "DELETE FROM service_history WHERE service_id = ?1",
+                params![id],
+            )?;
+            c.execute(
+                "DELETE FROM service_history_daily WHERE service_id = ?1",
+                params![id],
+            )?;
             c.execute(
                 "DELETE FROM service_snapshots WHERE service_id = ?1",
                 params![id],
@@ -600,8 +662,17 @@ impl Job {
                 "poller fetched"
             );
             self.store(&snapshot).await;
-            self.shared
-                .publish(self.service.id, self.generation, Arc::new(snapshot));
+            let written = self.shared.publish(
+                self.service.id,
+                self.generation,
+                i64::try_from(interval.as_secs()).unwrap_or(i64::MAX),
+                Arc::new(snapshot),
+            );
+            if let Some(written) = written
+                && let Err(err) = history::persist(&self.core, written).await
+            {
+                tracing::warn!(service_id = self.service.id, %err, "poller can't store the history");
+            }
             tokio::time::sleep(jitter(next_wait(interval, failures))).await;
         }
     }

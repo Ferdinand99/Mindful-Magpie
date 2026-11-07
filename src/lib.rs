@@ -11,6 +11,7 @@ pub mod api;
 pub mod config;
 pub mod connect;
 pub mod db;
+pub mod history;
 pub mod integrations;
 pub mod layout;
 pub mod needs;
