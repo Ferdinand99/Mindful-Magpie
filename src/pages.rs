@@ -51,6 +51,20 @@ fn clock_in(timezone: &str) -> (String, String) {
     (now.strftime("%H:%M").to_string(), date)
 }
 
+/// The answer to `/` depends on these request headers (a boosted request from
+/// another page gets a redirect), so a cache must not share it between them.
+const VARY: &str = "HX-Boosted, HX-Current-URL";
+
+/// Whether an htmx request comes from the start page itself (`HX-Current-URL`
+/// is the full address of the page that made the request).
+fn on_start_page(headers: &HeaderMap) -> bool {
+    headers
+        .get("hx-current-url")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| url::Url::parse(v).ok())
+        .is_some_and(|u| u.path() == "/")
+}
+
 async fn start(
     State(core): State<Core>,
     user: CurrentUser,
@@ -60,9 +74,11 @@ async fn start(
     // The page's stylesheet and clock script are linked from `<head>`, which a
     // boosted navigation (the Start link in the top bar and the tab bar) does
     // not load, and htmx does not run scripts it swaps in. Reaching the page
-    // that way makes the browser load it in full.
-    if headers.contains_key("hx-boosted") {
-        return Ok(([("hx-redirect", "/")], ()).into_response());
+    // from another page that way makes the browser load it in full. From the
+    // start page itself (its head is already loaded) the boosted request just
+    // swaps in the fresh body: a redirect to `/` would reload it for nothing.
+    if headers.contains_key("hx-boosted") && !on_start_page(&headers) {
+        return Ok(([("hx-redirect", "/"), ("vary", VARY)], ()).into_response());
     }
     let site = core.with_conn(|c| SiteSettings::load(c)).await?;
     let timezone = site.timezone_or_utc().to_string();
@@ -82,7 +98,7 @@ async fn start(
         date,
         timezone,
     };
-    Ok((jar, HtmlTemplate(page)).into_response())
+    Ok((jar, [("vary", VARY)], HtmlTemplate(page)).into_response())
 }
 
 /// The Settings nav item: the first tab the user may open (General for

@@ -5,23 +5,28 @@
 
 /* The start page ------------------------------------------------------------
    Soft colour fields behind the glass cards: the default background (a
-   chosen image replaces it later). */
-.wall {
-  position: fixed;
-  inset: 0;
-  z-index: -1;
-  pointer-events: none;
+   chosen image replaces it later). They are painted on <html>, fixed to the
+   viewport, and <body> is transparent so that nothing covers them.
+   The kit reserves a scrollbar gutter on <html>, and the browser paints that
+   gutter with the plain page colour, never with the gradients: a strip in the
+   page colour at the right edge wherever scrollbars take space (Windows). The
+   start page gives up the reserved gutter, so the gradients reach the edge;
+   a scrollbar only appears when the page really overflows. */
+html:has(.wall) {
+  scrollbar-gutter: auto;
   background:
     radial-gradient(60vw 50vh at 12% 8%, light-dark(rgba(139, 125, 255, 0.28), rgba(139, 125, 255, 0.35)), transparent 60%),
     radial-gradient(55vw 55vh at 88% 18%, light-dark(rgba(255, 100, 130, 0.2), rgba(255, 100, 130, 0.22)), transparent 60%),
     radial-gradient(70vw 60vh at 50% 100%, light-dark(rgba(48, 160, 200, 0.22), rgba(48, 160, 200, 0.22)), transparent 60%),
     var(--bg);
+  background-attachment: fixed;
 }
-
-/* The kit paints <body> with the page colour, which would cover the wall;
-   <html> keeps the page colour underneath. */
 body:has(.wall) {
   background: transparent;
+}
+/* The element is only the hook for the rules above. */
+.wall {
+  display: none;
 }
 
 /* Glass: a translucent card over the wall. */

@@ -66,6 +66,50 @@ async fn boosted_navigation_loads_the_page_in_full() {
     let res = web.send(req).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert_eq!(res.header("hx-redirect"), "/");
+    // The answer depends on the boost header, so caches must keep it apart.
+    assert!(
+        res.header("vary").contains("HX-Boosted"),
+        "vary: {}",
+        res.header("vary")
+    );
+}
+
+#[tokio::test]
+async fn boosted_navigation_from_the_start_page_is_not_reloaded() {
+    // The start page's head is already loaded when the request comes from `/`:
+    // the page is swapped in, with no redirect (that would reload it for nothing).
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    for current in ["http://magpie.test:3010/", "http://magpie.test:3010/?x=1"] {
+        let req = Request::get("/")
+            .header("hx-request", "true")
+            .header("hx-boosted", "true")
+            .header("hx-current-url", current)
+            .body(Body::empty())
+            .unwrap();
+        let res = web.send(req).await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        assert_eq!(res.header("hx-redirect"), "", "redirected from {current}");
+        assert!(res.body.contains(r#"id="groups""#), "{}", res.body);
+        assert!(
+            res.header("vary").contains("HX-Boosted"),
+            "vary: {}",
+            res.header("vary")
+        );
+    }
+
+    // From any other page the redirect stays.
+    let req = Request::get("/")
+        .header("hx-request", "true")
+        .header("hx-boosted", "true")
+        .header(
+            "hx-current-url",
+            "http://magpie.test:3010/settings/security",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let res = web.send(req).await;
+    assert_eq!(res.header("hx-redirect"), "/");
 }
 
 #[tokio::test]
