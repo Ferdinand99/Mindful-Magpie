@@ -391,6 +391,21 @@ test("render_css_styles_the_row_and_hides_the_live_region_visually", () => {
   assert.ok(!/style\s*=/.test(readFileSync(new URL("../static/magpie/render.js", import.meta.url), "utf8").replace(/\/\/.*$/gm, "").replace(/setAttribute\("style"/g, "")), "no style attributes");
 });
 
+test("a_need_wraps_by_word_and_puts_the_button_under_the_text_on_a_narrow_screen", () => {
+  const css = readFileSync(new URL("../static/magpie/render.css", import.meta.url), "utf8");
+  const block = (selector) => {
+    const start = css.indexOf(`
+${selector} {`);
+    assert.ok(start >= 0, `${selector} is in render.css`);
+    return css.slice(start, css.indexOf("}", start));
+  };
+  // The pill and its text both wrap at item boundaries: a name is never cut in the middle.
+  assert.match(block(".mm-need"), /flex-wrap: wrap/);
+  assert.match(block(".mm-need-chip"), /flex-wrap: wrap/);
+  // A pill of two lines is a rounded rectangle, not a capsule that clips its text.
+  assert.doesNotMatch(block(".mm-need"), /border-radius: 999px/);
+});
+
 test("the_row_is_named_by_its_heading_and_the_toggle_controls_the_acknowledged_list", () => {
   const { root } = draw([need(), need({ service_id: 2, key: "b", label: "b", acked: true })]);
   const section = row(root);

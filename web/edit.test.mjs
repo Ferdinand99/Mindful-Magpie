@@ -2477,3 +2477,12 @@ test("a_card_with_a_service_saves_without_a_link_and_a_plain_card_does_not", asy
   await tick();
   assert.equal(dialog.querySelector('input[name="url"]').getAttribute("aria-invalid"), "true");
 });
+
+test("the_numbers_picker_has_room_above_its_legend", () => {
+  // The picker is a fieldset inside the Service field: without a rule its legend sits right under
+  // the hint of the select.
+  const css = readFileSync(new URL("../static/magpie.css", import.meta.url), "utf8");
+  const start = css.indexOf(".field[data-metrics] {");
+  assert.ok(start >= 0, "the rule is in magpie.css");
+  assert.match(css.slice(start, css.indexOf("}", start)), /margin-block-start: var\(--sp-3\)/);
+});

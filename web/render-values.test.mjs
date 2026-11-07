@@ -938,3 +938,9 @@ test("a_changed_service_link_redraws_the_card_in_place", () => {
   updateValues(p.root, layout, { ...opts, services: withLink("") });
   assert.equal(p.root.querySelector(".mm-card").hasAttribute("href"), false);
 });
+
+test("a_bound_card_keeps_its_rows_at_the_top_when_the_row_of_cards_is_taller", () => {
+  const css = readFileSync(new URL("../static/magpie/render.css", import.meta.url), "utf8");
+  // Without it the grid stretches its rows, and the title of a short card sits in the middle.
+  assert.match(cssBlock(css, ".mm-card.mm-bound"), /align-content: start/);
+});

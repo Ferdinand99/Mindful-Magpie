@@ -210,6 +210,9 @@ a.mm-card {
 .mm-card.mm-bound {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
+  /* Cards of one row are as tall as the tallest: the rows stay at the top (the default
+     would stretch them and centre the title of a short card). */
+  align-content: start;
   gap: var(--sp-2) var(--sp-3);
 }
 .mm-svc {
@@ -356,6 +359,9 @@ a.mm-card {
 }
 .mm-need {
   display: inline-flex;
+  /* On a narrow screen the button goes under the text instead of squeezing it (a word is
+     never cut in the middle), so the pill may be two lines high: a rounded rectangle then. */
+  flex-wrap: wrap;
   align-items: center;
   gap: 0.25rem;
   min-width: 0;

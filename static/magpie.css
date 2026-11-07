@@ -318,6 +318,12 @@ html:root:has(.mm-root)[data-bg="image"] #mm-edit:not([aria-pressed="true"]) {
 .mm-swatch-dot[data-colour="brown"] { background: var(--pal-brown); }
 .mm-swatch-dot[data-colour="gray"] { background: var(--pal-gray); }
 
+/* The numbers a service card shows: a fieldset inside the Service field. It gets room above its
+   legend, as between the form's other fields. */
+.field[data-metrics] {
+  margin-block-start: var(--sp-3);
+}
+
 /* The background picker: four preset previews as a radio group, drawn from a
    data attribute (no style attributes), then the upload. */
 .mm-bg-presets {
