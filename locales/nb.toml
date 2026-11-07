@@ -113,6 +113,7 @@ service_none = "Ingen"
 help_service = "Kortet viser tall fra en tjeneste administratoren har satt opp."
 field_metrics = "Tall som vises"
 help_metrics = "Velg fra 1 til 4 tall."
+metrics_gone = "Tjenesten har ikke lenger: {names}. Lagring fjerner dem."
 metrics_full = "Du har valgt 4 tall, det er mest et kort kan vise. Fjern ett for å velge et annet."
 err_service_metrics = "Velg fra 1 til 4 tall fra tjenesten."
 err_bad_service = "Tjenesten kan ikke brukes. Velg en annen, eller Ingen."
@@ -157,6 +158,8 @@ roles_help = "Alle setter opp sin egen startside. Lesere kan ikke endre noe anne
 [tokens]
 sub = "La skript og KI-assistenter lese startsiden din."
 scope_read_sub = "Lenker og tjenester på startsiden"
+scope_owner = "Lese, som deg"
+scope_owner_help = "Leser startsiden din og tjenestene du kan se, slik du selv gjør. Nettleserutvidelsen bruker denne."
 
 [auth]
 all_set = "Alt er klart. Startsiden din er klar."

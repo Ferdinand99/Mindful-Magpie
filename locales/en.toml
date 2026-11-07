@@ -113,6 +113,7 @@ service_none = "None"
 help_service = "The card shows live numbers from a service your admin has set up."
 field_metrics = "Numbers to show"
 help_metrics = "Pick 1 to 4 numbers."
+metrics_gone = "The service no longer has: {names}. Saving removes them."
 metrics_full = "You picked 4 numbers, the most a card can show. Clear one to pick another."
 err_service_metrics = "Pick 1 to 4 numbers from the service."
 err_bad_service = "This service can't be used. Pick another, or None."
@@ -157,6 +158,8 @@ roles_help = "Everyone arranges their own start page. Viewers can't change anyth
 [tokens]
 sub = "Let scripts and AI assistants read your start page."
 scope_read_sub = "Links and services on the start page"
+scope_owner = "Read, as you"
+scope_owner_help = "Reads your start page and the services you may see, as you do. The browser extension uses this."
 
 [auth]
 all_set = "You’re all set. Your start page is ready."

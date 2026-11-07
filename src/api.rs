@@ -34,6 +34,7 @@ use vole_kit::http::ratelimit::{Rate, too_many_requests};
 use vole_kit::state::Core;
 
 use crate::layout::Layout;
+use crate::product::OWNER_SCOPE;
 use crate::services::{ServiceView, Viewer, services_for};
 use crate::values::values_for;
 use crate::{Magpie, connect, layout};
@@ -130,7 +131,7 @@ async fn me_start(
         return Err(ApiError::Forbidden);
     }
     let (layout, _) = layout::load_or_default(&core, user.id).await?;
-    let services = services_for(&core, &user).await?;
+    let services = services_for(&core, Viewer::for_token(&user)).await?;
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(StartDoc { layout, services }),
@@ -267,7 +268,7 @@ async fn extension_token(
                         "DELETE FROM api_tokens WHERE user_id = ?1 AND name = ?2",
                         params![user_id, name],
                     )?;
-                    api_tokens::insert(
+                    let token_id = api_tokens::insert(
                         &tx,
                         user_id,
                         &name,
@@ -276,6 +277,9 @@ async fn extension_token(
                         TokenScope::Read,
                         None,
                     )?;
+                    // Read-only, plus the scope that shows its owner's page as
+                    // the owner sees it (`Viewer::for_token`).
+                    api_tokens::add_scope(&tx, token_id, OWNER_SCOPE)?;
                     if replaced > 0 {
                         tracing::info!(user = %username, token = %name, replaced, "older API tokens of the same device revoked");
                     }

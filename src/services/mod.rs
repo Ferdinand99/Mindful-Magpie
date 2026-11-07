@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value as Json};
 use url::Url;
-use vole_kit::auth::CurrentUser;
+use vole_kit::auth::{CurrentUser, Role};
 
 use crate::integrations::{self, Integration};
 
@@ -98,20 +98,25 @@ impl Viewer {
     }
 }
 
-impl Viewer {
-    /// Who a request made with an API token acts as. (The review round of the
-    /// cards task narrows this to tokens that carry the `start:owner` scope.)
-    pub fn for_token(user: &CurrentUser) -> Self {
-        Viewer::new(user.id, user.account_role.is_admin())
+impl From<&CurrentUser> for Viewer {
+    /// Admin by the request's role: a read-only API token is capped at viewer,
+    /// as everywhere in the kit. Token routes that show the owner's own page
+    /// use [`Viewer::for_token`].
+    fn from(user: &CurrentUser) -> Self {
+        Viewer::new(user.id, user.is_admin())
     }
 }
 
-impl From<&CurrentUser> for Viewer {
-    /// Admin by the account's own role, not the request's: a read-only API
-    /// token caps `CurrentUser::role` at viewer, but the extension that holds it
-    /// shows its owner's page, and an admin's page may use admin-only services.
-    fn from(user: &CurrentUser) -> Self {
-        Viewer::new(user.id, user.account_role.is_admin())
+impl Viewer {
+    /// Who a token request shows the page of: admin when the request is an
+    /// admin's own (a session), or when the token carries the
+    /// [`OWNER_SCOPE`](crate::product::OWNER_SCOPE) scope (the browser
+    /// extension's token, given by the connect flow) and its owner is an
+    /// admin. A plain read-only token of an admin stays a viewer's, so a
+    /// script token that leaks does not show admin-only services.
+    pub fn for_token(user: &CurrentUser) -> Self {
+        let owner = user.has_scope(crate::product::OWNER_SCOPE) && user.may_act_as(Role::Admin);
+        Viewer::new(user.id, user.is_admin() || owner)
     }
 }
 

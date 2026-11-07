@@ -268,10 +268,11 @@ impl Checker {
 
     /// A card's service binding, as far as it can be told without the
     /// database: an id that can be one, and 1 to 4 metric ids of the shape of
-    /// an id, none twice. One problem at most is reported, on `…service.metrics`.
+    /// an id, none twice. One problem at most is reported: `bad_service` on
+    /// `…service`, or one code on `…service.metrics`.
     fn service(&mut self, path: &str, service: &ServiceRef) {
         if service.id < 1 {
-            self.err(format!("{path}.service"), "bad_service");
+            return self.err(format!("{path}.service"), "bad_service");
         }
         let metrics = format!("{path}.service.metrics");
         if service.metrics.is_empty() {

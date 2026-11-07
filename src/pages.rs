@@ -222,6 +222,7 @@ fn labels() -> BTreeMap<&'static str, &'static str> {
         "field_metrics",
         "help_metrics",
         "metrics_full",
+        "metrics_gone",
         "err_service_metrics",
         "err_bad_service",
         "err_bad_metric",

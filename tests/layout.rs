@@ -756,6 +756,15 @@ fn service_binding_validation_table() {
         "groups[0].cards[0].service",
         "bad_service",
     );
+    // One problem at most: a bad id is reported alone, whatever the metrics are.
+    expect(
+        with(ServiceRef {
+            id: 0,
+            metrics: vec![],
+        }),
+        "groups[0].cards[0].service",
+        "bad_service",
+    );
     // One to four, in the shape of an id, passes.
     for n in 1..=4 {
         let metrics: Vec<String> = (0..n).map(|i| format!("m_{i}-x")).collect();
