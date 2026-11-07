@@ -24,6 +24,7 @@
 //! [`FetchError`]'s texts are a closed set plus an HTTP status.
 
 pub mod api;
+pub mod github;
 pub mod http_kind;
 pub mod kk;
 pub mod pin;
@@ -75,6 +76,13 @@ pub trait Integration: Send + Sync + 'static {
     fn url_required(&self) -> bool {
         true
     }
+    /// Whether this is a personal kind: its address is fixed in the kind (a
+    /// service has none of its own) and its key is one user's own, so a
+    /// service of it belongs to that user (see [`crate::services::Scope`]).
+    /// Admins set up the other kinds.
+    fn personal(&self) -> bool {
+        false
+    }
     /// Checks the kind's own settings (`settings` is the JSON object built
     /// from [`Integration::fields`]); the first problem, if any.
     fn check_settings(
@@ -91,7 +99,7 @@ pub trait Integration: Send + Sync + 'static {
 
 /// The kinds compiled into this build.
 pub fn registry() -> &'static [&'static dyn Integration] {
-    static KINDS: [&dyn Integration; 7] = [
+    static KINDS: [&dyn Integration; 8] = [
         &http_kind::HTTP,
         &vv::VV,
         &kk::KK,
@@ -99,6 +107,7 @@ pub fn registry() -> &'static [&'static dyn Integration] {
         &proxmox::PROXMOX,
         &unraid::UNRAID,
         &tofa::TOFA,
+        &github::GITHUB,
     ];
     &KINDS
 }
@@ -165,12 +174,24 @@ pub enum Format {
     Text,
 }
 
+/// The settings key the store puts a service's number under, for a kind that
+/// keeps a memory per service (see [`FetchCtx::service_id`]).
+pub const SERVICE_ID_KEY: &str = "service_id";
+
 /// What a fetch needs: the shared client, the service's settings and its
-/// secret. The settings carry the service's address as `"url"`.
+/// secret. The settings carry the service's address as `"url"` (when it has
+/// one) and its number as [`SERVICE_ID_KEY`] (a test of a form has none).
 pub struct FetchCtx {
     pub http: reqwest::Client,
     pub settings: Json,
     pub secret: Option<String>,
+}
+
+impl FetchCtx {
+    /// The number of the service being fetched, when it is a stored one.
+    pub fn service_id(&self) -> Option<i64> {
+        self.settings.get(SERVICE_ID_KEY).and_then(Json::as_i64)
+    }
 }
 
 impl fmt::Debug for FetchCtx {
@@ -338,6 +359,9 @@ pub enum FetchError {
     /// kind reads (a Proxmox token without a role).
     #[error("key sees nothing")]
     NothingVisible,
+    /// The service's request limit is used up; the kind waits for it to reset.
+    #[error("rate limited")]
+    RateLimited,
     #[error("HTTP {0}")]
     Status(u16),
     #[error("request failed")]
@@ -363,6 +387,7 @@ impl FetchError {
             FetchError::KkTooOld => "fetch_err.kk_too_old",
             FetchError::NotAdmin => "fetch_err.not_admin",
             FetchError::NothingVisible => "fetch_err.nothing_visible",
+            FetchError::RateLimited => "fetch_err.rate_limited",
             FetchError::Other => "fetch_err.other",
             FetchError::Status(_) => return None,
         })
@@ -433,6 +458,7 @@ pub fn error_text_key(text: &str) -> Option<&'static str> {
         FetchError::KkTooOld,
         FetchError::NotAdmin,
         FetchError::NothingVisible,
+        FetchError::RateLimited,
         FetchError::Other,
     ]
     .into_iter()

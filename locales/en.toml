@@ -187,6 +187,7 @@ base_url_help = "Where people reach this instance: used in links. If MM_PUBLIC_U
 
 [nav]
 services = "Services"
+my_integrations = "My integrations"
 
 [service]
 sub = "The websites and apps Magpie fetches numbers from. Only admins set them up; the secret is stored encrypted and never shown again."
@@ -233,6 +234,16 @@ pin_help = "Optional, and only for an https address. For a server with a self-si
 pin_presented = "The server presents a certificate that was not accepted. Its fingerprint (SHA-256) is:"
 pin_use = "Use this fingerprint"
 
+[integration]
+sub = "Your own accounts that Magpie fetches numbers from. Only you see them and use them, admins included. The key is stored encrypted and never shown again."
+new = "New integration"
+edit = "Edit integration"
+none_title = "No integrations yet"
+none_text = "Add your own GitHub key so the start page can show your numbers."
+created = "Integration added."
+saved = "Integration saved."
+deleted = "Integration deleted."
+
 [err]
 name = "Give the service a name of at most 80 characters."
 kind = "Choose a kind of service."
@@ -251,6 +262,8 @@ http_expected = "Use a status like 200, a range like 200-399, or a list like 200
 fingerprint = "Use the 64 hexadecimal characters of a SHA-256 fingerprint. Colons and spaces are fine."
 fingerprint_https = "A certificate fingerprint only works with an https address."
 pve_token_id = "Use the token id as user@realm!tokenid, for example root@pam!start. Only ASCII letters, digits, dot, dash and underscore are accepted (no spaces or accented letters)."
+personal_limit = "You can have up to 10 integrations of your own."
+github_owners = "Use user or organisation names (letters, digits and single hyphens), separated by commas, at most 5."
 
 [kind]
 http = "Website"
@@ -260,6 +273,7 @@ ww = "Wise Wren"
 proxmox = "Proxmox VE"
 unraid = "Unraid"
 tofa = "Tofa"
+github = "GitHub"
 
 [field]
 http_expected = "Expected status"
@@ -280,6 +294,10 @@ unraid_secret = "API key"
 unraid_secret_help = "Create an API key in Unraid under Settings → Management Access → API Keys with the role VIEWER (Unraid 7.2 or newer), and paste it here. Sent as x-api-key. Stored encrypted."
 tofa_secret = "API key"
 tofa_secret_help = "Create an API key in Tofa under Server → Settings → API keys (server 0.9.34 or newer) and paste it here. The key acts as an admin in Tofa, so it is stored encrypted and never shown again. It works only on a direct connection (your network or the server's own address). Sent as Authorization: Bearer."
+github_owners = "Accounts and organisations"
+github_owners_help = "Optional. Only count repositories of these accounts and organisations, separated by commas. Empty means the account the token belongs to. For a token whose owner is an organisation, enter the organisation here."
+github_secret = "Access token"
+github_secret_help = "Create a fine-grained personal access token at github.com under Settings → Developer settings → Personal access tokens → Fine-grained tokens. Pick one owner (your account or one organisation; for an organisation, also enter it under \"Accounts and organisations\"), choose the repositories, and give it these permissions, all read-only: Metadata, Pull requests, Commit statuses, Actions, Dependabot alerts and Contents. A permission it lacks only leaves its number out. One token covers one owner or organisation, so add one integration for each. Sent as Authorization: Bearer. Stored encrypted."
 
 [metric]
 http_status = "HTTP status"
@@ -321,6 +339,11 @@ tofa_transcodes = "Transcodes"
 tofa_tasks_running = "Background tasks"
 tofa_libraries_unhealthy = "Libraries with errors"
 tofa_version = "Server version"
+gh_review_requests = "Waiting for your review"
+gh_ci_red = "Red CI"
+gh_dependabot = "Dependabot alerts"
+gh_releases_24h = "Releases, 24 hours"
+gh_open_prs = "Your open pull requests"
 
 [fetch_err]
 config = "The settings can't be used"
@@ -338,6 +361,7 @@ auth = "The key was refused"
 kk_too_old = "Requires Keen Kestrel 0.10 or newer"
 not_admin = "The key is not an admin key"
 nothing_visible = "The key can't see anything - check its role"
+rate_limited = "GitHub's request limit is reached, trying again later"
 
 [need]
 other = "needs attention"
@@ -356,6 +380,9 @@ unraid_disk = "Disk use (%): {count}"
 tofa_down = "Not answering"
 tofa_library = "Libraries with errors: {count}"
 tofa_library_warn = "Libraries with issues: {count}"
+
+gh_review = "Waiting for you: {count}"
+gh_ci_red = "Red CI: {count}"
 
 [value]
 unraid_array_started = "Started"

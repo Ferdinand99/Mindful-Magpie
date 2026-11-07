@@ -187,6 +187,7 @@ base_url_help = "Adressen folk når instansen på: brukes i lenker. Er MM_PUBLIC
 
 [nav]
 services = "Tjenester"
+my_integrations = "Mine integrasjoner"
 
 [service]
 sub = "Nettsidene og appene Magpie henter tall fra. Bare admin setter dem opp; nøkkelen lagres kryptert og vises aldri igjen."
@@ -233,6 +234,16 @@ pin_help = "Valgfritt, og bare for en https-adresse. For en server med selvsigne
 pin_presented = "Serveren viser et sertifikat som ikke ble godtatt. Fingeravtrykket (SHA-256) er:"
 pin_use = "Bruk dette fingeravtrykket"
 
+[integration]
+sub = "Dine egne kontoer som Magpie henter tall fra. Bare du ser og bruker dem, også admin. Nøkkelen lagres kryptert og vises aldri igjen."
+new = "Ny integrasjon"
+edit = "Rediger integrasjon"
+none_title = "Ingen integrasjoner ennå"
+none_text = "Legg inn din egen GitHub-nøkkel så startsiden kan vise tallene dine."
+created = "Integrasjonen er lagt til."
+saved = "Integrasjonen er lagret."
+deleted = "Integrasjonen er slettet."
+
 [err]
 name = "Gi tjenesten et navn på høyst 80 tegn."
 kind = "Velg en type tjeneste."
@@ -251,6 +262,8 @@ http_expected = "Bruk en status som 200, et område som 200-399 eller en liste s
 fingerprint = "Bruk de 64 heksadesimale tegnene i et SHA-256-fingeravtrykk. Kolon og mellomrom går bra."
 fingerprint_https = "Et sertifikat-fingeravtrykk virker bare med en https-adresse."
 pve_token_id = "Bruk token-id som bruker@realm!tokenid, for eksempel root@pam!start. Bare ASCII-bokstaver, tall, punktum, bindestrek og understrek er tillatt (ingen mellomrom eller bokstaver som æ, ø og å)."
+personal_limit = "Du kan ha opptil 10 egne integrasjoner."
+github_owners = "Bruk navn på brukere eller organisasjoner (bokstaver, sifre og enkle bindestreker), atskilt med komma, høyst 5."
 
 [kind]
 http = "Nettside"
@@ -260,6 +273,7 @@ ww = "Wise Wren"
 proxmox = "Proxmox VE"
 unraid = "Unraid"
 tofa = "Tofa"
+github = "GitHub"
 
 [field]
 http_expected = "Forventet status"
@@ -280,6 +294,10 @@ unraid_secret = "API-nøkkel"
 unraid_secret_help = "Lag en API-nøkkel i Unraid under Settings → Management Access → API Keys med rollen VIEWER (Unraid 7.2 eller nyere), og lim den inn her. Sendes som x-api-key. Lagres kryptert."
 tofa_secret = "API-nøkkel"
 tofa_secret_help = "Lag en API-nøkkel i Tofa under Server → Settings → API keys (server 0.9.34 eller nyere) og lim den inn her. Nøkkelen virker som admin i Tofa, så den lagres kryptert og vises aldri igjen. Den virker bare på en direkte tilkobling (nettverket ditt eller serverens egen adresse). Sendes som Authorization: Bearer."
+github_owners = "Kontoer og organisasjoner"
+github_owners_help = "Valgfritt. Tell bare repoer som tilhører disse kontoene og organisasjonene, atskilt med komma. Tomt betyr kontoen tokenet tilhører. For et token som tilhører en organisasjon, skriv organisasjonen her."
+github_secret = "Tilgangstoken"
+github_secret_help = "Lag et finkornet personlig tilgangstoken på github.com under Settings → Developer settings → Personal access tokens → Fine-grained tokens. Velg én eier (kontoen din eller én organisasjon; for en organisasjon skriver du den også under «Kontoer og organisasjoner»), velg repoene, og gi det disse tilgangene, alle bare lesing: Metadata, Pull requests, Commit statuses, Actions, Dependabot alerts og Contents. En tilgang det mangler, utelater bare tallet sitt. Ett token dekker én eier eller organisasjon, så legg til én integrasjon for hver. Sendes som Authorization: Bearer. Lagres kryptert."
 
 [metric]
 http_status = "HTTP-status"
@@ -321,6 +339,11 @@ tofa_transcodes = "Transkodinger"
 tofa_tasks_running = "Bakgrunnsjobber"
 tofa_libraries_unhealthy = "Bibliotek med feil"
 tofa_version = "Serverversjon"
+gh_review_requests = "Venter på din gjennomgang"
+gh_ci_red = "Rød CI"
+gh_dependabot = "Dependabot-varsler"
+gh_releases_24h = "Utgivelser, 24 timer"
+gh_open_prs = "Dine åpne pull requests"
 
 [fetch_err]
 config = "Innstillingene kan ikke brukes"
@@ -338,6 +361,7 @@ auth = "Nøkkelen ble avvist"
 kk_too_old = "Krever Keen Kestrel 0.10 eller nyere"
 not_admin = "Nøkkelen er ikke en admin-nøkkel"
 nothing_visible = "Nøkkelen ser ingenting – sjekk rollen"
+rate_limited = "GitHubs forespørselsgrense er nådd, prøver igjen senere"
 
 [need]
 other = "trenger oppmerksomhet"
@@ -356,6 +380,9 @@ unraid_disk = "Diskbruk (%): {count}"
 tofa_down = "Svarer ikke"
 tofa_library = "Bibliotek med feil: {count}"
 tofa_library_warn = "Bibliotek med avvik: {count}"
+
+gh_review = "Venter på deg: {count}"
+gh_ci_red = "Rød CI: {count}"
 
 [value]
 unraid_array_started = "Startet"

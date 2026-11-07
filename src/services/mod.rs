@@ -1,7 +1,13 @@
-//! Services: the admin's instances of an integration kind (a website, later a
-//! monitor, a code host …), with their address, settings, sealed secret,
-//! fetch interval and who may see them. [`store`] keeps them in the database,
-//! [`pages`] is the admin's Settings page for them.
+//! Services: instances of an integration kind (a website, a monitor, a code
+//! host …), with their address, settings, sealed secret, fetch interval and
+//! who may see them. [`store`] keeps them in the database, [`pages`] holds the
+//! Settings pages for them.
+//!
+//! A service is **shared** (set up by an admin, seen by the people its
+//! visibility names) or **personal** (`owner_user_id` set: a kind such as
+//! `github` whose key is one user's own). A personal service is seen, changed,
+//! tested and used by its user only, admins included: [`Scope`] is how every
+//! store function says which of the two it means.
 //!
 //! A service's secret is sealed (`vole_kit::crypto`, purpose
 //! [`SECRET_PURPOSE`]) and leaves the store only inside a
@@ -28,6 +34,9 @@ pub const SECRET_PURPOSE: &str = "magpie.service.secret";
 /// The form field (and error field) of the pinned certificate's fingerprint,
 /// the same as its settings key.
 pub const CERT_FIELD: &str = integrations::pin::SETTING;
+
+/// The most personal services one user may have.
+pub const MAX_PERSONAL: i64 = 10;
 
 /// The longest interval an admin may choose (a day).
 pub const MAX_INTERVAL_S: i64 = 86_400;
@@ -88,8 +97,33 @@ impl Visibility {
     }
 }
 
+/// Which services a store call is about: the shared ones, or the personal
+/// ones of one user. A service of the other kind does not exist for the call
+/// (it is not listed, not found, not changed and not deleted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Services set up by an admin (none belongs to a user).
+    Shared,
+    /// The personal services of this user.
+    Personal(i64),
+}
+
+impl Scope {
+    /// The user a service of this scope belongs to (`None` for shared services).
+    pub fn owner(self) -> Option<i64> {
+        match self {
+            Scope::Shared => None,
+            Scope::Personal(user) => Some(user),
+        }
+    }
+
+    pub fn is_personal(self) -> bool {
+        matches!(self, Scope::Personal(_))
+    }
+}
+
 /// Who is asking, for [`store::visible_to`] and [`store::can_see`]. Admins see
-/// every service.
+/// every shared service, and nobody's personal service but their own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Viewer {
     pub id: i64,
@@ -139,6 +173,8 @@ pub struct Service {
     pub visibility: Visibility,
     /// The users who see it when `visibility` is [`Visibility::Users`].
     pub users: Vec<i64>,
+    /// The user a personal service belongs to; `None` for a shared one.
+    pub owner_user_id: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -163,6 +199,9 @@ pub struct ServiceSummary {
     /// service's own «Lenke på kort», else the origin of its address (see
     /// [`card_link`]). Empty when the service has neither.
     pub link: String,
+    /// A personal service of the viewer who asked (so they, not an admin, are
+    /// the one who sets it up again when it needs that).
+    pub personal: bool,
 }
 
 /// The setting that holds a service's «Lenke på kort». It is not a field of
@@ -309,6 +348,10 @@ impl ServiceInput {
             errors.push(FieldError::new("kind", "err.kind"));
             return errors;
         };
+        // A kind with a fixed address has no address to enter.
+        if kind.personal() && self.url.as_deref().is_some_and(|u| !u.trim().is_empty()) {
+            errors.push(FieldError::new("url", "err.url"));
+        }
         let min = i64::try_from(kind.min_interval().as_secs()).unwrap_or(i64::MAX);
         if self.interval_s < min || self.interval_s > MAX_INTERVAL_S {
             errors.push(FieldError::new("interval", "err.interval"));
