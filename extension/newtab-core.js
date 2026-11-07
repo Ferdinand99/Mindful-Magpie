@@ -262,3 +262,13 @@ export async function start({
 
   return controller;
 }
+
+/**
+ * Whether a `storage.onChanged` event is a real change of the saved server or token: a save of the
+ * same values (the options page saving again, or the connect flow reconnecting to the same server
+ * with the same token) fires the event too, and must not stop the tabs that are open.
+ */
+export function connectionChanged(changes, area) {
+  if (area !== "local" || !changes) return false;
+  return ["serverUrl", "token"].some((key) => changes[key] && changes[key].oldValue !== changes[key].newValue);
+}

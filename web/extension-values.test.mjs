@@ -13,7 +13,7 @@ import {
   statusWithValues,
   valuesUrl,
 } from "../extension/state.js";
-import { start } from "../extension/newtab-core.js";
+import { connectionChanged, start } from "../extension/newtab-core.js";
 import { createView } from "../extension/newtab-view.js";
 import { render, updateValues, tickAges } from "../extension/vendor/render.js";
 
@@ -745,6 +745,20 @@ test("the page script wires the refresh to the page's visibility", () => {
 test("the page script stops the refresh when the saved server or token changes", () => {
   const src = read("newtab.js");
   assert.ok(src.includes("storage.onChanged"));
-  assert.ok(src.includes("changes.serverUrl") && src.includes("changes.token"));
+  assert.ok(src.includes("connectionChanged"));
   assert.ok(src.includes("connection"));
+});
+
+test("only a real change of the server or token stops the tabs, not saving the same values again", () => {
+  const same = { serverUrl: { oldValue: "http://h:1", newValue: "http://h:1" }, token: { oldValue: "t", newValue: "t" } };
+  assert.equal(connectionChanged(same, "local"), false);
+  assert.equal(connectionChanged({ serverUrl: { oldValue: "http://h:1", newValue: "http://h:2" } }, "local"), true);
+  assert.equal(connectionChanged({ token: { oldValue: "a", newValue: "b" } }, "local"), true);
+  // A first connection (nothing before) and a disconnect (nothing after) are changes.
+  assert.equal(connectionChanged({ token: { newValue: "b" } }, "local"), true);
+  assert.equal(connectionChanged({ token: { oldValue: "a" } }, "local"), true);
+  // Other keys (the cache) and other areas are not the connection.
+  assert.equal(connectionChanged({ last: { oldValue: 1, newValue: 2 } }, "local"), false);
+  assert.equal(connectionChanged({ token: { oldValue: "a", newValue: "b" } }, "sync"), false);
+  assert.equal(connectionChanged(undefined, "local"), false);
 });

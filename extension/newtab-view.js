@@ -3,7 +3,7 @@
 // The layout is drawn by the start page's own renderer (vendor/render.js, copied from
 // static/magpie/ by web/build-extension.mjs). This file adds what is specific to the extension:
 // the status line, the language of the labels, and image backgrounds (see background.js).
-import { render, tickAges, updateValues } from "./vendor/render.js";
+import { render, tickAges, toggleAckedNeeds, updateValues } from "./vendor/render.js";
 import { fetchBackground, imageId, serverOrigin } from "./background.js";
 import { pickLabels } from "./labels.js";
 import { renderStatus } from "./status.js";
@@ -36,6 +36,14 @@ export function createView({
   const { lang, labels } = pickLabels(language);
   doc.documentElement.setAttribute("lang", lang);
   const html = doc.documentElement;
+
+  // The renderer draws the toggle «N kvittert» but has no handlers: one delegated listener on the
+  // root (not an inline handler, which the page's content security policy would block) opens and
+  // closes the acknowledged needs. It survives every redraw, since the root itself is never replaced.
+  root.addEventListener("click", (event) => {
+    const toggle = event.target?.closest?.(".mm-needs-toggle");
+    if (toggle) toggleAckedNeeds(toggle);
+  });
 
   // The blob: URL of the image that is shown (or being fetched), kept so that the cached layout
   // and the fresh layout, which name the same image, load it once.
