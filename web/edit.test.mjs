@@ -1524,6 +1524,33 @@ test("focus_stays_in_the_sheet_while_it_is_busy_and_after", async () => {
   assert.ok(t.focus.last === input);
 });
 
+test("the_file_input_sits_hidden_inside_a_secondary_button_label_and_shares_the_busy_state", async () => {
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const t = setup({ background: fakeBackground({ upload: () => gate }) });
+  t.start();
+  const dialog = openPicker(t);
+  const input = dialog.querySelector('input[type="file"]');
+  const label = input.parentElement;
+  assert.equal(label.localName, "label", "the label is the button");
+  assert.ok(label.classList.contains("btn") && label.classList.contains("btn-secondary"));
+  assert.ok(input.classList.contains("vh"), "the real input stays, visually hidden");
+  assert.equal(label.textContent.trim(), "Upload picture", "the button text names the input");
+  const name = dialog.querySelector(".mm-file-name");
+  assert.equal(name.textContent, "");
+  choosePicture(dialog, picture("holiday.png"));
+  await tick();
+  assert.equal(name.textContent, "holiday.png", "the file on its way is named");
+  assert.equal(label.getAttribute("aria-disabled"), "true", "the button is busy with the input");
+  assert.equal(input.getAttribute("aria-disabled"), "true");
+  release({ status: 200, body: { id: "up3" } });
+  await tick();
+  assert.equal(name.textContent, "");
+  assert.equal(label.getAttribute("aria-disabled"), null);
+});
+
 test("server_refusals_and_network_errors_show_a_message_and_change_nothing", async () => {
   for (const [result, expected] of [
     [{ status: 413, body: { error: "too_large" } }, /too big/],

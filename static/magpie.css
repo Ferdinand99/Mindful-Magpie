@@ -24,16 +24,19 @@ body:has(.wall) {
   display: none;
 }
 
-/* The page fills the width: the grid grows with the screen instead of
-   stopping at the kit's reading width. */
+/* The page uses the width: the grid grows with the screen instead of stopping
+   at the kit's reading width, up to 2000px (the page and the top bar together,
+   centred): on a 2560px screen a group of a few cards no longer hangs at the far
+   left of a very wide empty page, and the Edit button stays near the content.
+   Below 2000px nothing changes. */
 .main.start {
-  max-width: none;
+  max-width: 2000px;
   gap: var(--sp-6);
   padding-left: max(clamp(1rem, 3vw, 3rem), var(--safe-left)); /* rtl-ok: safe-area insets are physical */
   padding-right: max(clamp(1rem, 3vw, 3rem), var(--safe-right)); /* rtl-ok: safe-area insets are physical */
 }
 body:has(.main.start) .topbar-inner {
-  max-width: none;
+  max-width: 2000px;
   padding-left: max(clamp(1rem, 3vw, 3rem), var(--safe-left)); /* rtl-ok: safe-area insets are physical */
   padding-right: max(clamp(1rem, 3vw, 3rem), var(--safe-right)); /* rtl-ok: safe-area insets are physical */
 }
@@ -67,6 +70,39 @@ html:root:has(.mm-root)[data-bg="image"] .date {
   text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
 }
 
+<<<<<<< HEAD
+=======
+/* The Edit button on an uploaded picture: its grey fill is faint on a pale
+   photo even under the scrim. Give it the dark glass of the cards and a hairline,
+   like the date above. (The open state, the inverted pill, keeps its own look.) */
+html:root:has(.mm-root)[data-bg="image"] #mm-edit:not([aria-pressed="true"]) {
+  --btn-bg: rgba(20, 20, 23, 0.62);
+  --btn-hover: rgba(20, 20, 23, 0.78);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.28);
+  -webkit-backdrop-filter: saturate(180%) blur(16px);
+  backdrop-filter: saturate(180%) blur(16px);
+}
+
+/* "Needs you": one glass row of alerts; hidden while nothing needs you. */
+.needs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2) var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+}
+.needs[hidden] {
+  display: none;
+}
+.needs-title {
+  margin-inline-end: var(--sp-1);
+  color: var(--muted);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+>>>>>>> origin/feat/start-page
 /* The groups: the renderer fills this element with groups of cards (the card
    grid, repeat(auto-fill, minmax(260px, 1fr)), is in magpie/render.css). */
 #groups {
@@ -361,6 +397,23 @@ html:root:has(.mm-root)[data-bg="image"] .date {
 }
 .mm-bg-status:empty {
   display: none;
+}
+/* The upload: the file input is hidden inside a secondary-button label (the kit
+   draws the focus ring on the label); the file on its way is named beside it. */
+.mm-file-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2) var(--sp-3);
+}
+.mm-file-btn {
+  cursor: pointer;
+}
+.mm-file-name {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.8125rem;
+  overflow-wrap: anywhere;
 }
 
 /* The move menu: one button per move. */
