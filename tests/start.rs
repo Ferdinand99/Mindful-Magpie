@@ -27,6 +27,13 @@ async fn start_page_renders_for_signed_in_user() {
     assert!(res.body.contains(r#"id="needs""#), "{}", res.body);
     assert!(res.body.contains(r#"id="clock""#), "{}", res.body);
     assert!(
+        res.body.contains(r#"href="/static/magpie/render.css""#),
+        "{}",
+        res.body
+    );
+    // The renderer draws the empty state (the text is in the labels block).
+    assert!(!res.body.contains("empty-card"), "{}", res.body);
+    assert!(
         res.body
             .contains("Startsiden er tom. Rediger den for å legge til tjenester og bokmerker."),
         "{}",
@@ -134,31 +141,73 @@ async fn start_page_never_takes_focus() {
     }
 
     // Page scripts are static files (the CSP allows no inline scripts), and
-    // the clock script never moves focus either.
+    // none of them moves focus either.
     assert!(
         html.contains(r#"<script src="/static/clock.js""#),
         "the clock script is not loaded"
     );
-    let js = app.get("/static/clock.js").await;
-    assert_eq!(js.status, StatusCode::OK, "{}", js.body);
     assert!(
-        js.header("content-type").contains("javascript"),
-        "content-type: {}",
-        js.header("content-type")
+        html.contains(r#"<script type="module" src="/static/magpie/start.js""#),
+        "the start page script is not loaded as a module"
     );
-    assert!(!js.body.contains(".focus("), "clock.js moves focus");
-    assert!(!js.body.contains("autofocus"), "clock.js sets autofocus");
+    for path in [
+        "/static/clock.js",
+        "/static/magpie/start.js",
+        "/static/magpie/render.js",
+    ] {
+        let js = app.get(path).await;
+        assert_eq!(js.status, StatusCode::OK, "{path}: {}", js.body);
+        assert!(
+            js.header("content-type").contains("javascript"),
+            "{path} content-type: {}",
+            js.header("content-type")
+        );
+    }
+
+    // Every script of the page's own, read from disk so that a new file is
+    // covered at once. Only edit mode (`edit.js`, which the user opens on
+    // purpose) may move focus, and nothing sets `autofocus`.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("static");
+    let mut scripts = vec![dir.join("clock.js")];
+    for entry in std::fs::read_dir(dir.join("magpie")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "js") && path.file_name().unwrap() != "edit.js" {
+            scripts.push(path);
+        }
+    }
+    assert!(
+        scripts.iter().any(|p| p.ends_with("render.js")),
+        "render.js is not among the scripts checked: {scripts:?}"
+    );
+    for path in scripts {
+        let source = std::fs::read_to_string(&path).unwrap().to_lowercase();
+        assert!(
+            !source.contains(".focus("),
+            "{} moves focus",
+            path.display()
+        );
+        assert!(
+            !source.contains("autofocus"),
+            "{} sets autofocus",
+            path.display()
+        );
+    }
 }
 
 #[tokio::test]
 async fn grid_fills_the_width() {
     let app = App::new().await;
-    let res = app.get("/static/magpie.css").await;
-    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    let css = res.body;
+    let mut css = String::new();
+    for path in ["/static/magpie.css", "/static/magpie/render.css"] {
+        let res = app.get(path).await;
+        assert_eq!(res.status, StatusCode::OK, "{path}: {}", res.body);
+        css.push_str(&res.body);
+        css.push('\n');
+    }
+    // The renderer's card grid fills the width: as many 260px columns as fit.
     assert!(
         css.contains("repeat(auto-fill, minmax(260px, 1fr))"),
-        "the group grid is not auto-fill"
+        "the card grid is not auto-fill"
     );
 
     // No rule for `#groups` caps the width (at-rules nest, so read the text

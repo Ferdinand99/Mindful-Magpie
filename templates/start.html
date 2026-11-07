@@ -3,7 +3,9 @@
 
 {% block head %}
   <link rel="stylesheet" href="/static/magpie.css">
+  <link rel="stylesheet" href="/static/magpie/render.css">
   <script src="/static/clock.js" defer></script>
+  <script type="module" src="/static/magpie/start.js"></script>
 {% endblock %}
 
 {% block main_class %}start{% endblock %}
@@ -36,14 +38,9 @@
 </section>
 {% endif %}
 
-<section id="groups" aria-label="{{ tr("start.groups") }}">
-  <div class="glass empty-card">
-    <div class="empty">
-      <div class="empty-icon">{{ m::icon("dashboard") }}</div>
-      <p class="empty-title">{{ tr("start.empty") }}</p>
-    </div>
-  </div>
-</section>
+{#- The renderer (static/magpie/render.js) draws the groups, the bookmarks and the
+    empty state into this element from the data blocks below. -#}
+<section id="groups" aria-label="{{ tr("start.groups") }}"></section>
 
 {#- Data, not script: the browser never runs these blocks. The JSON is written so
     that no text in it can end the block early (see json_for_html in pages.rs). -#}

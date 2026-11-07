@@ -24,6 +24,8 @@ src/
   layout/             # the start page layout: model and validation, per-user versioned storage
 templates/            # Magpie's pages (extend kit/layout.html)
 static/               # favicon, icons, web manifest, magpie.css, clock.js
+static/magpie/        # the start page scripts (ES modules: render.js is the shared renderer) and render.css
+web/                  # JavaScript tests (node --test, linkedom); dev-only
 migrations/           # Magpie's migrations
 locales/              # Magpie's strings (en, nb)
 tests/                # boot.rs, auth.rs, start.rs, layout.rs, layout_http.rs, api_start.rs, connect.rs; common/ builds an in-process app on a temporary data directory
@@ -46,6 +48,7 @@ cargo commands that run inside a Rust 1.99 container with clippy and rustfmt ins
 cargo test --locked                                  # 104 tests: boot, auth and users, start page, layout, extension API and connect flow
 cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --all --check
+cd web && npm ci && node --test                     # the renderer's tests (node:22 container; linkedom stands in for the DOM)
 docker build -t magpie:dev .
 docker run --rm magpie:dev --help     # every flag and its MM_ variable
 ```
@@ -81,7 +84,7 @@ A new licence must be added to `accepted` in `about.toml` on purpose. The image 
 
 ## CI and releases
 
-- `ci.yml`: format, clippy with `-D warnings` and tests; the notices check; on pull requests a Docker build for
+- `ci.yml`: format, clippy with `-D warnings` and tests; the `web` job (`npm ci` and `node --test` in `web/`); the notices check; on pull requests a Docker build for
   linux/amd64 and linux/arm64 (nothing is pushed).
 - `audit.yml`: RustSec advisories (`cargo deny check advisories`) on dependency changes and weekly.
 - `release-please.yml`: keeps a release pull request open on `main` (version and changelog from Conventional

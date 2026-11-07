@@ -43,6 +43,26 @@ jobs:
       - name: Tests
         run: cargo test --locked
 
+  # Logic tests of the start page scripts (static/magpie/) and, later, of the browser extension.
+  # They run with node --test; linkedom stands in for the DOM. Test files are web/*.test.mjs.
+  web:
+    name: Web tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Install
+        working-directory: web
+        run: npm ci --no-audit --no-fund
+
+      - name: Tests
+        working-directory: web
+        run: node --test
+
   # THIRD-PARTY-NOTICES holds the licence texts of the Rust crates in the image. It is made from
   # the dependencies (scripts/notices.sh), so a changed dependency makes it stale: this job fails
   # then. It also fails when a

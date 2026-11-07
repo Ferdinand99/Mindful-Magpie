@@ -4,22 +4,17 @@
    purple stays the colour of links and focus. */
 
 /* The start page ------------------------------------------------------------
-   Soft colour fields behind the glass cards: the default background (a
-   chosen image replaces it later). They are painted on <html>, fixed to the
-   viewport, and <body> is transparent so that nothing covers them.
+   The background (colour fields, a preset or the user's image) and the glass
+   cards, groups, tiles and bookmark pills belong to the shared renderer: see
+   magpie/render.css. The background is painted on <html>, fixed to the
+   viewport, and <body> is transparent so that nothing covers it.
    The kit reserves a scrollbar gutter on <html>, and the browser paints that
-   gutter with the plain page colour, never with the gradients: a strip in the
+   gutter with the plain page colour, never with the background: a strip in the
    page colour at the right edge wherever scrollbars take space (Windows). The
-   start page gives up the reserved gutter, so the gradients reach the edge;
+   start page gives up the reserved gutter, so the background reaches the edge;
    a scrollbar only appears when the page really overflows. */
 html:has(.wall) {
   scrollbar-gutter: auto;
-  background:
-    radial-gradient(60vw 50vh at 12% 8%, light-dark(rgba(139, 125, 255, 0.28), rgba(139, 125, 255, 0.35)), transparent 60%),
-    radial-gradient(55vw 55vh at 88% 18%, light-dark(rgba(255, 100, 130, 0.2), rgba(255, 100, 130, 0.22)), transparent 60%),
-    radial-gradient(70vw 60vh at 50% 100%, light-dark(rgba(48, 160, 200, 0.22), rgba(48, 160, 200, 0.22)), transparent 60%),
-    var(--bg);
-  background-attachment: fixed;
 }
 body:has(.wall) {
   background: transparent;
@@ -27,28 +22,6 @@ body:has(.wall) {
 /* The element is only the hook for the rules above. */
 .wall {
   display: none;
-}
-
-/* Glass: a translucent card over the wall. */
-.glass {
-  background: light-dark(rgba(255, 255, 255, 0.62), rgba(28, 28, 31, 0.55));
-  border: 1px solid var(--line);
-  border-radius: var(--r-lg);
-  -webkit-backdrop-filter: saturate(180%) blur(24px);
-  backdrop-filter: saturate(180%) blur(24px);
-}
-@media (prefers-reduced-transparency: reduce) {
-  .glass {
-    background: var(--card);
-    -webkit-backdrop-filter: none;
-    backdrop-filter: none;
-  }
-}
-@media (prefers-contrast: more) {
-  .glass {
-    background: var(--card);
-    border-color: var(--line-strong);
-  }
 }
 
 /* The page fills the width: the grid grows with the screen instead of
@@ -107,16 +80,10 @@ body:has(.main.start) .topbar-inner {
   letter-spacing: 0;
 }
 
-/* The groups: cards in a grid that fills the width (about 260px at least). */
+/* The groups: the renderer fills this element with groups of cards (the card
+   grid, repeat(auto-fill, minmax(260px, 1fr)), is in magpie/render.css). */
 #groups {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-  gap: var(--sp-3);
   min-width: 0;
-}
-#groups > .empty-card {
-  grid-column: 1 / -1;
-  border-style: solid;
 }
 
 @media (max-width: 720px) {
