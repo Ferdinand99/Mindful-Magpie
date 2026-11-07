@@ -54,16 +54,16 @@ fn intro(out: &mut String, base: &str) {
 
 fn nothing(_: &mut String) {}
 
-/// The API reference. Magpie has no REST routes of its own yet; the kit
-/// documents the routes it serves.
+/// The API reference: Magpie's routes for the browser extension (see
+/// [`crate::api`]); the kit documents the routes it serves.
 pub static DOCS: DocsSpec = DocsSpec {
-    routes: &[],
+    routes: crate::api::ROUTES,
     openapi_title: "Mindful Magpie API",
     openapi_description: "REST API for Mindful Magpie. Authenticate with `Authorization: Bearer mm_…`. Reads need any token; writes need a token with write access (a session cookie is never enough).",
     bearer_description: "API token (mm_…)",
     credentials: &[],
     error_example: ERROR_EXAMPLE,
-    error_codes: &[],
+    error_codes: crate::api::ERROR_CODES,
     config_document: None,
     curl_path_param: curl_param,
     markdown_intro: intro,

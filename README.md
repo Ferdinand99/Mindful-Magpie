@@ -42,6 +42,7 @@ and pre-migration backups). The container starts as root only to hand `/data` to
 | `--bind` | `MM_BIND` | `0.0.0.0` | address to listen on |
 | `--port` | `MM_PORT` | `3010` | port to listen on |
 | `--public-url` | `MM_PUBLIC_URL` | (none) | the address people use; stored as the General page's public URL |
+| `--extension-ids` | `MM_EXTENSION_IDS` | (none) | extra browser extension IDs, comma separated, that may use "Koble til Magpie" (a development build); the official extension always may |
 | | `MM_TRUST_PROXY` | off | honour `X-Forwarded-*` from a reverse proxy (read by vole-kit) |
 | | `MM_SETUP_TOKEN` | (random, logged at the first start) | `/setup` only opens with `?token=<value>` until the first user exists (read by vole-kit) |
 
@@ -57,7 +58,8 @@ environment:
 
 `MM_PUBLIC_URL` must be the root of its own host name (a path like `https://example.com/start` is refused at
 startup). Without `MM_TRUST_PROXY=1` Magpie sees every request as coming from the proxy: the sign-in rate limits are
-keyed to the proxy's address, so one person's failed attempts lock out everyone, and Magpie cannot tell that the
+keyed to the proxy's address, so one person's failed attempts lock out everyone (the same goes for the rate limit of the
+browser extension's token endpoint, which is per client address), and Magpie cannot tell that the
 request came in over HTTPS, so it sends no HSTS header.
 
 ## Develop

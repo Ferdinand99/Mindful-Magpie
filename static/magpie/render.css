@@ -1,0 +1,243 @@
+/* Mindful Magpie: styles for the start page renderer (render.js).
+   The browser extension copies this file together with render.js.
+
+   It needs the Hedgerow design tokens (the kit's style.css): --text, --muted,
+   --line, --line-strong, --brand, --card, --bg, --fill, --r-lg, --sp-*,
+   --pal-red ... --pal-gray. The page that uses it gives render() an element to
+   fill (the page uses #groups) and lays out nothing but what is in it.
+
+   Contents: glass, backgrounds (presets and image), groups and cards, tiles,
+   bookmark pills, the empty state. */
+
+/* Glass: a translucent card over the background. */
+.glass,
+.mm-pill {
+  background: light-dark(rgba(255, 255, 255, 0.62), rgba(28, 28, 31, 0.55));
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  -webkit-backdrop-filter: saturate(180%) blur(24px);
+  backdrop-filter: saturate(180%) blur(24px);
+}
+@media (prefers-reduced-transparency: reduce) {
+  .glass,
+  .mm-pill {
+    background: var(--card);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+@media (prefers-contrast: more) {
+  .glass,
+  .mm-pill {
+    background: var(--card);
+    border-color: var(--line-strong);
+  }
+}
+
+/* Backgrounds ----------------------------------------------------------------
+   render() sets data-bg on <html>: hedgerow (also the look before the script
+   runs), natt, skumring, hav or image. They are painted on <html>, fixed to the
+   viewport, so <body> must be transparent. Everything but hedgerow is dark
+   whatever the theme, so those force the dark colours. `html:root` outranks the
+   kit's `:root[data-theme]` rules.
+   Every rule needs `.mm-root` (the element render() fills) somewhere in the
+   page. htmx swaps only the body, so <html> outlives a boosted visit to another
+   page: when the root goes, the background and the dark colour scheme go too. */
+html:has(.mm-root) > body {
+  background: transparent;
+}
+html:root:has(.mm-root):not([data-bg]),
+html:root:has(.mm-root)[data-bg="hedgerow"] {
+  background:
+    radial-gradient(60vw 50vh at 12% 8%, light-dark(rgba(139, 125, 255, 0.28), rgba(139, 125, 255, 0.35)), transparent 60%),
+    radial-gradient(55vw 55vh at 88% 18%, light-dark(rgba(255, 100, 130, 0.2), rgba(255, 100, 130, 0.22)), transparent 60%),
+    radial-gradient(70vw 60vh at 50% 100%, light-dark(rgba(48, 160, 200, 0.22), rgba(48, 160, 200, 0.22)), transparent 60%),
+    var(--bg);
+  background-attachment: fixed;
+}
+html:root:has(.mm-root)[data-bg="natt"] {
+  color-scheme: dark;
+  background: #0b0b0d;
+}
+html:root:has(.mm-root)[data-bg="skumring"] {
+  color-scheme: dark;
+  background:
+    radial-gradient(60vw 50vh at 15% 10%, rgba(139, 92, 246, 0.45), transparent 60%),
+    radial-gradient(60vw 55vh at 85% 20%, rgba(244, 63, 94, 0.35), transparent 60%),
+    radial-gradient(70vw 60vh at 50% 100%, rgba(236, 72, 153, 0.25), transparent 60%),
+    #12081c;
+  background-attachment: fixed;
+}
+html:root:has(.mm-root)[data-bg="hav"] {
+  color-scheme: dark;
+  background:
+    radial-gradient(60vw 50vh at 12% 8%, rgba(20, 184, 166, 0.4), transparent 60%),
+    radial-gradient(60vw 55vh at 88% 18%, rgba(59, 130, 246, 0.38), transparent 60%),
+    radial-gradient(70vw 60vh at 50% 100%, rgba(6, 182, 212, 0.28), transparent 60%),
+    #061219;
+  background-attachment: fixed;
+}
+/* An uploaded image (render() sets --mm-bg-image) under a dark scrim, so that
+   text stays readable on a light photo. */
+html:root:has(.mm-root)[data-bg="image"] {
+  color-scheme: dark;
+  background:
+    linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0.5)),
+    var(--mm-bg-image, none) center / cover no-repeat #0b0b0d;
+  background-attachment: fixed;
+}
+
+/* Groups ---------------------------------------------------------------------
+   Each group is a heading and a grid of cards that fills the width (about 260px
+   at least). */
+.mm-group {
+  min-width: 0;
+}
+.mm-group + .mm-group,
+.mm-group + .mm-bookmarks {
+  margin-block-start: var(--sp-6);
+}
+.mm-group-title {
+  margin: 0 0 var(--sp-3);
+  margin-inline-start: var(--sp-1);
+  font-size: 0.9375rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
+}
+.mm-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: var(--sp-3);
+  min-width: 0;
+}
+
+/* Cards ----------------------------------------------------------------------- */
+.mm-card {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-width: 0;
+  padding: var(--sp-3) 0.875rem;
+  color: var(--text);
+  text-decoration: none;
+}
+a.mm-card {
+  transition:
+    transform 0.12s cubic-bezier(0.23, 1, 0.32, 1),
+    border-color 0.2s;
+}
+@media (hover: hover) and (pointer: fine) {
+  a.mm-card:hover {
+    border-color: var(--line-strong);
+    transform: translateY(-1px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  a.mm-card {
+    transition: none;
+  }
+  a.mm-card:hover {
+    transform: none;
+  }
+}
+.mm-card-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.mm-card-title {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
+}
+.mm-card-desc {
+  color: var(--muted);
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
+}
+/* The marker for a link that is not an http(s) address. */
+.mm-invalid {
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-style: italic;
+}
+
+/* The tile: a letter or one emoji on a palette colour. The letter is near-black
+   (#101012) on every colour but indigo, which takes white. Contrast ratios
+   (light theme / dark theme): near-black on red 5.4/5.6, orange 8.6/9.2, yellow
+   12.6/13.5, green 8.6/9.4, mint 9.0/12.6, teal 7.4/9.6, cyan 7.5/11.0, blue
+   4.7/5.2, purple 4.6/5.4, pink 5.2/5.4, brown 5.4/6.2, gray 5.8/6.6; white on
+   indigo 5.6/5.1. Every colour reaches at least 4.5:1 in both themes (white
+   would give only 1.4 to 4.1 on the others, near-black only 3.4/3.8 on indigo). */
+.mm-tile {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  background: var(--pal-gray);
+  color: #101012;
+  font-size: 0.875rem;
+  font-weight: 700;
+  line-height: 1;
+  user-select: none;
+}
+.mm-tile[data-colour="red"] { background: var(--pal-red); }
+.mm-tile[data-colour="orange"] { background: var(--pal-orange); }
+.mm-tile[data-colour="yellow"] { background: var(--pal-yellow); }
+.mm-tile[data-colour="green"] { background: var(--pal-green); }
+.mm-tile[data-colour="mint"] { background: var(--pal-mint); }
+.mm-tile[data-colour="teal"] { background: var(--pal-teal); }
+.mm-tile[data-colour="cyan"] { background: var(--pal-cyan); }
+.mm-tile[data-colour="blue"] { background: var(--pal-blue); }
+.mm-tile[data-colour="indigo"] {
+  background: var(--pal-indigo);
+  color: #fff;
+}
+.mm-tile[data-colour="purple"] { background: var(--pal-purple); }
+.mm-tile[data-colour="pink"] { background: var(--pal-pink); }
+.mm-tile[data-colour="brown"] { background: var(--pal-brown); }
+.mm-tile[data-colour="gray"] { background: var(--pal-gray); }
+/* Bookmark pills ---------------------------------------------------------------- */
+.mm-bookmarks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+.mm-pill {
+  max-width: 100%;
+  padding: 0.4375rem 0.875rem;
+  border-radius: 999px;
+  color: var(--text);
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+@media (hover: hover) and (pointer: fine) {
+  a.mm-pill:hover {
+    border-color: var(--brand);
+  }
+}
+
+/* The empty state ---------------------------------------------------------------
+   Self-contained: the same look as the kit's .empty and .empty-title, so that a
+   page without the kit's rules (the extension) draws it the same. */
+.mm-empty {
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+}
+.mm-empty .empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 3rem var(--sp-6);
+  text-align: center;
+}
+.mm-empty .empty-title {
+  margin: 0;
+  font-size: 1.0625rem;
+  font-weight: 600;
+  letter-spacing: -0.013em;
+}

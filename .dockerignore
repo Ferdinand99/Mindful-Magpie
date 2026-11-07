@@ -24,6 +24,7 @@ docs/
 assets/
 site/
 tests/
+web/
 *.md
 docker-compose*.yml
 Dockerfile

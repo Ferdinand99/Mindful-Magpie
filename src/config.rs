@@ -29,12 +29,33 @@ pub struct Config {
     /// without it, the address of each request is used.
     #[arg(long, env = "MM_PUBLIC_URL", value_parser = parse_public_url)]
     pub public_url: Option<String>,
+
+    /// Extra browser extension IDs (the gecko id of a development or
+    /// self-signed build, comma separated) that may use "Koble til Magpie".
+    /// The official extension, mindful-magpie@hedgerow.tools, always may.
+    #[arg(
+        long,
+        env = "MM_EXTENSION_IDS",
+        value_delimiter = ',',
+        value_parser = parse_extension_id
+    )]
+    pub extension_ids: Vec<String>,
 }
 
 impl Config {
     pub fn bind_addr(&self) -> SocketAddr {
         SocketAddr::new(self.bind, self.port)
     }
+}
+
+/// An extension ID as written in a manifest's `gecko.id`: an e-mail-like
+/// address or a `{uuid}`. Blank entries are allowed and ignored.
+fn parse_extension_id(raw: &str) -> Result<String, String> {
+    let id = raw.trim();
+    if id.len() > 128 || id.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("an extension ID has no spaces and at most 128 characters".into());
+    }
+    Ok(id.to_string())
 }
 
 /// An http(s) URL for the root of a host, without query or fragment, returned
@@ -68,6 +89,7 @@ mod tests {
         assert_eq!(c.port, 3010);
         assert_eq!(c.bind_addr().to_string(), "0.0.0.0:3010");
         assert_eq!(c.public_url, None);
+        assert!(c.extension_ids.is_empty());
         let c = Config::try_parse_from([
             "mindful-magpie",
             "--port",
@@ -80,6 +102,21 @@ mod tests {
         .unwrap();
         assert_eq!(c.bind_addr().to_string(), "127.0.0.1:8080");
         assert_eq!(c.public_url.as_deref(), Some("https://start.example.com"));
+    }
+
+    #[test]
+    fn extension_ids_are_a_comma_separated_list() {
+        let c = Config::try_parse_from([
+            "mindful-magpie",
+            "--extension-ids",
+            "dev@example.com, {1b2c3d4e-0000-4000-8000-000000000000}",
+        ])
+        .unwrap();
+        assert_eq!(
+            c.extension_ids,
+            ["dev@example.com", "{1b2c3d4e-0000-4000-8000-000000000000}"]
+        );
+        assert!(Config::try_parse_from(["mindful-magpie", "--extension-ids", "a b"]).is_err());
     }
 
     #[test]
