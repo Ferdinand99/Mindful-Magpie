@@ -1,7 +1,7 @@
-//! The `ww` kind («Wise Wren», Plan 5, task 3), against a stub of Wise Wren's
-//! API: the numbers, the status and the needs, what a failing call, a refused
-//! key or a malformed answer does, and that the token stays out of every
-//! error, reading and log.
+//! The `ww` kind («Wise Wren») against a stub of Wise Wren's API: the numbers,
+//! the status and the needs, what a failing call, a refused key or a
+//! malformed answer does, and that the token stays out of every error,
+//! reading and log.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -202,12 +202,22 @@ fn ctx(base: &str, secret: Option<&str>) -> FetchCtx {
     }
 }
 
+/// A fetch with the token that is expected to give a reading, good or bad.
 async fn fetch(base: &str) -> Snapshot {
     integrations::find("ww")
         .expect("the registry lists ww")
         .fetch(&ctx(base, Some(TOKEN)))
         .await
         .expect("a reading, good or bad")
+}
+
+/// A fetch with the token that is expected to give none: the reason.
+async fn fetch_err(base: &str) -> FetchError {
+    integrations::find("ww")
+        .expect("the registry lists ww")
+        .fetch(&ctx(base, Some(TOKEN)))
+        .await
+        .expect_err("no reading at all")
 }
 
 fn num(snapshot: &Snapshot, id: &str) -> Option<f64> {
@@ -240,6 +250,9 @@ fn the_kind_describes_itself() {
     let fields = kind.fields();
     assert_eq!(fields.len(), 1);
     assert!(fields[0].secret);
+    assert_eq!(fields[0].key, "secret");
+    assert_eq!(fields[0].label_key, "field.ww_secret");
+    assert_eq!(fields[0].placeholder, "ww_…");
 }
 
 /// The keys of a locale file's section, with their texts.
@@ -305,21 +318,27 @@ fn every_text_of_the_kind_exists_in_both_languages() {
     );
     assert!(texts["en"][help].contains("Read"), "{}", texts["en"][help]);
     assert!(
-        texts["nb"][help].contains("API-tokens"),
+        texts["en"][help].contains("Read only"),
+        "{}",
+        texts["en"][help]
+    );
+    assert!(
+        texts["nb"][help].contains("API-tokener"),
         "{}",
         texts["nb"][help]
     );
-    assert!(texts["nb"][help].contains("Lese"), "{}", texts["nb"][help]);
+    assert!(
+        texts["nb"][help].contains("«Bare lesing»"),
+        "{}",
+        texts["nb"][help]
+    );
 }
 
 #[test]
 fn the_refused_key_text_maps_to_its_translation_key() {
-    assert_eq!(FetchError::Auth.to_string(), "The key was refused");
+    assert_eq!(FetchError::Auth.to_string(), "key refused");
     assert_eq!(FetchError::Auth.text_key(), Some("fetch_err.auth"));
-    assert_eq!(
-        error_text_key("The key was refused"),
-        Some("fetch_err.auth")
-    );
+    assert_eq!(error_text_key("key refused"), Some("fetch_err.auth"));
 }
 
 // ---------------------------------------------------------------------------
@@ -442,12 +461,14 @@ async fn the_address_may_carry_a_path_prefix() {
 // Status
 
 #[tokio::test]
-async fn updates_ready_warn() {
+async fn updates_ready_are_shown_but_do_not_change_the_status() {
     let (base, stub) = serve().await;
     quiet(&stub);
     stub.ok(UPDATES, &updates(2));
     let s = fetch(&base).await;
-    assert_eq!(s.status, Status::Warn);
+    // Wise Wren's list does not say which updates were skipped, so a count
+    // alone is not a warning.
+    assert_eq!(s.status, Status::Ok);
     assert_eq!(num(&s, "updates_ready"), Some(2.0));
     // Updates alone are not a need.
     assert!(s.needs.is_empty(), "{:?}", s.needs);
@@ -743,32 +764,24 @@ async fn a_failing_call_still_lets_the_others_raise_needs() {
 }
 
 #[tokio::test]
-async fn every_call_failing_gives_a_bad_reading_without_numbers() {
+async fn every_call_failing_gives_no_reading() {
     let (base, stub) = serve().await;
     for path in [SERVERS, UPDATES, RUNS] {
         stub.reply(path, 503, "");
     }
-    let s = fetch(&base).await;
-    assert_eq!(s.status, Status::Bad);
-    assert_eq!(s.error.as_deref(), Some("HTTP 503"));
-    assert!(s.values.is_empty());
-    assert!(s.needs.is_empty());
+    assert_eq!(fetch_err(&base).await, FetchError::Status(503));
 }
 
 #[tokio::test]
-async fn a_missing_endpoint_is_a_bad_reading_not_a_panic() {
+async fn a_missing_endpoint_gives_no_reading_and_no_panic() {
     // An old or other server that does not know the routes: 404 on all.
     let (base, _stub) = serve().await;
-    let s = fetch(&base).await;
-    assert_eq!(s.status, Status::Bad);
-    assert_eq!(s.error.as_deref(), Some("HTTP 404"));
+    assert_eq!(fetch_err(&base).await, FetchError::Status(404));
 }
 
 #[tokio::test]
-async fn an_unreachable_server_is_a_bad_reading() {
-    let s = fetch("http://127.0.0.1:1").await;
-    assert_eq!(s.status, Status::Bad);
-    assert_eq!(s.error.as_deref(), Some("connection failed"));
+async fn an_unreachable_server_gives_no_reading() {
+    assert_eq!(fetch_err("http://127.0.0.1:1").await, FetchError::Connect);
 }
 
 #[tokio::test]
@@ -778,14 +791,10 @@ async fn a_refused_key_says_so_and_no_more() {
         for path in [SERVERS, UPDATES, RUNS] {
             stub.reply(path, code, json!({ "error": "unauthorized" }).to_string());
         }
-        let s = fetch(&base).await;
-        assert_eq!(s.status, Status::Bad, "{code}");
-        assert_eq!(s.error.as_deref(), Some("The key was refused"), "{code}");
-        assert_eq!(
-            error_text_key(s.error.as_deref().unwrap()),
-            Some("fetch_err.auth")
-        );
-        assert!(s.values.is_empty());
+        let err = fetch_err(&base).await;
+        assert_eq!(err, FetchError::Auth, "{code}");
+        assert_eq!(err.to_string(), "key refused", "{code}");
+        assert_eq!(error_text_key(&err.to_string()), Some("fetch_err.auth"));
     }
 }
 
@@ -797,7 +806,7 @@ async fn a_refusal_in_one_call_beats_another_failure() {
     stub.reply(UPDATES, 401, "");
     let s = fetch(&base).await;
     assert_eq!(s.status, Status::Bad);
-    assert_eq!(s.error.as_deref(), Some("The key was refused"));
+    assert_eq!(s.error.as_deref(), Some("key refused"));
     assert!(s.values.contains_key("failed_targets"));
 }
 
@@ -831,15 +840,12 @@ async fn malformed_json_is_a_bad_reading_not_a_panic() {
 }
 
 #[tokio::test]
-async fn all_three_malformed_gives_no_numbers() {
+async fn all_three_malformed_gives_no_reading() {
     let (base, stub) = serve().await;
     for path in [SERVERS, UPDATES, RUNS] {
         stub.reply(path, 200, "<html>hello</html>");
     }
-    let s = fetch(&base).await;
-    assert_eq!(s.status, Status::Bad);
-    assert_eq!(s.error.as_deref(), Some("unexpected answer"));
-    assert!(s.values.is_empty());
+    assert_eq!(fetch_err(&base).await, FetchError::Invalid);
 }
 
 #[tokio::test]
@@ -943,15 +949,19 @@ async fn the_token_is_in_no_reading_error_or_log() {
     readings.push(fetch(&base).await);
     stub.reply(RUNS, 500, format!("{{\"echo\": \"Bearer {TOKEN}\"}}"));
     readings.push(fetch(&base).await);
+    let mut errors = Vec::new();
     for path in [SERVERS, UPDATES, RUNS] {
         stub.reply(path, 401, format!("Bearer {TOKEN}"));
     }
-    readings.push(fetch(&base).await);
+    errors.push(fetch_err(&base).await);
     for path in [SERVERS, UPDATES, RUNS] {
         stub.reply(path, 200, format!("{{\"servers\": \"{TOKEN}\"}}"));
     }
-    readings.push(fetch(&base).await);
-    readings.push(fetch("http://127.0.0.1:1").await);
+    errors.push(fetch_err(&base).await);
+    errors.push(fetch_err("http://127.0.0.1:1").await);
+    for err in &errors {
+        assert!(!format!("{err} {err:?}").contains(TOKEN));
+    }
 
     for reading in &readings {
         let stored = serde_json::to_string(reading).unwrap();
@@ -973,6 +983,11 @@ async fn the_token_is_in_no_reading_error_or_log() {
     }
 
     let log = logged();
+    // The capture does see what the HTTP library logs.
+    assert!(
+        log.contains("hyper_util") || log.contains("reqwest"),
+        "the capture sees the HTTP client's own lines"
+    );
     assert!(!log.contains(TOKEN), "the token reached the log");
     assert!(
         !log.contains("Bearer"),

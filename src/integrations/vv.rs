@@ -9,21 +9,18 @@
 //!
 //! The service's secret is a read token, sent as `Authorization: Bearer`.
 //! Monitor names come from outside: they are shown only as the text value
-//! `first_down`, never in a need.
+//! `first_down`, never in a need. A field that is missing or odd costs only
+//! its own metric.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderValue};
-use serde::Deserialize;
 use serde_json::Value as Json;
-use url::Url;
-use vole_kit::net::check_host;
 
+use super::api::{self, OldAddresses, Reply};
 use super::{
     BoxFuture, FetchCtx, FetchError, Field, FieldKind, Format, Integration, Level, MetricDef, Need,
-    Snapshot, Status, Value, classify, read_capped,
+    Snapshot, Status, Value,
 };
 
 /// The only instance.
@@ -34,21 +31,20 @@ pub struct VvKind;
 
 /// The number of days the uptime figure covers.
 const DAYS: &str = "30";
-/// How long an address that answered 404 to `/summary` is left alone.
-const LEGACY_FOR: Duration = Duration::from_secs(60 * 60);
-/// Most addresses remembered as old.
-const LEGACY_MAX: usize = 64;
 /// Longest `first_down` text, in characters.
 const NAME_CHARS: usize = 80;
 
 /// The key of the need «some monitors are down».
 pub const DOWN_NEED: &str = "vv:down";
 
+/// The addresses whose `/summary` answered 404.
+static OLD: OldAddresses = OldAddresses::new();
+
 static FIELDS: [Field; 1] = [Field {
-    key: "token",
-    label_key: "field.vv_token",
-    help_key: "field.vv_token_help",
-    placeholder: "",
+    key: "secret",
+    label_key: "field.vv_secret",
+    help_key: "field.vv_secret_help",
+    placeholder: "vv_…",
     kind: FieldKind::Text,
     required: true,
     secret: true,
@@ -87,257 +83,128 @@ static METRICS: [MetricDef; 6] = [
     },
 ];
 
-// ---------------------------------------------------------------------------
-// What Vigilant Vole answers. Only what is read; every other field is ignored.
-
-#[derive(Debug, Deserialize)]
-struct Summary {
-    monitors: Counts,
-    #[serde(default)]
-    uptime: Uptime,
-    #[serde(default)]
-    down: Vec<DownMonitor>,
+/// What is read of an answer: the counts, the uptime figures and the name of
+/// the monitor that has been down longest (the last two from a summary only).
+/// Each is missing when the answer does not have it in a usable form.
+#[derive(Debug, Default, PartialEq)]
+struct Reading {
+    up: Option<f64>,
+    down: Option<f64>,
+    pending: Option<f64>,
+    unknown: Option<f64>,
+    paused: Option<f64>,
+    uptime_30d: Option<f64>,
+    uptime_24h: Option<f64>,
+    first_down: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct Counts {
-    #[serde(default)]
-    up: u64,
-    #[serde(default)]
-    down: u64,
-    #[serde(default)]
-    pending: u64,
-    #[serde(default)]
-    unknown: u64,
-    #[serde(default)]
-    paused: u64,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct Uptime {
-    pct: Option<f64>,
-    pct_24h: Option<f64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DownMonitor {
-    name: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Health {
-    monitors: HealthMonitors,
-}
-
-#[derive(Debug, Deserialize)]
-struct HealthMonitors {
-    #[serde(default)]
-    by_status: BTreeMap<String, u64>,
-}
-
-impl From<HealthMonitors> for Counts {
-    fn from(h: HealthMonitors) -> Counts {
-        let count = |key: &str| h.by_status.get(key).copied().unwrap_or(0);
-        Counts {
-            up: count("up"),
-            down: count("down"),
-            pending: count("pending"),
-            unknown: count("unknown"),
-            paused: count("paused"),
-        }
+/// The counts in `monitors`, each as `count` reads it.
+fn counts(monitors: &Json, count: impl Fn(Option<&Json>) -> Option<f64>) -> Reading {
+    Reading {
+        up: count(monitors.get("up")),
+        down: count(monitors.get("down")),
+        pending: count(monitors.get("pending")),
+        unknown: count(monitors.get("unknown")),
+        paused: count(monitors.get("paused")),
+        ..Reading::default()
     }
 }
 
-// ---------------------------------------------------------------------------
-// Old servers
-
-/// The addresses that answered 404 to `/summary`, and when.
-#[derive(Debug, Default)]
-struct Legacy {
-    seen: Vec<(String, Instant)>,
+/// The reading of a `/summary` answer. Without `monitors` there is nothing
+/// to show: [`FetchError::Invalid`].
+fn summary(doc: &Json) -> Result<Reading, FetchError> {
+    let monitors = doc
+        .get("monitors")
+        .filter(|m| m.is_object())
+        .ok_or(FetchError::Invalid)?;
+    Ok(Reading {
+        // `uptime` and `down` may be null, or missing.
+        uptime_30d: api::percent(doc.pointer("/uptime/pct")),
+        uptime_24h: api::percent(doc.pointer("/uptime/pct_24h")),
+        first_down: doc
+            .get("down")
+            .and_then(Json::as_array)
+            .and_then(|list| list.iter().find_map(|d| d.get("name")?.as_str()))
+            .map(|name| api::clean_text(name, NAME_CHARS))
+            .filter(|name| !name.is_empty()),
+        ..counts(monitors, api::count)
+    })
 }
 
-impl Legacy {
-    fn expire(&mut self, now: Instant) {
-        self.seen
-            .retain(|(_, at)| now.saturating_duration_since(*at) < LEGACY_FOR);
-    }
-
-    /// Whether `key` answered 404 within the last hour.
-    fn is_old(&mut self, key: &str, now: Instant) -> bool {
-        self.expire(now);
-        self.seen.iter().any(|(k, _)| k == key)
-    }
-
-    fn mark(&mut self, key: &str, now: Instant) {
-        self.expire(now);
-        self.seen.retain(|(k, _)| k != key);
-        if self.seen.len() >= LEGACY_MAX {
-            self.seen.remove(0);
-        }
-        self.seen.push((key.to_string(), now));
-    }
+/// The reading of a `/health` answer (an older server): the counts only.
+fn health(doc: &Json) -> Result<Reading, FetchError> {
+    let by_status = doc
+        .pointer("/monitors/by_status")
+        .filter(|m| m.is_object())
+        .ok_or(FetchError::Invalid)?;
+    // A status that is not listed has no monitors.
+    Ok(counts(by_status, |v| Some(api::count(v).unwrap_or(0.0))))
 }
 
-static LEGACY: Mutex<Legacy> = Mutex::new(Legacy { seen: Vec::new() });
-
-fn legacy<T>(f: impl FnOnce(&mut Legacy) -> T) -> T {
-    // A panic elsewhere cannot leave the list in a state that matters.
-    let mut guard = LEGACY.lock().unwrap_or_else(|e| e.into_inner());
-    f(&mut guard)
-}
-
-// ---------------------------------------------------------------------------
-// Addresses and requests
-
-/// The service's address: `http` or `https`, a host, no user name or password.
-fn base(settings: &Json) -> Result<Url, FetchError> {
-    let text = settings
-        .get("url")
-        .and_then(Json::as_str)
-        .ok_or(FetchError::Config)?;
-    let url = Url::parse(text.trim()).map_err(|_| FetchError::Config)?;
-    if !matches!(url.scheme(), "http" | "https")
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
-        return Err(FetchError::Config);
-    }
-    let host = url.host_str().ok_or(FetchError::Config)?;
-    // An address in the URL never reaches the guarded resolver.
-    check_host(host).map_err(|_| FetchError::Forbidden)?;
-    Ok(url)
-}
-
-/// `base` with `/api/v1/<last>` after its own path (Vigilant Vole may sit
-/// under a prefix behind a proxy).
-fn endpoint(base: &Url, last: &str) -> Result<Url, FetchError> {
-    let mut url = base.clone();
-    url.set_query(None);
-    url.set_fragment(None);
-    url.path_segments_mut()
-        .map_err(|()| FetchError::Config)?
-        .pop_if_empty()
-        .extend(["api", "v1", last]);
-    Ok(url)
-}
-
-enum Reply {
-    Body(Vec<u8>),
-    NotFound,
-}
-
-/// One GET. The error is why there is no reading; it holds neither the
-/// address nor the header.
-async fn get(http: &reqwest::Client, url: Url, auth: &HeaderValue) -> Result<Reply, FetchError> {
-    let response = http
-        .get(url)
-        .header(AUTHORIZATION, auth.clone())
-        .header(ACCEPT, "application/json")
-        .send()
-        .await
-        .map_err(|e| classify(&e))?;
-    match response.status().as_u16() {
-        401 | 403 => Err(FetchError::Auth),
-        404 => Ok(Reply::NotFound),
-        code if !(200..300).contains(&code) => Err(FetchError::Status(code)),
-        _ => read_capped(response).await.map(Reply::Body),
-    }
-}
-
-fn parse<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, FetchError> {
-    serde_json::from_slice(body).map_err(|_| FetchError::Invalid)
-}
-
-// ---------------------------------------------------------------------------
-// The reading
-
-/// The text of a monitor's name that is safe to show: no control characters,
-/// not long.
-fn clean_name(name: &str) -> String {
-    name.chars()
-        .filter(|c| !c.is_control())
-        .take(NAME_CHARS)
-        .collect::<String>()
-        .trim()
-        .to_string()
-}
-
-fn percent(p: Option<f64>) -> Value {
-    Value {
-        num: p.filter(|p| p.is_finite()),
-        text: None,
-    }
-}
-
-fn snapshot(counts: &Counts, uptime: &Uptime, first_down: Option<String>) -> Snapshot {
-    let status = if counts.down > 0 {
+fn snapshot(reading: Reading) -> Snapshot {
+    let down = reading.down.unwrap_or(0.0);
+    let status = if down > 0.0 {
         Status::Bad
-    } else if counts.pending + counts.unknown > 0 {
+    } else if reading.pending.unwrap_or(0.0) + reading.unknown.unwrap_or(0.0) > 0.0 {
         Status::Warn
     } else {
         Status::Ok
     };
     let mut snapshot = Snapshot::new(status);
-    let count = |n: u64| Value::num(n as f64);
-    snapshot.values = BTreeMap::from([
-        ("up".to_string(), count(counts.up)),
-        ("down".to_string(), count(counts.down)),
-        ("paused".to_string(), count(counts.paused)),
-        ("uptime_30d".to_string(), percent(uptime.pct)),
-        ("uptime_24h".to_string(), percent(uptime.pct_24h)),
-        (
-            "first_down".to_string(),
-            match first_down.filter(|n| !n.is_empty()) {
-                Some(name) => Value::text(name),
-                None => Value {
-                    num: None,
-                    text: None,
-                },
-            },
-        ),
-    ]);
-    if counts.down > 0 {
-        snapshot.needs.push(down_need(counts.down));
+    let mut values = BTreeMap::new();
+    for (id, number) in [
+        ("up", reading.up),
+        ("down", reading.down),
+        ("paused", reading.paused),
+        ("uptime_30d", reading.uptime_30d),
+        ("uptime_24h", reading.uptime_24h),
+    ] {
+        if let Some(number) = number {
+            values.insert(id.to_string(), Value::num(number));
+        }
+    }
+    if let Some(name) = reading.first_down {
+        values.insert("first_down".to_string(), Value::text(name));
+    }
+    snapshot.values = values;
+    if down > 0.0 {
+        snapshot.needs.push(down_need(down));
     }
     snapshot
 }
 
 /// The need «n monitors are down». Its text takes only the count (the card
 /// shows the service's name next to it); no monitor name goes in.
-fn down_need(down: u64) -> Need {
+fn down_need(down: f64) -> Need {
     Need {
         key: DOWN_NEED.to_string(),
         level: Level::Bad,
         label_key: "need.vv_down".to_string(),
-        params: BTreeMap::from([("count".to_string(), down.to_string())]),
-        score: down as f64,
+        params: BTreeMap::from([("count".to_string(), format!("{down:.0}"))]),
+        score: down,
     }
 }
 
-async fn read(ctx: &FetchCtx, base: &Url, auth: &HeaderValue) -> Result<Snapshot, FetchError> {
-    let mut summary = endpoint(base, "summary")?;
-    let key = summary.as_str().to_string();
-    if !legacy(|l| l.is_old(&key, Instant::now())) {
-        summary.set_query(Some(&format!("days={DAYS}")));
-        match get(&ctx.http, summary, auth).await? {
-            Reply::Body(body) => {
-                let s: Summary = parse(&body)?;
-                let first = s.down.iter().find_map(|d| d.name.as_deref());
-                return Ok(snapshot(&s.monitors, &s.uptime, first.map(clean_name)));
+async fn read(ctx: &FetchCtx) -> Result<Snapshot, FetchError> {
+    let base = api::base_url(&ctx.settings)?;
+    let auth = api::bearer(ctx.secret.as_deref())?;
+    let path = |last| ["api", "v1", last];
+    let key = api::endpoint(&base, &path("summary"), None)?.to_string();
+    if !OLD.is_old(&key, Instant::now()) {
+        let url = api::endpoint(&base, &path("summary"), Some(&format!("days={DAYS}")))?;
+        match api::get_json::<Json>(&ctx.http, url, &auth).await? {
+            Reply::Found(doc) => {
+                OLD.forget(&key);
+                return summary(&doc).map(snapshot);
             }
-            Reply::NotFound => legacy(|l| l.mark(&key, Instant::now())),
+            Reply::NotFound => OLD.mark(&key, Instant::now()),
         }
     }
-    // An old server: the counts of `/health`, and no uptime figures.
-    match get(&ctx.http, endpoint(base, "health")?, auth).await? {
-        Reply::Body(body) => {
-            let h: Health = parse(&body)?;
-            Ok(snapshot(&h.monitors.into(), &Uptime::default(), None))
-        }
-        // Not Vigilant Vole, or older than any this kind knows.
-        Reply::NotFound => Err(FetchError::Status(404)),
-    }
+    // An old server: the counts of `/health`, and no uptime figures. A 404
+    // here too is not Vigilant Vole, or older than any this kind knows.
+    let url = api::endpoint(&base, &path("health"), None)?;
+    let doc: Json = api::get_json(&ctx.http, url, &auth).await?.found()?;
+    health(&doc).map(snapshot)
 }
 
 impl Integration for VvKind {
@@ -366,79 +233,57 @@ impl Integration for VvKind {
     }
 
     fn fetch<'a>(&'a self, ctx: &'a FetchCtx) -> BoxFuture<'a, Result<Snapshot, FetchError>> {
-        Box::pin(async move {
-            // What the admin set wrong is an `Err`; what the server does is a
-            // bad reading.
-            let base = base(&ctx.settings)?;
-            let token = ctx
-                .secret
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .ok_or(FetchError::Config)?;
-            let mut auth = HeaderValue::from_str(&format!("Bearer {token}"))
-                .map_err(|_| FetchError::Config)?;
-            // Kept out of debug output, and stripped on a redirect to another
-            // host.
-            auth.set_sensitive(true);
-            Ok(read(ctx, &base, &auth)
-                .await
-                .unwrap_or_else(|e| Snapshot::failed(&e)))
-        })
+        Box::pin(read(ctx))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
-    fn an_old_address_is_left_alone_for_an_hour() {
-        let start = Instant::now();
-        let mut l = Legacy::default();
-        assert!(!l.is_old("a", start));
-        l.mark("a", start);
-        assert!(l.is_old("a", start + Duration::from_secs(59 * 60)));
-        assert!(!l.is_old("b", start));
-        assert!(!l.is_old("a", start + LEGACY_FOR));
-        assert!(l.seen.is_empty());
+    fn a_summary_with_null_or_odd_fields_keeps_what_is_good() {
+        let doc = json!({
+            "monitors": { "up": 5, "down": null, "pending": "x", "unknown": -1, "paused": 2 },
+            "uptime": null,
+            "down": null,
+        });
+        let reading = summary(&doc).unwrap();
+        assert_eq!(reading.up, Some(5.0));
+        assert_eq!(reading.down, None);
+        assert_eq!(reading.paused, Some(2.0));
+        assert_eq!(reading.uptime_30d, None);
+        assert_eq!(reading.first_down, None);
+        let snapshot = snapshot(reading);
+        assert_eq!(snapshot.status, Status::Ok);
+        let ids: Vec<_> = snapshot.values.keys().map(String::as_str).collect();
+        assert_eq!(ids, ["paused", "up"]);
     }
 
     #[test]
-    fn the_list_of_old_addresses_stays_small() {
-        let now = Instant::now();
-        let mut l = Legacy::default();
-        for i in 0..(LEGACY_MAX + 10) {
-            l.mark(&format!("http://h{i}/"), now);
+    fn the_uptime_is_clamped_and_a_hostile_name_is_cleaned() {
+        let doc = json!({
+            "monitors": { "up": 1, "down": 1 },
+            "uptime": { "pct": 140.0, "pct_24h": -2.0 },
+            "down": [{ "name": null }, { "name": "a\u{202E}b\nc" }],
+        });
+        let reading = summary(&doc).unwrap();
+        assert_eq!(reading.uptime_30d, Some(100.0));
+        assert_eq!(reading.uptime_24h, Some(0.0));
+        assert_eq!(reading.first_down.as_deref(), Some("ab c"));
+    }
+
+    #[test]
+    fn no_monitors_is_not_a_reading() {
+        for doc in [
+            json!({}),
+            json!({ "monitors": null }),
+            json!({ "monitors": 3 }),
+        ] {
+            assert_eq!(summary(&doc).unwrap_err(), FetchError::Invalid);
         }
-        assert_eq!(l.seen.len(), LEGACY_MAX);
-        assert!(!l.is_old("http://h0/", now));
-        assert!(l.is_old(&format!("http://h{}/", LEGACY_MAX + 9), now));
-    }
-
-    #[test]
-    fn the_endpoint_follows_the_path_of_the_address() {
-        let at = |text: &str, last: &str| {
-            endpoint(&Url::parse(text).unwrap(), last)
-                .unwrap()
-                .to_string()
-        };
-        assert_eq!(
-            at("http://h:3000", "summary"),
-            "http://h:3000/api/v1/summary"
-        );
-        assert_eq!(
-            at("https://h/vole/", "health"),
-            "https://h/vole/api/v1/health"
-        );
-        assert_eq!(
-            at("https://h/vole?x=1#f", "health"),
-            "https://h/vole/api/v1/health"
-        );
-    }
-
-    #[test]
-    fn a_name_is_cleaned_and_cut() {
-        assert_eq!(clean_name("a\u{0}b\nc\u{7}"), "abc");
-        assert_eq!(clean_name(&"x".repeat(500)).chars().count(), NAME_CHARS);
+        assert_eq!(health(&json!({})).unwrap_err(), FetchError::Invalid);
     }
 }

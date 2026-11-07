@@ -6,7 +6,8 @@
 //! targets with a new version) and `GET /api/v1/runs?limit=100` (one page of
 //! the newest runs, never followed on). A call that fails costs only its own
 //! numbers: the reading turns bad, says why, and keeps what the other calls
-//! gave. Wise Wren's own names (servers, targets, images) are never kept: the
+//! gave (when none of them gave anything the fetch is an `Err`). Wise Wren's
+//! own names (servers, targets, images) are never kept: the
 //! reading holds numbers only.
 //!
 //! The token is sent as `Authorization: Bearer`, marked sensitive so it stays
@@ -17,16 +18,15 @@ use std::time::Duration;
 
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp, civil};
-use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderValue};
+use reqwest::header::HeaderValue;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use serde_json::Value as Json;
 use url::Url;
-use vole_kit::net::check_host;
 
+use super::api;
 use super::{
     BoxFuture, FetchCtx, FetchError, Field, FieldKind, Format, Integration, Level, MetricDef, Need,
-    Snapshot, Status, Value, classify, read_capped,
+    Snapshot, Status, Value,
 };
 
 /// How many of the newest runs one fetch asks for. Wise Wren answers newest
@@ -115,34 +115,21 @@ impl Integration for WwKind {
 
     fn fetch<'a>(&'a self, ctx: &'a FetchCtx) -> BoxFuture<'a, Result<Snapshot, FetchError>> {
         Box::pin(async move {
-            let base = base_url(&ctx.settings)?;
-            let token = ctx
-                .secret
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .ok_or(FetchError::Config)?;
-            let mut auth = HeaderValue::from_str(&format!("Bearer {token}"))
-                .map_err(|_| FetchError::Config)?;
-            // Kept out of debug output, and stripped on a redirect to
-            // another host.
-            auth.set_sensitive(true);
+            let base = api::base_url(&ctx.settings)?;
+            let auth = api::bearer(ctx.secret.as_deref())?;
 
             let runs_query = format!("limit={RUN_LIMIT}");
             let (servers, updates, runs) = tokio::join!(
-                get::<ServerList>(ctx, endpoint(&base, "/api/v1/servers", None), &auth),
-                get::<TargetList>(ctx, endpoint(&base, "/api/v1/updates", None), &auth),
-                get::<RunList>(
-                    ctx,
-                    endpoint(&base, "/api/v1/runs", Some(&runs_query)),
-                    &auth
-                ),
+                call::<ServerList>(ctx, &base, "servers", None, &auth),
+                call::<TargetList>(ctx, &base, "updates", None, &auth),
+                call::<RunList>(ctx, &base, "runs", Some(&runs_query), &auth),
             );
-            Ok(reading(
+            reading(
                 servers.map(|l| l.servers),
                 updates.map(|l| l.targets),
                 runs.map(|l| l.runs),
                 Timestamp::now(),
-            ))
+            )
         })
     }
 }
@@ -216,59 +203,17 @@ fn parse_time(text: &str) -> Option<Timestamp> {
     Some(at.to_zoned(TimeZone::UTC).ok()?.timestamp())
 }
 
-/// The address to read: `http` or `https`, a host, no user name or password.
-fn base_url(settings: &Json) -> Result<Url, FetchError> {
-    let text = settings
-        .get("url")
-        .and_then(Json::as_str)
-        .ok_or(FetchError::Config)?;
-    let url = Url::parse(text.trim()).map_err(|_| FetchError::Config)?;
-    if !matches!(url.scheme(), "http" | "https")
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
-        return Err(FetchError::Config);
-    }
-    let host = url.host_str().ok_or(FetchError::Config)?;
-    // An address in the URL never reaches the guarded resolver.
-    check_host(host).map_err(|_| FetchError::Forbidden)?;
-    Ok(url)
-}
-
-/// `path` under the address (which may itself have a path, behind a reverse
-/// proxy), with the query given.
-fn endpoint(base: &Url, path: &str, query: Option<&str>) -> Url {
-    let mut url = base.clone();
-    let prefix = base.path().trim_end_matches('/');
-    url.set_path(&format!("{prefix}{path}"));
-    url.set_query(query);
-    url.set_fragment(None);
-    url
-}
-
-/// One call. Every way it can fail is one of [`FetchError`]'s fixed texts.
-async fn get<T: DeserializeOwned>(
+/// One call to `/api/v1/<last>`. A 404 is an error too: there is nothing to
+/// fall back on.
+async fn call<T: DeserializeOwned>(
     ctx: &FetchCtx,
-    url: Url,
+    base: &Url,
+    last: &str,
+    query: Option<&str>,
     auth: &HeaderValue,
 ) -> Result<T, FetchError> {
-    let response = ctx
-        .http
-        .get(url)
-        .header(AUTHORIZATION, auth.clone())
-        .header(ACCEPT, "application/json")
-        .send()
-        .await
-        .map_err(|err| classify(&err))?;
-    let code = response.status();
-    if matches!(code.as_u16(), 401 | 403) {
-        return Err(FetchError::Auth);
-    }
-    if !code.is_success() {
-        return Err(FetchError::Status(code.as_u16()));
-    }
-    let body = read_capped(response).await?;
-    serde_json::from_slice(&body).map_err(|_| FetchError::Invalid)
+    let url = api::endpoint(base, &["api", "v1", last], query)?;
+    api::get_json(&ctx.http, url, auth).await?.found()
 }
 
 /// Which of two failures to report: a refused key first, since it is what an
@@ -315,10 +260,10 @@ fn reading(
     updates: Result<Vec<Target>, FetchError>,
     runs: Result<Vec<Run>, FetchError>,
     now: Timestamp,
-) -> Snapshot {
+) -> Result<Snapshot, FetchError> {
     let mut snapshot = Snapshot::new(Status::Ok);
     let mut error = None;
-    let (mut offline, mut failed, mut updates_ready) = (0, 0, 0);
+    let (mut offline, mut failed) = (0, 0);
 
     match servers {
         Ok(servers) => {
@@ -341,13 +286,13 @@ fn reading(
     match updates {
         Ok(targets) => {
             // `/updates` lists the targets with a new version.
-            updates_ready = targets
+            let ready = targets
                 .iter()
                 .filter(|t| t.status.as_deref().is_none_or(|s| s == "update"))
                 .count();
             snapshot
                 .values
-                .insert("updates_ready".into(), Value::num(updates_ready as f64));
+                .insert("updates_ready".into(), Value::num(ready as f64));
         }
         Err(err) => error = Some(worse(error, err)),
     }
@@ -371,7 +316,7 @@ fn reading(
         && let Some(err) = error
     {
         // Nothing could be read at all.
-        return Snapshot::failed(&err);
+        return Err(err);
     }
     if failed > 0 {
         snapshot
@@ -388,10 +333,12 @@ fn reading(
         snapshot.error = Some(err.to_string());
     } else if failed > 0 {
         snapshot.status = Status::Bad;
-    } else if offline > 0 || updates_ready > 0 {
+    } else if offline > 0 {
+        // Updates ready are shown, not a warning: whether they matter is up
+        // to the user (Wise Wren's list does not say which ones were skipped).
         snapshot.status = Status::Warn;
     }
-    snapshot
+    Ok(snapshot)
 }
 
 /// A need whose only parameter is how many: the chip shows the service's name

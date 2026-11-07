@@ -376,10 +376,9 @@ async fn an_answer_that_is_not_a_summary_is_an_unexpected_answer() {
         "[]",
         "{}",
         r#"{"totals": 5}"#,
-        r#"{"totals": {"new_issues": 1}}"#,
-        r#"{"totals": {"new_issues": "many", "regressed_issues": 0, "unresolved_issues": 0}}"#,
-        r#"{"totals": {"new_issues": -1, "regressed_issues": 0, "unresolved_issues": 0}}"#,
-        r#"{"totals": {"new_issues": 1.5, "regressed_issues": 0, "unresolved_issues": 0}}"#,
+        r#"{"totals": null}"#,
+        r#"{"totals": {}}"#,
+        r#"{"totals": {"new_issues": "many", "regressed_issues": null}}"#,
     ] {
         let (url, _) = serve(200, body).await;
         assert_eq!(
@@ -388,6 +387,105 @@ async fn an_answer_that_is_not_a_summary_is_an_unexpected_answer() {
             "{body:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn odd_numbers_only_drop_their_own_metric() {
+    // (the totals, the metrics that must be gone, the number of the one that stays)
+    for (totals, gone, new) in [
+        (
+            r#"{"new_issues": 3, "regressed_issues": 0}"#,
+            "unresolved_issues",
+            3.0,
+        ),
+        (
+            r#"{"new_issues": 3, "regressed_issues": -1, "unresolved_issues": 2}"#,
+            "regressed_issues",
+            3.0,
+        ),
+        (
+            r#"{"new_issues": 3, "regressed_issues": "x", "unresolved_issues": 2}"#,
+            "regressed_issues",
+            3.0,
+        ),
+        (
+            r#"{"new_issues": 3, "unresolved_issues": 2, "visitors_today": -5}"#,
+            "visitors_today",
+            3.0,
+        ),
+        (
+            r#"{"new_issues": 3, "unresolved_issues": 2, "app_users_today": [1]}"#,
+            "app_users_today",
+            3.0,
+        ),
+        (
+            r#"{"new_issues": 3.9, "unresolved_issues": 2}"#,
+            "crash_free",
+            3.0,
+        ),
+    ] {
+        let body = format!(r#"{{"totals": {totals}}}"#);
+        let (url, _) = serve(200, body.clone()).await;
+        let snapshot = fetch(&url, Some(TOKEN)).await.unwrap();
+        assert!(!snapshot.values.contains_key(gone), "{body}");
+        assert_eq!(num(&snapshot, "new_issues"), Some(new), "{body}");
+        assert_eq!(snapshot.status, Status::Warn, "{body}");
+        // No empty value is ever stored.
+        assert!(
+            snapshot
+                .values
+                .values()
+                .all(|v| v.num.is_some() || v.text.is_some()),
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_crash_free_percentage_is_kept_between_0_and_100() {
+    for (given, want) in [(250.0, 100.0), (-4.0, 0.0), (97.25, 97.25)] {
+        let mut t = totals(0, 0, 0);
+        t["crash_free_sessions"] = json!(given);
+        let (url, _) = serve(200, summary(t, vec![])).await;
+        let snapshot = fetch(&url, Some(TOKEN)).await.unwrap();
+        assert_eq!(num(&snapshot, "crash_free"), Some(want), "{given}");
+    }
+}
+
+#[tokio::test]
+async fn a_title_loses_control_and_format_characters() {
+    let title = "a\u{202E}b\u{200B}c\u{2066}d\u{FEFF}e\u{0}f";
+    let body = summary(
+        totals(0, 0, 1),
+        vec![project(1, issue(1, title, "2026-11-06 21:30:00"))],
+    );
+    let (url, _) = serve(200, body).await;
+    let snapshot = fetch(&url, Some(TOKEN)).await.unwrap();
+    assert_eq!(text(&snapshot, "newest_issue"), Some("abcdef"));
+}
+
+#[tokio::test]
+async fn a_redirect_to_another_origin_does_not_carry_the_token() {
+    // The address answers with a redirect to a second stub on another port;
+    // the client drops the Authorization header on a cross-origin redirect.
+    let (target, target_stub) = serve(200, summary(totals(1, 0, 0), vec![])).await;
+    let location = format!("{target}/api/v1/summary?hours=24");
+    let app = Router::new().fallback(move || {
+        let location = location.clone();
+        async move { axum::response::Redirect::temporary(&location) }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let snapshot = fetch(&origin, Some(TOKEN)).await.unwrap();
+    assert_eq!(num(&snapshot, "new_issues"), Some(1.0));
+    assert_eq!(target_stub.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        target_stub.auth.lock().unwrap().as_slice(),
+        [String::new()],
+        "the token stays with its host"
+    );
 }
 
 #[tokio::test]
@@ -556,6 +654,8 @@ fn the_kind_is_registered_with_its_form_metrics_and_intervals() {
     let fields = kind.fields();
     assert_eq!(fields.len(), 1);
     assert_eq!(fields[0].key, "secret");
+    assert_eq!(fields[0].label_key, "field.kk_secret");
+    assert_eq!(fields[0].placeholder, "kk_…");
     assert!(fields[0].secret);
     assert!(fields[0].required);
 
@@ -641,12 +741,17 @@ fn every_text_the_kind_uses_exists_in_english_and_norwegian() {
     assert!(
         locale_text(nb, "field.kk_secret_help")
             .unwrap()
-            .contains("API-tokens")
+            .contains("API-tokener")
     );
     assert!(
         locale_text(nb, "field.kk_secret_help")
             .unwrap()
-            .contains("«Lese»")
+            .contains("«Bare lesing»")
+    );
+    assert!(
+        locale_text(en, "field.kk_secret_help")
+            .unwrap()
+            .contains("Read only")
     );
     // The version that ships the endpoint is in the text.
     assert!(

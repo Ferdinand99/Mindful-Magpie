@@ -154,12 +154,20 @@ fn ctx(url: &str, token: Option<&str>) -> FetchCtx {
     }
 }
 
-/// A fetch with the token; the kind answers with a snapshot.
+/// A fetch with the token that is expected to give a reading.
 async fn fetch(url: &str) -> Snapshot {
     kind()
         .fetch(&ctx(url, Some(TOKEN)))
         .await
-        .expect("the vv kind answers with a snapshot")
+        .expect("the vv kind gives a reading")
+}
+
+/// A fetch with the token that is expected to give none: the reason.
+async fn fetch_err(url: &str) -> FetchError {
+    kind()
+        .fetch(&ctx(url, Some(TOKEN)))
+        .await
+        .expect_err("the vv kind gives no reading")
 }
 
 fn summary(up: u64, down: u64, pending: u64, unknown: u64, paused: u64) -> Json {
@@ -175,8 +183,9 @@ fn summary(up: u64, down: u64, pending: u64, unknown: u64, paused: u64) -> Json 
     })
 }
 
+/// A metric's number; `None` when the metric is left out.
 fn num(s: &Snapshot, id: &str) -> Option<f64> {
-    s.values.get(id).unwrap_or_else(|| panic!("no {id}")).num
+    s.values.get(id).and_then(|v| v.num)
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +206,9 @@ fn the_kind_describes_itself() {
     let fields = k.fields();
     assert_eq!(fields.len(), 1);
     assert!(fields[0].secret && fields[0].required);
+    assert_eq!(fields[0].key, "secret");
+    assert_eq!(fields[0].label_key, "field.vv_secret");
+    assert_eq!(fields[0].placeholder, "vv_…");
     // Every text it needs is in both languages.
     let mut keys: Vec<&str> = vec![k.label_key(), fields[0].label_key, fields[0].help_key];
     keys.extend(k.metrics().iter().map(|m| m.label_key));
@@ -275,15 +287,14 @@ async fn the_status_follows_down_and_pending() {
 }
 
 #[tokio::test]
-async fn a_null_percent_is_a_value_without_a_number() {
+async fn a_null_percent_leaves_the_metric_out() {
     let mut body = summary(0, 0, 0, 0, 4);
     body["uptime"] = json!({ "days": 30, "pct": null, "pct_24h": null, "monitors_counted": 0 });
     let (url, _) = serve(Answer::Json(body), Answer::Status(500)).await;
     let s = fetch(&url).await;
     assert_eq!(s.status, Status::Ok);
-    assert_eq!(num(&s, "uptime_30d"), None);
-    assert_eq!(num(&s, "uptime_24h"), None);
-    assert_eq!(s.values["uptime_30d"].text, None);
+    assert!(!s.values.contains_key("uptime_30d"));
+    assert!(!s.values.contains_key("uptime_24h"));
     assert_eq!(num(&s, "paused"), Some(4.0));
     assert_eq!(num(&s, "up"), Some(0.0));
     // One percent known, the other not.
@@ -292,7 +303,54 @@ async fn a_null_percent_is_a_value_without_a_number() {
     let (url, _) = serve(Answer::Json(body), Answer::Status(500)).await;
     let s = fetch(&url).await;
     assert_eq!(num(&s, "uptime_30d"), Some(99.87));
-    assert_eq!(num(&s, "uptime_24h"), None);
+    assert!(!s.values.contains_key("uptime_24h"));
+    // No empty value is ever stored.
+    assert!(
+        s.values
+            .values()
+            .all(|v| v.num.is_some() || v.text.is_some())
+    );
+}
+
+#[tokio::test]
+async fn a_null_uptime_or_down_list_costs_only_those_metrics() {
+    let mut body = summary(6, 1, 0, 0, 0);
+    body["uptime"] = Json::Null;
+    body["down"] = Json::Null;
+    let (url, _) = serve(Answer::Json(body), Answer::Status(500)).await;
+    let s = fetch(&url).await;
+    assert_eq!(s.status, Status::Bad);
+    assert_eq!(num(&s, "up"), Some(6.0));
+    assert_eq!(num(&s, "down"), Some(1.0));
+    assert_eq!(s.needs.len(), 1);
+    for id in ["uptime_30d", "uptime_24h", "first_down"] {
+        assert!(!s.values.contains_key(id), "{id}");
+    }
+    // A null count: that metric goes, and the status goes on what is left.
+    let mut body = summary(6, 0, 1, 0, 0);
+    body["monitors"]["down"] = Json::Null;
+    let (url, _) = serve(Answer::Json(body), Answer::Status(500)).await;
+    let s = fetch(&url).await;
+    assert_eq!(s.status, Status::Warn);
+    assert!(!s.values.contains_key("down"));
+    assert_eq!(num(&s, "up"), Some(6.0));
+}
+
+#[tokio::test]
+async fn a_percentage_is_kept_between_0_and_100() {
+    let mut body = summary(1, 0, 0, 0, 0);
+    body["uptime"] = json!({ "pct": 187.5, "pct_24h": -3.0 });
+    let (url, _) = serve(Answer::Json(body), Answer::Status(500)).await;
+    let s = fetch(&url).await;
+    assert_eq!(num(&s, "uptime_30d"), Some(100.0));
+    assert_eq!(num(&s, "uptime_24h"), Some(0.0));
+    // Not a number at all: left out.
+    let mut body = summary(1, 0, 0, 0, 0);
+    body["uptime"] = json!({ "pct": "high", "pct_24h": [1] });
+    let (url, _) = serve(Answer::Json(body), Answer::Status(500)).await;
+    let s = fetch(&url).await;
+    assert!(!s.values.contains_key("uptime_30d"));
+    assert!(!s.values.contains_key("uptime_24h"));
 }
 
 #[tokio::test]
@@ -305,7 +363,7 @@ async fn fields_it_does_not_know_are_ignored_and_the_optional_ones_may_be_missin
     let s = fetch(&url).await;
     assert_eq!(s.status, Status::Ok);
     assert_eq!(num(&s, "up"), Some(2.0));
-    assert_eq!(num(&s, "uptime_30d"), None);
+    assert!(!s.values.contains_key("uptime_30d"));
 }
 
 // ---------------------------------------------------------------------------
@@ -392,10 +450,10 @@ async fn an_old_server_falls_back_to_health_and_is_not_asked_for_summary_again()
     assert_eq!(num(&s, "up"), Some(5.0));
     assert_eq!(num(&s, "down"), Some(2.0));
     assert_eq!(num(&s, "paused"), Some(1.0));
-    // No uptime figures, and no first monitor.
-    assert_eq!(num(&s, "uptime_30d"), None);
-    assert_eq!(num(&s, "uptime_24h"), None);
-    assert_eq!(s.values["first_down"].text, None);
+    // No uptime figures, and no first monitor: the metrics are left out.
+    for id in ["uptime_30d", "uptime_24h", "first_down"] {
+        assert!(!s.values.contains_key(id), "{id}");
+    }
     // What it has still gives the need.
     assert_eq!(s.needs.len(), 1);
     assert_eq!(s.needs[0].score, 2.0);
@@ -416,12 +474,9 @@ async fn an_old_server_falls_back_to_health_and_is_not_asked_for_summary_again()
 }
 
 #[tokio::test]
-async fn a_server_without_either_endpoint_is_a_bad_reading_not_an_error() {
+async fn a_server_without_either_endpoint_gives_no_reading() {
     let (url, _) = serve(Answer::Status(404), Answer::Status(404)).await;
-    let s = fetch(&url).await;
-    assert_eq!(s.status, Status::Bad);
-    assert_eq!(s.error.as_deref(), Some("HTTP 404"));
-    assert!(s.values.is_empty() && s.needs.is_empty());
+    assert_eq!(fetch_err(&url).await, FetchError::Status(404));
 }
 
 #[tokio::test]
@@ -437,15 +492,14 @@ async fn a_health_answer_with_no_counts_is_zero_counts() {
 // A refused key, and everything else that goes wrong
 
 #[tokio::test]
-async fn a_refused_key_is_a_bad_reading_with_the_auth_text() {
+async fn a_refused_key_gives_no_reading_and_the_auth_text() {
     for code in [401, 403] {
         let (url, stub) = serve(Answer::Status(code), Answer::Status(code)).await;
-        let s = fetch(&url).await;
-        assert_eq!(s.status, Status::Bad, "{code}");
-        let text = s.error.as_deref().unwrap();
-        assert_eq!(text, FetchError::Auth.to_string());
-        assert_eq!(integrations::error_text_key(text), Some("fetch_err.auth"));
-        assert!(s.values.is_empty() && s.needs.is_empty());
+        let err = fetch_err(&url).await;
+        assert_eq!(err, FetchError::Auth, "{code}");
+        let text = err.to_string();
+        assert_eq!(text, "key refused");
+        assert_eq!(integrations::error_text_key(&text), Some("fetch_err.auth"));
         assert!(!text.contains(TOKEN) && !text.contains("Bearer"));
         // It does not go on to /health with a key that was refused.
         assert!(stub.hits_on(HEALTH).is_empty());
@@ -455,13 +509,11 @@ async fn a_refused_key_is_a_bad_reading_with_the_auth_text() {
 #[tokio::test]
 async fn a_key_refused_by_health_on_an_old_server_is_refused_too() {
     let (url, _) = serve(Answer::Status(404), Answer::Status(401)).await;
-    let s = fetch(&url).await;
-    assert_eq!(s.status, Status::Bad);
-    assert_eq!(s.error.as_deref(), Some("key refused"));
+    assert_eq!(fetch_err(&url).await, FetchError::Auth);
 }
 
 #[tokio::test]
-async fn malformed_answers_are_bad_readings_and_do_not_panic() {
+async fn malformed_answers_give_no_reading_and_do_not_panic() {
     for raw in [
         "",
         "not json",
@@ -470,39 +522,57 @@ async fn malformed_answers_are_bad_readings_and_do_not_panic() {
         "null",
         "{}",
         r#"{"monitors": 5}"#,
-        r#"{"monitors": {"up": -1}}"#,
-        r#"{"monitors": {"up": "many"}}"#,
-        r#"{"monitors": {"up": 1}, "down": 7}"#,
-        r#"{"monitors": {"up": 1}, "down": [5]}"#,
+        r#"{"monitors": null}"#,
         "\u{0}\u{1}\u{2}",
     ] {
         let (url, _) = serve(Answer::Raw(raw), Answer::Status(500)).await;
-        let s = fetch(&url).await;
-        assert_eq!(s.status, Status::Bad, "{raw:?}");
-        assert_eq!(s.error.as_deref(), Some("unexpected answer"), "{raw:?}");
-        assert!(s.values.is_empty() && s.needs.is_empty(), "{raw:?}");
+        assert_eq!(fetch_err(&url).await, FetchError::Invalid, "{raw:?}");
     }
     // The same from /health.
     let (url, _) = serve(Answer::Status(404), Answer::Raw("<html>")).await;
-    let s = fetch(&url).await;
-    assert_eq!(s.error.as_deref(), Some("unexpected answer"));
+    assert_eq!(fetch_err(&url).await, FetchError::Invalid);
 }
 
 #[tokio::test]
-async fn server_errors_and_a_refused_connection_are_bad_readings() {
+async fn odd_fields_in_a_good_answer_only_drop_their_metric() {
+    for (raw, gone) in [
+        (r#"{"monitors": {"up": -1, "down": 2}}"#, "up"),
+        (r#"{"monitors": {"up": "many", "down": 2}}"#, "up"),
+        (
+            r#"{"monitors": {"up": 1, "down": 2}, "down": 7}"#,
+            "first_down",
+        ),
+        (
+            r#"{"monitors": {"up": 1, "down": 2}, "down": [5]}"#,
+            "first_down",
+        ),
+        (
+            r#"{"monitors": {"up": 1, "down": 2}, "uptime": 5}"#,
+            "uptime_30d",
+        ),
+    ] {
+        let (url, _) = serve(Answer::Raw(raw), Answer::Status(500)).await;
+        let s = fetch(&url).await;
+        assert!(!s.values.contains_key(gone), "{raw}");
+        assert_eq!(num(&s, "down"), Some(2.0), "{raw}");
+        assert_eq!(s.status, Status::Bad, "{raw}");
+    }
+}
+
+#[tokio::test]
+async fn server_errors_and_a_refused_connection_give_no_reading() {
     let (url, _) = serve(Answer::Status(500), Answer::Status(500)).await;
-    let s = fetch(&url).await;
-    assert_eq!(s.status, Status::Bad);
-    assert_eq!(s.error.as_deref(), Some("HTTP 500"));
+    assert_eq!(fetch_err(&url).await, FetchError::Status(500));
 
     // A port nothing listens on.
     let free = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap()
     };
-    let s = fetch(&format!("http://{free}")).await;
-    assert_eq!(s.status, Status::Bad);
-    assert_eq!(s.error.as_deref(), Some("connection failed"));
+    assert_eq!(
+        fetch_err(&format!("http://{free}")).await,
+        FetchError::Connect
+    );
 }
 
 #[tokio::test]
@@ -512,9 +582,7 @@ async fn a_huge_answer_is_cut_off() {
         Answer::Status(500),
     )
     .await;
-    let s = fetch(&url).await;
-    assert_eq!(s.status, Status::Bad);
-    assert_eq!(s.error.as_deref(), Some("response too large"));
+    assert_eq!(fetch_err(&url).await, FetchError::TooLarge);
 }
 
 #[tokio::test]
@@ -526,9 +594,7 @@ async fn a_server_that_never_answers_times_out() {
         settings: json!({ "url": url }),
         secret: Some(TOKEN.into()),
     };
-    let s = kind().fetch(&c).await.unwrap();
-    assert_eq!(s.status, Status::Bad);
-    assert_eq!(s.error.as_deref(), Some("timeout"));
+    assert_eq!(kind().fetch(&c).await.unwrap_err(), FetchError::Timeout);
 }
 
 #[tokio::test]
@@ -576,7 +642,7 @@ async fn settings_it_cannot_use_are_errors_that_name_no_value() {
 async fn a_path_in_the_address_is_kept() {
     // Vigilant Vole behind a proxy prefix.
     let (url, stub) = serve(Answer::Status(404), Answer::Status(404)).await;
-    let _ = fetch(&format!("{url}/vole/")).await;
+    let _ = fetch_err(&format!("{url}/vole/")).await;
     let paths: Vec<_> = stub
         .hits
         .lock()
@@ -620,8 +686,8 @@ async fn the_token_is_in_the_request_only() {
         let _ = format!("{c:?}");
     }
     // An address nothing listens on.
-    snapshots.push(fetch("http://127.0.0.1:1").await);
-    assert_eq!(snapshots.len(), 7);
+    errors.push(fetch_err("http://127.0.0.1:1").await);
+    assert_eq!(snapshots.len() + errors.len(), 7);
 
     let mut all = String::new();
     for s in &snapshots {

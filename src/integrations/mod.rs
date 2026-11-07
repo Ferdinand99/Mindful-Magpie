@@ -18,6 +18,7 @@
 //! nothing here puts a secret, a settings value or a URL into an error text:
 //! [`FetchError`]'s texts are a closed set plus an HTTP status.
 
+pub mod api;
 pub mod http_kind;
 pub mod kk;
 pub mod poller;
@@ -81,12 +82,7 @@ pub trait Integration: Send + Sync + 'static {
 
 /// The kinds compiled into this build.
 pub fn registry() -> &'static [&'static dyn Integration] {
-    static KINDS: [&dyn Integration; 4] = [
-        &http_kind::HTTP,
-        &vv::VV,
-        &kk::KK,
-        &ww_kind::WW,
-    ];
+    static KINDS: [&dyn Integration; 4] = [&http_kind::HTTP, &vv::VV, &kk::KK, &ww_kind::WW];
     &KINDS
 }
 
