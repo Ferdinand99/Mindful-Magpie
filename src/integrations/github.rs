@@ -42,7 +42,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use jiff::{SignedDuration, Timestamp};
-use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
+use reqwest::header::{ACCEPT, HeaderMap};
 use serde_json::{Value as Json, json};
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -50,7 +50,7 @@ use url::Url;
 use super::api;
 use super::{
     BoxFuture, FetchCtx, FetchError, Field, FieldKind, Format, Integration, Level, MetricDef, Need,
-    SettingError, Snapshot, Status, Value, classify, read_capped,
+    SettingError, Snapshot, Status, Value, read_capped,
 };
 
 /// The address of the GitHub API.
@@ -190,7 +190,7 @@ impl Integration for GithubKind {
 
     fn fetch<'a>(&'a self, ctx: &'a FetchCtx) -> BoxFuture<'a, Result<Snapshot, FetchError>> {
         Box::pin(async move {
-            let auth = api::bearer(ctx.secret.as_deref())?;
+            let auth = api::Credential::bearer(ctx.secret.as_deref())?;
             let owners = match ctx.settings.get("owners") {
                 None | Some(Json::Null) => Vec::new(),
                 Some(Json::String(text)) => parse_owners(text).ok_or(FetchError::Config)?,
@@ -422,7 +422,7 @@ impl Limits {
 struct Session<'a> {
     http: &'a reqwest::Client,
     base: Url,
-    auth: HeaderValue,
+    auth: api::Credential,
     /// The service and its token, when the service is a stored one (what is
     /// remembered is kept under them).
     memory: Option<(i64, [u8; 8])>,
@@ -624,13 +624,13 @@ impl Session<'_> {
         request: reqwest::RequestBuilder,
         now: Timestamp,
     ) -> Result<(Vec<u8>, Limits), FetchError> {
-        let response = request
-            .header(AUTHORIZATION, self.auth.clone())
+        // With the token on it: a redirect to another origin is refused.
+        let request = self
+            .auth
+            .apply(request)
             .header(ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await
-            .map_err(|err| classify(&err))?;
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        let response = api::send_credentialed(request).await?;
         let code = response.status().as_u16();
         let limits = Limits::of(response.headers());
         self.note(&limits, now);
@@ -977,6 +977,8 @@ fn need(key: &str, level: Level, label_key: &str, count: usize) -> Need {
 
 #[cfg(test)]
 mod tests {
+    use reqwest::header::HeaderValue;
+
     use super::*;
 
     fn at(secs: i64) -> Timestamp {

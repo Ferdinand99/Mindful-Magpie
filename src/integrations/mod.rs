@@ -57,7 +57,9 @@ pub const MAX_BODY: usize = 1024 * 1024;
 /// How many redirects a fetch follows (to `http` and `https` only).
 pub const MAX_REDIRECTS: usize = 3;
 
-/// One kind of service.
+/// One kind of service. A kind sends its requests with [`FetchCtx::http`],
+/// never with [`client`] (see there), and keeps a secret out of everything it
+/// returns.
 pub trait Integration: Send + Sync + 'static {
     /// The stored name of the kind (`services.kind`), e.g. `"http"`.
     fn kind(&self) -> &'static str;
@@ -178,10 +180,15 @@ pub enum Format {
 /// keeps a memory per service (see [`FetchCtx::service_id`]).
 pub const SERVICE_ID_KEY: &str = "service_id";
 
-/// What a fetch needs: the shared client, the service's settings and its
-/// secret. The settings carry the service's address as `"url"` (when it has
-/// one) and its number as [`SERVICE_ID_KEY`] (a test of a form has none).
+/// What a fetch needs: the client, the service's settings and its secret. The
+/// settings carry the service's address as `"url"` (when it has one) and its
+/// number as [`SERVICE_ID_KEY`] (a test of a form has none).
 pub struct FetchCtx {
+    /// The client to send every request with. A kind always uses this one and
+    /// never [`client`]: for a service with a pinned certificate it is the
+    /// client that accepts only that certificate, so a request made with
+    /// another client would skip the pin. (The shared client is for whoever
+    /// builds a [`FetchCtx`].)
     pub http: reqwest::Client,
     pub settings: Json,
     pub secret: Option<String>,

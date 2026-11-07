@@ -9,7 +9,9 @@ use mindful_magpie::integrations::{self, Integration};
 const KINDS: [&str; 3] = ["vv", "kk", "ww"];
 /// Every kind the build lists: the three above share one form, the others
 /// have their own (and their own tests).
-const ALL: [&str; 7] = ["http", "vv", "kk", "ww", "proxmox", "unraid", "tofa"];
+const ALL: [&str; 8] = [
+    "http", "vv", "kk", "ww", "proxmox", "unraid", "tofa", "github",
+];
 
 /// The texts of one `[section]` of a locale file.
 fn section(file: &str, wanted: &str) -> HashMap<String, String> {
@@ -156,5 +158,13 @@ fn need_labels_use_the_same_terms_as_the_metrics() {
                 "{lang}: {need} and {metric}"
             );
         }
+    }
+}
+
+#[test]
+fn eight_kinds_and_only_github_is_personal() {
+    assert_eq!(integrations::registry().len(), 8);
+    for name in ALL {
+        assert_eq!(kind(name).personal(), name == "github", "{name}");
     }
 }

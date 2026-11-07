@@ -875,3 +875,35 @@ async fn a_redirect_within_the_origin_keeps_the_key() {
     assert_eq!(seen[1].api_key.as_deref(), Some(KEY));
     assert_eq!(seen[1].method, "POST");
 }
+
+#[tokio::test]
+async fn the_text_of_a_value_is_looked_up_by_a_safe_key_only() {
+    // The texts come from the kit's catalogue, which a Magpie installs.
+    let _app = common::App::new().await;
+    use mindful_magpie::integrations::value_label;
+    // A known word gets its text; anything else shows as it is.
+    assert_eq!(value_label("unraid", "array", "STARTED"), "Started");
+    for hostile in [
+        "../",
+        "../../etc/passwd",
+        "a.b",
+        "unraid_array_started.",
+        "value.unraid_array_started",
+        "[value]",
+        "started\u{0}",
+        "star ted",
+        "<b>started</b>",
+        "",
+        "   ",
+        "é",
+        &"x".repeat(200),
+    ] {
+        let shown = value_label("unraid", "array", hostile);
+        // Never one of the fixed texts by accident, and never changed.
+        assert_eq!(shown, hostile, "{hostile:?}");
+    }
+    // The kind and metric are not looked up with anything but the key's own
+    // characters either: a hostile one finds nothing and shows the raw text.
+    assert_eq!(value_label("../x", "array", "started"), "started");
+    assert_eq!(value_label("unraid", "a.b", "started"), "started");
+}

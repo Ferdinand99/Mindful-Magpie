@@ -1509,13 +1509,27 @@ async fn the_personal_test_is_limited_to_six_a_minute_per_user() {
     let res = vera
         .post_with("/settings/integrations/test", &press, true)
         .await;
-    assert_eq!(res.status, StatusCode::TOO_MANY_REQUESTS, "{}", res.body);
-    assert!(res.header("retry-after").parse::<u64>().unwrap() >= 1);
-    // Still limited, whatever the form says.
+    // Answered with the fragment «Test» swaps in (htmx ignores a 4xx answer),
+    // saying why, with how long to wait in `Retry-After` and in the text.
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let wait = res.header("retry-after").parse::<u64>().unwrap();
+    assert!((1..=60).contains(&wait), "{wait}");
+    assert!(
+        res.body.contains("data-test-status=\"unknown\""),
+        "{}",
+        res.body
+    );
+    assert!(res.body.contains("Too many tests"), "{}", res.body);
+    assert!(res.body.contains(&format!("{wait} s")), "{}", res.body);
+    // And the text exists in Norwegian.
+    assert!(
+        include_str!("../locales/nb.toml").contains("For mange tester – vent litt ({seconds} s)")
+    );
+    // Still limited, whatever the form says: no key is sent for it.
     let res = vera
         .post_with("/settings/integrations/test", &[("kind", "http")], true)
         .await;
-    assert_eq!(res.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(res.body.contains("Too many tests"), "{}", res.body);
     // The budget is the user's own: Bob, and the admin's own page, are not
     // held back.
     for _ in 0..3 {
@@ -1555,7 +1569,8 @@ async fn the_personal_test_is_limited_to_six_a_minute_per_user() {
     let res = bob
         .post_with("/settings/integrations/test", &press, true)
         .await;
-    assert_eq!(res.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.body.contains("Too many tests"), "{}", res.body);
 }
 
 // ---------------------------------------------------------------------------
@@ -1683,7 +1698,8 @@ async fn the_poller_fetches_a_personal_service_with_its_users_token() {
             kinds: stub_kinds,
             spread: Duration::ZERO,
         },
-    );
+    )
+    .await;
     let snapshot = {
         let mut found = None;
         for _ in 0..100 {

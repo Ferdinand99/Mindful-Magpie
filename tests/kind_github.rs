@@ -1074,11 +1074,10 @@ async fn a_redirect_to_another_origin_does_not_carry_the_token() {
         .unwrap()
         .push_back(Reply::bare(307, "").header("location", &format!("{other}/graphql")));
     let _ = fetch_with(&base, &ctx(None, None, Some(TOKEN))).await;
+    // A request with a key never follows a redirect to another origin: the
+    // other server saw nothing at all, so no key reached it.
     let seen = other_stub.seen();
-    assert!(!seen.is_empty(), "the redirect was followed");
-    for request in seen {
-        assert_eq!(request.auth, None, "the token followed the redirect");
-    }
+    assert!(seen.is_empty(), "the redirect was followed: {seen:?}");
 }
 
 // ---------------------------------------------------------------------------

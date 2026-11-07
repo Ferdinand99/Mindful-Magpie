@@ -954,6 +954,9 @@ async fn a_stored_link_is_used_and_checked() {
         json!("https:///x"),
         json!(" https://example.com/"),
         json!("https://example.com/\n"),
+        // A link with a user name or password is refused.
+        json!("https://user:pw@example.com/"),
+        json!("https://user@example.com/"),
         json!(5),
         json!(null),
         json!("https://example.com/".repeat(200)),
@@ -1028,4 +1031,117 @@ async fn a_hidden_services_link_never_reaches_the_page() {
     for leak in ["hidden.example.org", "10.1.2.3", "10.4.5.6", "secret-link"] {
         assert!(!res.body.contains(leak), "me/start leaks {leak:?}");
     }
+}
+
+#[tokio::test]
+async fn a_long_link_is_not_cut_by_the_settings_limit() {
+    // Settings texts are limited to 1024 characters; the link has its own limit
+    // (2048, like a card's), so a long one is kept, not silently refused.
+    let long = format!("https://example.com/{}", "a".repeat(1500));
+    let mut with = input("Long", Visibility::All, &[]);
+    with.settings = json!({ "expected_status": SETTING, "link": long });
+    assert!(with.check().is_empty(), "{:?}", with.check());
+    let too_long = format!("https://example.com/{}", "a".repeat(2100));
+    let mut over = input("Longer", Visibility::All, &[]);
+    over.settings = json!({ "expected_status": SETTING, "link": too_long });
+    assert!(over.check().iter().any(|e| e.field == "link"));
+}
+
+#[tokio::test]
+async fn an_ipv6_address_gives_an_origin_with_brackets() {
+    let core_app = App::new().await;
+    let core = &core_app.magpie.core;
+    let admin = add_user(&core_app, "ada", "admin").await;
+    let mut six = input("Six", Visibility::All, &[]);
+    six.url = Some("http://[2001:db8::1]:8080/some/path?x=1".into());
+    store::create(core, &six).await.unwrap();
+    let mut loopback = input("Loop", Visibility::All, &[]);
+    loopback.url = Some("https://[::1]/".into());
+    store::create(core, &loopback).await.unwrap();
+    let views = services_for(core, Viewer::new(admin, true)).await.unwrap();
+    let link = |name: &str| views.iter().find(|v| v.name == name).unwrap().link.clone();
+    assert_eq!(link("Six"), "http://[2001:db8::1]:8080");
+    assert_eq!(link("Loop"), "https://[::1]");
+}
+
+#[test]
+fn an_address_with_userinfo_gives_an_origin_without_it() {
+    // The form refuses user names and passwords in an address, but a row written
+    // by something else could have them: they never reach the link.
+    use mindful_magpie::services::card_link;
+    let none = json!({});
+    assert_eq!(
+        card_link(&none, Some("http://user:pw@host.example:8080/path?q=1#f")),
+        "http://host.example:8080"
+    );
+    assert_eq!(
+        card_link(&none, Some("https://tok:@host.example/")),
+        "https://host.example"
+    );
+    // Not an http(s) address, or none: no link.
+    assert_eq!(card_link(&none, Some("ftp://host.example/")), "");
+    assert_eq!(card_link(&none, Some("not a url")), "");
+    assert_eq!(card_link(&none, None), "");
+}
+
+#[tokio::test]
+async fn a_card_without_a_link_gives_a_hidden_service_the_same_answer_as_a_missing_one() {
+    let app = App::new().await;
+    let mut vera = Web::new(&app, "vera", "viewer").await;
+    let hidden = service(&app, "Hidden-Name-XYZ", Visibility::Admin, &[]).await;
+    let missing = hidden + 100;
+    let save_for = |id: i64| doc(0, vec![bound_card_without_link("c1", id)]);
+    let for_hidden = save(&mut vera, &save_for(hidden)).await;
+    let for_missing = save(&mut vera, &save_for(missing)).await;
+    assert_eq!(
+        for_hidden.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        for_hidden.body
+    );
+    assert_eq!(
+        for_hidden.json(),
+        json!({ "error": "invalid",
+                "fields": [{ "path": "groups[0].cards[0].service", "code": "bad_service" }] })
+    );
+    // Byte for byte: an empty link does not tell the two apart either.
+    assert_eq!(for_hidden.body, for_missing.body);
+    assert_eq!(for_hidden.status, for_missing.status);
+    assert!(!for_hidden.body.contains("Hidden-Name-XYZ"));
+}
+
+#[tokio::test]
+async fn an_unchanged_binding_to_a_gone_service_without_a_link_can_still_be_saved() {
+    let app = App::new().await;
+    let mut admin = Web::new(&app, "ada", "admin").await;
+    let id = service(&app, "Blog", Visibility::Admin, &[]).await;
+    let res = save(&mut admin, &doc(0, vec![bound_card_without_link("c1", id)])).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(store::delete(&app.magpie.core, id).await.unwrap());
+
+    // The card stays as it is (its binding and its empty link): the page can
+    // still be saved, for example after another card was changed.
+    let other = bound_card("c2", None);
+    let res = save(
+        &mut admin,
+        &doc(1, vec![bound_card_without_link("c1", id), other]),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let embedded = block(&page(&mut admin, "en").await.body, "mm-layout");
+    assert_eq!(embedded["groups"][0]["cards"][0]["service"]["id"], id);
+    assert_eq!(embedded["groups"][0]["cards"][0]["url"], "");
+    // A new binding to the gone service is still refused.
+    let res = save(
+        &mut admin,
+        &doc(
+            2,
+            vec![
+                bound_card_without_link("c1", id),
+                bound_card_without_link("c3", id),
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", res.body);
 }

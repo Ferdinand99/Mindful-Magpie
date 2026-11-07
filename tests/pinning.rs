@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::Redirect;
 use axum::routing::get;
 use common::{App, Res, Web};
 use mindful_magpie::integrations::poller::{Options, Poller};
@@ -150,6 +151,13 @@ async fn serve(
         .route(
             "/fail",
             get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
+        )
+        // A redirect to the other test server's `/ok`.
+        .route(
+            "/to/{port}",
+            get(|Path(port): Path<u16>| async move {
+                Redirect::temporary(&format!("https://127.0.0.1:{port}/ok"))
+            }),
         )
         .with_state(seen.clone());
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -774,7 +782,8 @@ async fn the_poller_fetches_a_pinned_service_with_its_pin() {
             kinds: integrations::find,
             spread: Duration::ZERO,
         },
-    );
+    )
+    .await;
     let mut got = None;
     for _ in 0..200 {
         if let Some(snapshot) = poller.snapshot(id) {
@@ -785,4 +794,46 @@ async fn the_poller_fetches_a_pinned_service_with_its_pin() {
     }
     let snapshot = got.expect("the poller made a reading");
     assert_eq!(snapshot.status, Status::Ok, "{:?}", snapshot.error);
+}
+
+#[tokio::test]
+async fn a_pinned_host_that_redirects_to_another_certificate_gives_the_certificate_error() {
+    // The pin is for that server only: a redirect to a server with another
+    // certificate is not followed into it, and the reason is the certificate's.
+    let pinned = tls_stub().await;
+    let other = tls_stub().await;
+    let snapshot = fetch(
+        &pinned.url(&format!("/to/{}", other.port)),
+        Some(&pinned.fingerprint),
+        None,
+    )
+    .await;
+    assert_eq!(snapshot.status, Status::Bad);
+    let text = snapshot.error.as_deref().unwrap();
+    assert_eq!(text, FetchError::Cert.to_string());
+    assert_eq!(
+        integrations::error_text_key(text),
+        Some("fetch_err.cert"),
+        "the page says why in both languages"
+    );
+    assert!(
+        other.requests().is_empty(),
+        "nothing reached the other server"
+    );
+    // With a secret the redirect is refused before it leaves the origin.
+    let snapshot = fetch(
+        &pinned.url(&format!("/to/{}", other.port)),
+        Some(&pinned.fingerprint),
+        Some(SECRET),
+    )
+    .await;
+    assert_eq!(snapshot.status, Status::Bad);
+    assert_eq!(
+        snapshot.error.as_deref(),
+        Some(FetchError::RedirectScheme.to_string().as_str())
+    );
+    assert!(other.requests().is_empty());
+    // Directly, the pinned server itself still answers.
+    let ok = fetch(&pinned.url("/ok"), Some(&pinned.fingerprint), None).await;
+    assert_eq!(ok.status, Status::Ok, "{:?}", ok.error);
 }

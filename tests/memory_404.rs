@@ -142,7 +142,8 @@ async fn a_service_event_makes_the_poller_ask_again() {
             kinds: integrations::find,
             spread: Duration::ZERO,
         },
-    );
+    )
+    .await;
     // The first reading: too old.
     wait_for(&poller, id, |s| s.status == Status::Bad).await;
     upgrade.done.store(true, Ordering::SeqCst);

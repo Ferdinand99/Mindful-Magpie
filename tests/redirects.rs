@@ -129,6 +129,50 @@ async fn a_redirect_within_the_origin_keeps_the_credential() {
     );
 }
 
+#[tokio::test]
+async fn a_same_origin_hop_and_then_a_cross_origin_one_is_refused() {
+    // The first hop stays on the origin, the second leaves it. The origin that
+    // counts is the one the request began at, not the last hop's.
+    let (target, target_stub) =
+        stub::serve_one("/target", Answer::Json(json!({ "ok": true }))).await;
+    let to = format!("{target}/target");
+    let app = axum::Router::new()
+        .route(
+            "/start",
+            axum::routing::any(|| async { axum::response::Redirect::temporary("/hop") }),
+        )
+        .route(
+            "/hop",
+            axum::routing::any(move || {
+                let to = to.clone();
+                async move { axum::response::Redirect::temporary(&to) }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    for credential in [
+        Credential::bearer(Some(SECRET)).unwrap(),
+        Credential::header("x-api-key", Some(SECRET)).unwrap(),
+    ] {
+        let err = api::get_json::<Json>(client(), url(&origin), &credential)
+            .await
+            .unwrap_err();
+        assert_eq!(err, FetchError::RedirectScheme);
+        let err = api::post_json::<Json>(client(), url(&origin), &credential, &json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(err, FetchError::RedirectScheme);
+        assert_untouched(&target_stub, "two hops");
+    }
+    // Without a secret both hops are followed.
+    let reply = api::get_json_public::<Json>(client(), url(&origin))
+        .await
+        .unwrap();
+    assert_eq!(reply, Reply::Found(json!({ "ok": true })));
+}
+
 fn http_kind() -> &'static dyn Integration {
     integrations::find("http").expect("the http kind is registered")
 }

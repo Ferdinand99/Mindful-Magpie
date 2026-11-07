@@ -382,9 +382,12 @@ impl ServiceInput {
         // «Lenke på kort»: a link for the browser, checked like a card's. It is
         // never fetched, so what it points at is not checked. Empty is none.
         if let Some(link) = settings.get(LINK_KEY) {
-            let fine = link
-                .as_str()
-                .is_some_and(|l| l.is_empty() || crate::layout::model::link_problem(l).is_none());
+            let fine = link.as_str().is_some_and(|l| {
+                l.is_empty()
+                    || (crate::layout::model::link_problem(l).is_none()
+                        && Url::parse(l)
+                            .is_ok_and(|u| u.username().is_empty() && u.password().is_none()))
+            });
             if !fine {
                 errors.push(FieldError::new("link", "err.link"));
             }
@@ -395,8 +398,9 @@ impl ServiceInput {
             }
         }
         for (key, value) in settings {
-            // The pin has its own message.
+            // The pin has its own message, and the link its own limit (2048).
             if key != integrations::pin::SETTING
+                && key != LINK_KEY
                 && value
                     .as_str()
                     .is_some_and(|text| text.chars().count() > 1024)

@@ -36,7 +36,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value as Json};
 use vole_kit::auth::CurrentUser;
 use vole_kit::http::error::ApiError;
-use vole_kit::http::ratelimit::{Rate, too_many_requests};
+use vole_kit::http::ratelimit::{Rate, retry_after, retry_after_secs};
 use vole_kit::http::{ApiResult, HtmlTemplate};
 use vole_kit::i18n::{self, Tr as _};
 use vole_kit::page::{PageCtx, flash};
@@ -1105,7 +1105,17 @@ async fn test(
         )
     {
         tracing::warn!(user = %user.username, "personal «Test» over the budget");
-        return Ok(too_many_requests(wait));
+        // Answered with the fragment «Test» swaps in (htmx does not swap a 4xx
+        // answer), so the person sees why nothing was sent. `Retry-After` says
+        // how long, for anything that reads it.
+        let seconds = retry_after_secs(wait).to_string();
+        let mut res = HtmlTemplate(unknown(
+            i18n::t("service.test_throttled").replace("{seconds}", &seconds),
+        ))
+        .into_response();
+        let (name, value) = retry_after(wait);
+        res.headers_mut().insert(name, value);
+        return Ok(res);
     }
     let raw = Raw::parse(&body);
     let Some(kind) = mode.kind(raw.get("kind")) else {
