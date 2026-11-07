@@ -22,6 +22,7 @@ pub mod api;
 pub mod http_kind;
 pub mod kk;
 pub mod poller;
+pub mod unraid;
 pub mod vv;
 pub mod ww_kind;
 
@@ -82,7 +83,13 @@ pub trait Integration: Send + Sync + 'static {
 
 /// The kinds compiled into this build.
 pub fn registry() -> &'static [&'static dyn Integration] {
-    static KINDS: [&dyn Integration; 4] = [&http_kind::HTTP, &vv::VV, &kk::KK, &ww_kind::WW];
+    static KINDS: [&dyn Integration; 5] = [
+        &http_kind::HTTP,
+        &vv::VV,
+        &kk::KK,
+        &ww_kind::WW,
+        &unraid::UNRAID,
+    ];
     &KINDS
 }
 
@@ -366,6 +373,21 @@ enum RedirectError {
     TooMany,
     #[error("redirect to a scheme that is not http or https")]
     Scheme,
+    #[error("redirect to another origin while a key is sent")]
+    CrossOrigin,
+}
+
+tokio::task_local! {
+    /// Set while a request is sent that carries its key in a header of its
+    /// own (`x-api-key`, say). reqwest drops `Authorization` and cookies on a
+    /// redirect to another origin, but not a header like that, so the
+    /// redirect policy refuses such a redirect.
+    pub(crate) static KEY_IN_OWN_HEADER: ();
+}
+
+/// Where a URL's origin is: scheme, host and port.
+fn origin(url: &url::Url) -> (&str, Option<&str>, Option<u16>) {
+    (url.scheme(), url.host_str(), url.port_or_known_default())
 }
 
 /// What a failed request is, for a short reason. The error's own text (which
@@ -378,7 +400,9 @@ pub fn classify(err: &reqwest::Error) -> FetchError {
         }
         match e.downcast_ref::<RedirectError>() {
             Some(RedirectError::TooMany) => return FetchError::Redirects,
-            Some(RedirectError::Scheme) => return FetchError::RedirectScheme,
+            Some(RedirectError::Scheme | RedirectError::CrossOrigin) => {
+                return FetchError::RedirectScheme;
+            }
             None => {}
         }
         source = e.source();
@@ -412,6 +436,15 @@ fn redirect_policy() -> reqwest::redirect::Policy {
                 .is_some_and(|p| p.scheme() == "https")
         {
             return attempt.error(RedirectError::Scheme);
+        }
+        // A key in a header of its own stays with its origin.
+        if KEY_IN_OWN_HEADER.try_with(|()| ()).is_ok()
+            && attempt
+                .previous()
+                .last()
+                .is_some_and(|p| origin(p) != origin(attempt.url()))
+        {
+            return attempt.error(RedirectError::CrossOrigin);
         }
         // A name is checked when it is resolved; an address in the URL never
         // reaches the resolver.
