@@ -27,6 +27,7 @@ document.addEventListener("DOMContentLoaded", () => {
   start({
     storage: browser.storage,
     fetchImpl: fetch,
+    language: navigator.language,
     draw,
     update: draw.update,
     tick: draw.tick,

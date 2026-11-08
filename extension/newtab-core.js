@@ -11,8 +11,10 @@
 //
 // Order of events: the cached layout and cached values are drawn at once; then the layout and the
 // values are fetched together and drawn; then, while the tab is visible, the values are fetched
-// every 30 s (an EventSource cannot send the token, so there is no stream). Hiding the tab stops
-// the timer, showing it refreshes at once and starts it again.
+// every 30 s (an EventSource cannot send the token, so there is no stream). Those refreshes leave
+// the curves (`history`) out and keep the ones the page has; the curves are fetched with the
+// values on load and at most every 5 minutes after. Hiding the tab stops the timer, showing it
+// refreshes at once and starts it again.
 //
 // The cache belongs to one server and one token. Values and the old-server back-off are tagged with
 // the server address and trusted only for that server. Before anything is written, the saved
@@ -26,14 +28,18 @@ import {
   fetchData,
   fetchValues,
   isValidData,
+  keepCurves,
   isValidValues,
   nextValues,
   nextView,
   serverNowMs,
   statusWithValues,
 } from "./state.js";
+import { pickLabels } from "./labels.js";
 
 export const REFRESH_MS = 30_000;
+// How often a refresh takes the curves (the values' `history`) as well.
+export const HISTORY_MS = 5 * 60_000;
 // A server that answers 404 to the values request is from before the values API. It is not asked
 // again for this long (also across new tabs, through storage).
 export const MISSING_BACKOFF_MS = 5 * 60_000;
@@ -59,7 +65,8 @@ function hasBound(data) {
 
 export async function start({
   storage,
-  fetchImpl,
+  fetchImpl: rawFetch,
+  language = null,
   draw,
   update = draw,
   tick = () => {},
@@ -68,6 +75,14 @@ export async function start({
   timers = defaultTimers,
   now = Date.now,
 }) {
+  // The server writes some texts in the request's language (the services' metric labels, the
+  // needs, the reasons of a failed reading), the page draws its own (and the detail titles) in the
+  // browser's language (labels.js). Ask the server for that same language, so a card never mixes
+  // two; without a language the browser's own Accept-Language goes.
+  const asked = language ? pickLabels(language).lang : null;
+  const fetchImpl = asked
+    ? (url, opts = {}) => rawFetch(url, { ...opts, headers: { ...(opts.headers ?? {}), "Accept-Language": asked } })
+    : rawFetch;
   let stored = {};
   try {
     stored =
@@ -84,6 +99,8 @@ export async function start({
   let timer = null;
   let inFlight = null;
   let lastAttempt = now();
+  // When the curves were last fetched (null: not yet, so the next fetch takes them).
+  let historyAt = null;
   let blocked = false; // the token was rejected: no point in asking again
   let bound = false;
   const unschedule = () => {
@@ -154,11 +171,14 @@ export async function start({
 
   // Takes in the answer of a values fetch: keeps, stores or drops the values and returns the kind
   // (fresh, cached, network, unauthorized, missing, or stale when the settings changed meanwhile).
-  async function absorb(result) {
+  // `withHistory` false: the answer has no curves, and the page keeps the ones it has.
+  async function absorb(result, withHistory = true) {
     if (!(await sameConnection())) {
       stop();
       return "stale";
     }
+    if (result?.ok && !withHistory) result = { ...result, values: keepCurves(values, result.values) };
+    if (result?.ok && withHistory) historyAt = now();
     const next = nextValues(values, result);
     values = next.values;
     try {
@@ -224,9 +244,10 @@ export async function start({
     if (inBackoff()) return; // an old server: nothing to draw, nothing to ask
     // The ages move on even while the request is slow or fails.
     tick(clock());
-    const result = await fetchValues(fetchImpl, conn.serverUrl, conn.token);
+    const withHistory = historyAt === null || now() - historyAt >= HISTORY_MS;
+    const result = await fetchValues(fetchImpl, conn.serverUrl, conn.token, undefined, { history: withHistory });
     if (stopped) return;
-    const answer = await absorb(result);
+    const answer = await absorb(result, withHistory);
     if (answer === "stale" || stopped) return;
     status = statusWithValues(baseStatus, answer);
     if (blocked) unschedule();
