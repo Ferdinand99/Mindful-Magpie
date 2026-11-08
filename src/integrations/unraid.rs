@@ -34,6 +34,20 @@
 //! } memory { percentTotal } }`, which the schema has; whether the role VIEWER
 //! may read them is not confirmed, and a denied field is only a missing
 //! number.
+//!
+//! **The details.** [`details`] fills blocks from the same answer: bars for the
+//! disks and caches (name, use, size and temperature), the parity check's
+//! facts (last check, duration, errors), the stopped containers, and the
+//! unread notifications. The names (disks, containers) come from outside and
+//! go only into these blocks. What they need beyond the core query (`name`
+//! and `temp` of a disk, `duration` of the check, `names` of a container, and
+//! `notifications`) is asked only by the full query, so an older Unraid that
+//! rejects it still gives the metrics and the facts the core query has, and
+//! the card then has fewer blocks. An error about one of these extras is
+//! silent (see [`is_extra`]). The unit of the file system figures is read as
+//! KiB (what Unraid's `disks.ini` has; the schema says kilobytes) and shown in
+//! decimal units like Unraid's own pages; whether the role VIEWER may read
+//! `notifications` is not confirmed, and a denied field costs only that block.
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -44,6 +58,7 @@ use jiff::tz::TimeZone;
 use serde_json::{Value as Json, json};
 
 use super::api::{self, Credential, OldAddresses};
+use super::block::{Bar, Block, Fact, ListItem, MAX_ITEMS};
 use super::{
     BoxFuture, FetchCtx, FetchError, Field, FieldKind, Format, Integration, Level, MetricDef, Need,
     Snapshot, Status, Value,
@@ -76,16 +91,18 @@ const QUERY: &str = "query {
   array {
     state
     capacity { kilobytes { used total } }
-    parityCheckStatus { running errors date }
-    disks { fsSize fsUsed fsFree }
-    caches { fsSize fsUsed fsFree }
+    parityCheckStatus { running errors date duration }
+    disks { name temp fsSize fsUsed fsFree }
+    caches { name temp fsSize fsUsed fsFree }
   }
-  docker { containers { state } }
+  docker { containers { state names } }
   info { os { hostname } }
   metrics { cpu { percentTotal } memory { percentTotal } }
+  notifications { overview { unread { total alert warning } } }
 }";
 
-/// The same without `info` and `metrics`, for a server that rejects those.
+/// The same without `info`, `metrics` and the fields only the details read,
+/// for a server that rejects those.
 const CORE_QUERY: &str = "query {
   array {
     state
@@ -196,11 +213,18 @@ fn ratio(used: f64, size: f64) -> Option<f64> {
     (size > 0.0).then(|| (used / size * 100.0).clamp(0.0, 100.0))
 }
 
-/// How full one disk is, from its `fsSize` and `fsUsed` (or `fsFree`).
-fn one_disk(disk: &Json) -> Option<f64> {
+/// What is used of one disk and how big it is, from its `fsSize` and `fsUsed`
+/// (or `fsFree`), in the unit of the answer.
+fn used_and_size(disk: &Json) -> Option<(f64, f64)> {
     let size = amount(disk.get("fsSize"))?;
     let used = amount(disk.get("fsUsed"))
         .or_else(|| amount(disk.get("fsFree")).map(|free| (size - free).max(0.0)))?;
+    Some((used, size))
+}
+
+/// How full one disk is, from its `fsSize` and `fsUsed` (or `fsFree`).
+fn one_disk(disk: &Json) -> Option<f64> {
+    let (used, size) = used_and_size(disk)?;
     ratio(used, size)
 }
 
@@ -280,6 +304,244 @@ fn array_stopped(reading: &Reading) -> bool {
         .array
         .as_deref()
         .is_some_and(|state| !state.eq_ignore_ascii_case("started"))
+}
+
+/// Longest disk or container name kept in a block line, in characters.
+const LINE_NAME_CHARS: usize = 48;
+
+/// The fields only the details read: an error about one of them costs the
+/// detail and nothing else.
+const DETAIL_FIELDS: [&str; 4] = ["name", "temp", "names", "duration"];
+
+/// Whether an error of a GraphQL answer is about something only the top bar or
+/// the details read: `info`, `metrics`, `notifications`, or one of the
+/// [`DETAIL_FIELDS`] of a disk, the check or a container.
+fn is_extra(error: &Json) -> bool {
+    let Some(path) = error.get("path").and_then(Json::as_array) else {
+        return false;
+    };
+    match path.first().and_then(Json::as_str) {
+        Some("info" | "metrics" | "notifications") => true,
+        _ => {
+            path.len() > 1
+                && path
+                    .last()
+                    .and_then(Json::as_str)
+                    .is_some_and(|leaf| DETAIL_FIELDS.contains(&leaf))
+        }
+    }
+}
+
+/// A number with one decimal, and none when it is whole («14», «12.3»).
+fn short_number(n: f64) -> String {
+    // A figure past what is a count of anything real is cut, so that the text
+    // stays short.
+    let n = n.min(api::MAX_COUNT);
+    let rounded = (n * 10.0).round() / 10.0;
+    if rounded.fract() == 0.0 {
+        format!("{rounded:.0}")
+    } else {
+        format!("{rounded:.1}")
+    }
+}
+
+/// «12.3 / 14 TB»: `used` of `size`, both in KiB, as decimal units of the size.
+fn used_of(used_kib: f64, size_kib: f64) -> String {
+    let (used, size) = (used_kib * 1024.0, size_kib * 1024.0);
+    let (div, unit) = if size >= 1e12 {
+        (1e12, "TB")
+    } else if size >= 1e9 {
+        (1e9, "GB")
+    } else {
+        (1e6, "MB")
+    };
+    format!(
+        "{} / {} {unit}",
+        short_number(used / div),
+        short_number(size / div)
+    )
+}
+
+/// One bar for a disk or a cache: its name, how full it is, the figures and
+/// the temperature when the answer has it. A disk with no name or no file
+/// system figures has no bar.
+fn disk_bar(disk: &Json) -> Option<Bar> {
+    let name = api::clean_text(disk.get("name")?.as_str()?, LINE_NAME_CHARS);
+    if name.is_empty() {
+        return None;
+    }
+    let (used, size) = used_and_size(disk)?;
+    let mut text = used_of(used, size);
+    if let Some(temp) = amount(disk.get("temp")).filter(|t| *t <= 150.0) {
+        text.push_str(&format!(" · {} °C", short_number(temp)));
+    }
+    Some(Bar {
+        label: name,
+        pct: ratio(used, size)?,
+        text,
+        ..Default::default()
+    })
+}
+
+/// «Disker»: the data disks and then the caches. More than a block holds: the
+/// fullest ones, in their order.
+fn disk_bars(data: &Json) -> Option<Block> {
+    let array = data.get("array")?;
+    let mut bars: Vec<Bar> = ["disks", "caches"]
+        .iter()
+        .filter_map(|group| array.get(group).and_then(Json::as_array))
+        .flatten()
+        .filter_map(disk_bar)
+        .collect();
+    if bars.len() > MAX_ITEMS {
+        let mut by_use: Vec<usize> = (0..bars.len()).collect();
+        by_use.sort_by(|a, b| bars[*b].pct.total_cmp(&bars[*a].pct));
+        let keep: Vec<usize> = by_use.into_iter().take(MAX_ITEMS).collect();
+        let mut index = 0;
+        bars.retain(|_| {
+            index += 1;
+            keep.contains(&(index - 1))
+        });
+    }
+    (!bars.is_empty()).then(|| Block::Bars {
+        title_key: "unraid_disks".into(),
+        bars,
+    })
+}
+
+/// The date of a time in Unix seconds (UTC), as «2026-11-01».
+fn day(seconds: f64) -> Option<String> {
+    let at = Timestamp::from_second(seconds as i64).ok()?;
+    Some(at.to_zoned(TimeZone::UTC).date().to_string())
+}
+
+/// «8 h 12 min»: a length of time in seconds.
+fn length(seconds: f64) -> String {
+    let minutes = (seconds.min(api::MAX_COUNT) / 60.0).round() as u64;
+    match (minutes / 60, minutes % 60) {
+        (0, 0) => "< 1 min".to_string(),
+        (0, m) => format!("{m} min"),
+        (h, 0) => format!("{h} h"),
+        (h, m) => format!("{h} h {m} min"),
+    }
+}
+
+/// «Paritetssjekk»: when it last ran, how long it took, and its errors. A check
+/// that is running has no finished date or length to show.
+fn parity_facts(data: &Json) -> Option<Block> {
+    let parity = data
+        .pointer("/array/parityCheckStatus")
+        .filter(|p| p.is_object())?;
+    let running = parity
+        .get("running")
+        .and_then(Json::as_bool)
+        .unwrap_or(false);
+    let mut rows = Vec::new();
+    let mut row = |key: &str, value: Option<String>| {
+        if let Some(value) = value {
+            rows.push(Fact {
+                label_key: Some(key.to_string()),
+                label: None,
+                value,
+                ..Default::default()
+            });
+        }
+    };
+    if !running {
+        row(
+            "unraid_parity_last",
+            parity
+                .get("date")
+                .and_then(Json::as_str)
+                .and_then(moment)
+                .and_then(day),
+        );
+        row(
+            "unraid_parity_duration",
+            amount(parity.get("duration"))
+                .filter(|s| *s > 0.0)
+                .map(length),
+        );
+    }
+    row(
+        "unraid_parity_errors",
+        api::count(parity.get("errors")).map(|n| format!("{n:.0}")),
+    );
+    (!rows.is_empty()).then(|| Block::Facts {
+        title_key: "unraid_parity".into(),
+        rows,
+    })
+}
+
+/// A container's name: the first of `names` (Docker's have a leading `/`).
+fn container_name(container: &Json) -> Option<String> {
+    let names = container.get("names")?;
+    let name = names.as_array().and_then(|l| l.first()).unwrap_or(names);
+    let name = api::clean_text(name.as_str()?.trim_start_matches('/'), LINE_NAME_CHARS);
+    (!name.is_empty()).then_some(name)
+}
+
+/// «Stoppede containere»: the ones that are not running, greyed.
+fn stopped_list(data: &Json) -> Option<Block> {
+    let containers = data.pointer("/docker/containers")?.as_array()?;
+    let items: Vec<ListItem> = containers
+        .iter()
+        .filter(|c| {
+            c.get("state")
+                .and_then(Json::as_str)
+                .is_some_and(|state| !state.eq_ignore_ascii_case("running"))
+        })
+        .filter_map(container_name)
+        .map(|name| ListItem {
+            status: Some(Status::Unknown),
+            ..ListItem::new(name)
+        })
+        .collect();
+    (!items.is_empty()).then(|| Block::List {
+        title_key: "unraid_stopped".into(),
+        items,
+    })
+}
+
+/// «Varsler»: the unread notifications, when there are some (and the key may
+/// read them).
+fn notice_facts(data: &Json) -> Option<Block> {
+    let unread = data.pointer("/notifications/overview/unread")?;
+    let total = api::count(unread.get("total")).filter(|n| *n > 0.0)?;
+    let mut rows = vec![("unraid_unread", total)];
+    for (key, field) in [("unraid_alerts", "alert"), ("unraid_warnings", "warning")] {
+        if let Some(n) = api::count(unread.get(field)).filter(|n| *n > 0.0) {
+            rows.push((key, n));
+        }
+    }
+    Some(Block::Facts {
+        title_key: "unraid_notices".into(),
+        rows: rows
+            .into_iter()
+            .map(|(key, n)| Fact {
+                label_key: Some(key.to_string()),
+                label: None,
+                value: format!("{n:.0}"),
+                ..Default::default()
+            })
+            .collect(),
+    })
+}
+
+/// The detail blocks of the `data` of an answer: the disks' bars, the parity
+/// check's facts, the stopped containers and the unread notifications. Names
+/// go only into these blocks (the poller cuts them down; see
+/// [`super::block`]).
+pub fn details(data: &Json) -> Vec<Block> {
+    [
+        disk_bars(data),
+        parity_facts(data),
+        stopped_list(data),
+        notice_facts(data),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 fn snapshot(reading: Reading) -> Snapshot {
@@ -375,19 +637,11 @@ fn all_refused(errors: Option<&Json>) -> bool {
 }
 
 /// What the errors of an answer that has data say about the part of it that
-/// matters: `None` when they are only about `info` and `metrics` (or there
-/// are none), else why (the key may not read it, or something else).
+/// matters: `None` when they are only about the extras (`info`, `metrics`, the
+/// details' fields; see [`is_extra`]) or there are none, else why (the key may not read it, or something else).
 fn core_error(errors: Option<&Json>) -> Option<FetchError> {
     let list = errors.and_then(Json::as_array)?;
-    let core: Vec<&Json> = list
-        .iter()
-        .filter(|error| {
-            !matches!(
-                error.pointer("/path/0").and_then(Json::as_str),
-                Some("info" | "metrics")
-            )
-        })
-        .collect();
+    let core: Vec<&Json> = list.iter().filter(|error| !is_extra(error)).collect();
     if core.is_empty() {
         None
     } else if all_refused(Some(&Json::Array(core.into_iter().cloned().collect()))) {
@@ -413,16 +667,26 @@ fn query_rejected(doc: &Json) -> bool {
             })
 }
 
+/// Whether the answer has no usable `data` and every error is about something
+/// only the top bar or the details read (`info`, `metrics`, `notifications`): a
+/// key that may not read one of those can make the server drop the whole
+/// `data`, which the core query then answers without.
+fn only_extras_failed(doc: &Json) -> bool {
+    doc.get("data").is_none_or(|data| !data.is_object())
+        && doc
+            .get("errors")
+            .and_then(Json::as_array)
+            .is_some_and(|list| !list.is_empty() && list.iter().all(is_extra))
+}
+
 /// The snapshot of a GraphQL answer.
 fn answer(doc: &Json) -> Result<Snapshot, FetchError> {
-    let reading = doc
-        .get("data")
-        .filter(|data| data.is_object())
-        .map(reading)
-        .filter(|r| *r != Reading::default());
+    let data = doc.get("data").filter(|data| data.is_object());
+    let reading = data.map(reading).filter(|r| *r != Reading::default());
     match reading {
         Some(reading) => {
-            let mut snapshot = snapshot(reading);
+            let mut snapshot =
+                snapshot(reading).with_details(data.map(details).unwrap_or_default());
             // A part that matters could not be read: not quite well.
             if let Some(error) = core_error(doc.get("errors")) {
                 if snapshot.status == Status::Ok {
@@ -457,7 +721,7 @@ async fn read(ctx: &FetchCtx) -> Result<Snapshot, FetchError> {
     if !CORE_ONLY.is_old(&address, Instant::now()) {
         match ask(ctx, &url, &key, QUERY).await {
             Err(FetchError::Status(400)) => {}
-            Ok(doc) if query_rejected(&doc) => {}
+            Ok(doc) if query_rejected(&doc) || only_extras_failed(&doc) => {}
             Ok(doc) => {
                 CORE_ONLY.forget(&address);
                 return answer(&doc);
