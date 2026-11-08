@@ -629,6 +629,33 @@ async fn the_embed_has_only_what_the_user_may_see_and_never_a_secret() {
 }
 
 #[tokio::test]
+async fn the_token_api_names_the_metrics_in_the_language_the_request_asks_for() {
+    // The browser extension asks in the language it draws its own strings in.
+    let app = App::new().await;
+    let mut admin = Web::new(&app, "ada", "admin").await;
+    service(&app, "Blog", Visibility::All, &[]).await;
+    let token = extension_token(&app, &mut admin).await;
+    for (lang, label) in [("en", "HTTP status"), ("nb", "HTTP-status")] {
+        let res = app
+            .send(
+                Request::get("/api/v1/me/start")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header("accept-language", lang)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        assert_eq!(
+            res.json()["services"][0]["metrics"][0]["label"],
+            label,
+            "{lang}: {}",
+            res.body
+        );
+    }
+}
+
+#[tokio::test]
 async fn metric_labels_are_in_the_page_language() {
     let app = App::new().await;
     let mut admin = Web::new(&app, "ada", "admin").await;

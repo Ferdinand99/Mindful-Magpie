@@ -1,7 +1,7 @@
 // The interface strings of the shared renderer, in English and Norwegian. The keys are the ones
 // the server writes into the start page's #mm-labels block (src/pages.rs, labels()); the texts
 // are the same as in locales/en.toml and locales/nb.toml (start.empty, start.invalid_link,
-// start.group_label, start.bookmarks_label, the service strings, start.block_more and the «Trenger deg» strings), so the new tab reads like the web page. A test keeps
+// start.group_label, start.bookmarks_label, the service strings, start.block_more, the spark labels and the «Trenger deg» strings), so the new tab reads like the web page. A test keeps
 // the key lists equal to the server's.
 
 import { detail } from "./vendor/detail-labels.js";
@@ -24,6 +24,9 @@ export const labels = {
     status_unknown: "Status: unknown",
     updated: "Last updated {when}",
     block_more: "+ {n} more",
+    spark_line: "Now {value}, from {min} to {max}",
+    spark_counter: "{n} in the last 24 hours",
+    spark_updown: "{n} half hours with something down",
     needs: "Needs you",
     need_ack: "Acknowledge",
     need_ack_for: "Acknowledge {name}: {text}",
@@ -46,6 +49,9 @@ export const labels = {
     status_unknown: "Status: ukjent",
     updated: "Sist oppdatert {when}",
     block_more: "+ {n} til",
+    spark_line: "Nå {value}, fra {min} til {max}",
+    spark_counter: "{n} siste 24 timer",
+    spark_updown: "{n} halvtimer der noe var nede",
     needs: "Trenger deg",
     need_ack: "Kvitter",
     need_ack_for: "Kvitter {name}: {text}",

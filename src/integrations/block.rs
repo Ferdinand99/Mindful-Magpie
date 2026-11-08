@@ -94,6 +94,10 @@ pub enum SparkStyle {
     /// A strip of cells, one per point: bad where the value is above 0, good
     /// where it is 0 (for a count of things that are down).
     UpDown,
+    /// A count that grows and starts again (today's visitors): bars of what it
+    /// grew by in each hour, where a fall counts as a new start. A page that
+    /// does not know the style draws a line.
+    Counter,
 }
 
 /// One line of a list: the text, a smaller second line, a status dot, a value
@@ -684,6 +688,17 @@ mod tests {
             panic!("the spark stays")
         };
         assert_eq!(title_key, "");
+        let counter: Block = serde_json::from_value(
+            serde_json::json!({ "kind": "spark", "title_key": "k", "metric": "visitors_today", "style": "counter" }),
+        )
+        .unwrap();
+        assert!(matches!(
+            counter,
+            Block::Spark {
+                style: SparkStyle::Counter,
+                ..
+            }
+        ));
         // An unknown style is not a block.
         assert!(
             serde_json::from_value::<Block>(

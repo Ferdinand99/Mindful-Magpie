@@ -131,26 +131,31 @@ static METRICS: [MetricDef; 5] = [
         id: "review_requests",
         label_key: "metric.gh_review_requests",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "ci_red",
         label_key: "metric.gh_ci_red",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "dependabot",
         label_key: "metric.gh_dependabot",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "releases_24h",
         label_key: "metric.gh_releases_24h",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "open_prs",
         label_key: "metric.gh_open_prs",
         format: Format::Number,
+        peak: false,
     },
 ];
 

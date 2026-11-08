@@ -1628,6 +1628,28 @@ async fn the_embed_and_the_token_api_carry_the_history_of_curve_metrics_only() {
     for stray in ["4242.5", "7777.5", "7778.5", "Router"] {
         assert!(!res.body.contains(stray), "the API leaks {stray}");
     }
+
+    // `?history=none`: the same answer without the curves (the extension's
+    // frequent refresh); any other value is the whole answer.
+    let light = bearer_get(&w.app, "/api/v1/me/values?history=none", &token).await;
+    assert_eq!(light.status, StatusCode::OK, "{}", light.body);
+    let mut light = light.json();
+    let entry = &light["services"][w.a.to_string()];
+    assert!(entry.get("history").is_none(), "{entry}");
+    assert!(entry.get("history_daily").is_none(), "{entry}");
+    for e in api["services"].as_object_mut().unwrap().values_mut() {
+        let e = e.as_object_mut().unwrap();
+        e.remove("history");
+        e.remove("history_daily");
+    }
+    light["now"] = json!(0);
+    assert_eq!(light, api);
+    let other = bearer_get(&w.app, "/api/v1/me/values?history=all&x=1", &token).await;
+    assert!(
+        other.json()["services"][w.a.to_string()]
+            .get("history")
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -2026,6 +2048,60 @@ async fn the_daily_rows_are_sent_again_every_15_minutes_at_most() {
     feed(&w.app, w.a, now, 13.0);
     let a = live.event().await["services"][w.a.to_string()].clone();
     assert!(a.get("history_daily").is_none(), "{a}");
+}
+
+#[tokio::test]
+async fn a_peak_rewritten_in_its_slot_is_sent_and_a_lower_reading_is_not() {
+    let w = world().await;
+    let mut bob = Web::new(&w.app, "bob", "viewer").await;
+    save(
+        &mut bob,
+        &doc(0, vec![card("c1", Some(bind(w.a, &["latency_ms"])))]),
+    )
+    .await;
+    let now = now_s();
+    let slot = now - now % 300;
+    // A fast service whose `down` count is a peak, drawn as a curve.
+    let feed_down = |at: i64, down: f64| {
+        let mut s = reading_with(at, 10.0, &[("down", false)]);
+        s.values.insert("down".into(), Reading::num(down));
+        w.app
+            .magpie
+            .poller
+            .record_peaks_for_tests(w.a, 60, &s, &["down"]);
+        w.app.magpie.poller.set_snapshot_for_tests(w.a, s);
+    };
+    feed_down(slot + 5, 0.0);
+    let mut live = open_live(&bob, "en").await;
+    let first = live.event().await;
+    assert_eq!(
+        first["services"][w.a.to_string()]["history"],
+        json!({ "down": [[slot, 0]] })
+    );
+    tokio::task::yield_now().await;
+    tokio::time::pause();
+
+    // Down in the same slot: the slot's point is now 1, sent as a rewrite.
+    feed_down(slot + 65, 1.0);
+    let update = live.event().await;
+    assert_eq!(
+        update["services"][w.a.to_string()]["history_append"],
+        json!({ "down": [slot, 1] })
+    );
+    // Back up in the same slot: the point stays 1, so no point goes out.
+    feed_down(slot + 125, 0.0);
+    let update = live.event().await;
+    let a = &update["services"][w.a.to_string()];
+    assert!(a.get("history_append").is_none(), "{a}");
+    assert!(a.get("history").is_none(), "{a}");
+    assert_eq!(
+        w.app
+            .magpie
+            .poller
+            .history(w.a, &["down".to_string()].into(), now_s())["down"][0]
+            .value,
+        1.0
+    );
 }
 
 #[tokio::test]

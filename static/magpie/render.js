@@ -435,8 +435,10 @@ function drawStatus(doc, labels, status) {
 //
 // A spark block names a metric; its curve is drawn from the entry's `history` of that metric
 // (`[[unix_s, value], ...]`, the last 24 hours) as a small inline SVG, made with the DOM (no
-// markup): a line scaled to the lowest and highest value, or for `up_down` a strip of cells (bad
-// where the value is above 0, good where it is 0, blank where there is no point).
+// markup): a line scaled to the lowest and highest value (broken where readings are missing), for
+// `up_down` a strip of cells (bad where the value is above 0, good where it is 0, blank where there
+// is no point), and for `counter` (a count that grows and starts again, like today's visitors)
+// bars of what it grew by in each hour.
 
 const BLOCK_KINDS = ["list", "bars", "strip", "facts", "spark"];
 const MAX_BLOCKS = 6;
@@ -454,6 +456,12 @@ const SPARK_W = 288;
 const SPARK_H = 32;
 // The cells of an up/down strip: one per half hour.
 const SPARK_SLOTS = 48;
+// The bars of a counter: one per hour.
+const SPARK_HOURS = 24;
+// The history keeps one point per 5 minutes for a service polled faster; a line is broken where two
+// points are more than twice the spacing apart (a reading or more is missing).
+const SPARK_SLOT_S = 300;
+const SPARK_STYLES = ["up_down", "counter"];
 const SVG_NS = "http://www.w3.org/2000/svg";
 
 /** The text of a detail key in the page's labels (`detail.<key>`), "" when the key is not known. */
@@ -499,7 +507,7 @@ function shapeBlock(block, ctx) {
   if (block.kind === "spark") {
     entries = sparkPoints(ctx.history, block.metric, Math.floor(ctx.nowMs / 1000));
     if (entries.length === 0) return null;
-    return { kind: "spark", title_key: block.title_key, look: ["up_down"].includes(block.style) ? "up_down" : "line", entries };
+    return { kind: "spark", title_key: block.title_key, look: SPARK_STYLES.includes(block.style) ? block.style : "line", entries };
   }
   if (block.kind === "list") {
     entries = list(block.items)
@@ -688,9 +696,12 @@ function coord(n) {
 /**
  * A line through the points, x by time over the last 24 hours and y between the lowest and the
  * highest value. One point, or values that are all the same (or too far apart to subtract), give a
- * flat line in the middle.
+ * flat line in the middle. Where two points are more than twice the spacing of the readings apart
+ * (`intervalS`, at least 5 minutes) the line is broken: one polyline per run of readings, and a
+ * lone reading between two gaps is a short dash. Returns the picture, the lowest, the highest and
+ * the latest value.
  */
-function sparkLine(doc, points, nowS) {
+function sparkLine(doc, points, nowS, intervalS) {
   const pic = svg(doc, "svg", "mm-spark-svg mm-spark-line");
   pic.setAttribute("viewBox", `0 0 ${SPARK_W} ${SPARK_H}`);
   pic.setAttribute("preserveAspectRatio", "none");
@@ -707,12 +718,67 @@ function sparkLine(doc, points, nowS) {
   const x = (t) => Math.min(SPARK_W, Math.max(0, ((t - from) / SPARK_WINDOW_S) * SPARK_W));
   const pad = 3;
   const y = (v) => (flat ? SPARK_H / 2 : SPARK_H - pad - ((v - min) / span) * (SPARK_H - 2 * pad));
-  const coords = points.length === 1 ? [[0, y(points[0][1])], [SPARK_W, y(points[0][1])]] : points.map(([t, v]) => [x(t), y(v)]);
-  const line = svg(doc, "polyline", "mm-spark-path");
-  line.setAttribute("points", coords.map(([a, b]) => `${coord(a)},${coord(b)}`).join(" "));
-  line.setAttribute("vector-effect", "non-scaling-stroke");
-  pic.appendChild(line);
-  return pic;
+  const runs = [];
+  if (points.length === 1) {
+    runs.push([[0, y(points[0][1])], [SPARK_W, y(points[0][1])]]);
+  } else {
+    const gap = 2 * Math.max(SPARK_SLOT_S, Number.isFinite(intervalS) ? intervalS : 0);
+    let run = [];
+    points.forEach(([t, v], i) => {
+      if (i > 0 && t - points[i - 1][0] > gap) {
+        runs.push(run);
+        run = [];
+      }
+      run.push([x(t), y(v)]);
+    });
+    runs.push(run);
+  }
+  for (const run of runs) {
+    // A lone reading: a dash of its own, so that it shows.
+    const drawn = run.length === 1 ? [[Math.max(0, run[0][0] - 1), run[0][1]], [Math.min(SPARK_W, run[0][0] + 1), run[0][1]]] : run;
+    const line = svg(doc, "polyline", "mm-spark-path");
+    line.setAttribute("points", drawn.map(([a, b]) => `${coord(a)},${coord(b)}`).join(" "));
+    line.setAttribute("vector-effect", "non-scaling-stroke");
+    pic.appendChild(line);
+  }
+  return { pic, min, max, latest: points[points.length - 1][1] };
+}
+
+/**
+ * Bars of what a counter grew by in each hour of the last 24. A counter counts up and starts again
+ * (today's visitors at midnight): each step adds `v - prev`, or `v` when the value fell (it started
+ * again); the first reading adds nothing, and a step that is not a finite number of at least 0 adds
+ * nothing either. A step after a gap counts in the hour of the reading that ends it. Returns the
+ * picture and the total.
+ */
+function sparkCounter(doc, points, nowS) {
+  const pic = svg(doc, "svg", "mm-spark-svg mm-spark-counter");
+  pic.setAttribute("viewBox", `0 0 ${SPARK_HOURS} ${SPARK_H}`);
+  pic.setAttribute("preserveAspectRatio", "none");
+  pic.setAttribute("focusable", "false");
+  const bins = new Array(SPARK_HOURS).fill(0);
+  const from = nowS - SPARK_WINDOW_S;
+  for (let i = 1; i < points.length; i += 1) {
+    const [t, v] = points[i];
+    const prev = points[i - 1][1];
+    const step = v < prev ? v : v - prev;
+    if (!(Number.isFinite(step) && step > 0)) continue;
+    const bin = Math.min(SPARK_HOURS - 1, Math.max(0, Math.floor((t - from) / 3600)));
+    bins[bin] += step;
+  }
+  let top = 0;
+  for (const n of bins) if (n > top) top = n;
+  const total = bins.reduce((sum, n) => sum + n, 0);
+  bins.forEach((n, i) => {
+    const h = top > 0 && Number.isFinite(top) ? (n / top) * (SPARK_H - 2) : 0;
+    const bar = svg(doc, "rect", "mm-spark-bar");
+    bar.setAttribute("x", coord(i + 0.12));
+    bar.setAttribute("y", coord(SPARK_H - h));
+    bar.setAttribute("width", "0.76");
+    bar.setAttribute("height", coord(h));
+    pic.appendChild(bar);
+  });
+  return { pic, total };
 }
 
 /**
@@ -745,17 +811,38 @@ function sparkCells(doc, points, nowS) {
   return { pic, bad: slots.filter((state) => state === "bad").length };
 }
 
-/** A spark block's picture: one image, named by its title (and, for up/down, the count of bad cells). */
+/** A label's text with its `{name}` placeholders filled in. */
+function filled(text, values) {
+  let out = text;
+  for (const [name, value] of Object.entries(values)) out = out.split(`{${name}}`).join(value);
+  return out;
+}
+
+/**
+ * A spark block's picture: one image. The block's title names it already (the group), so the
+ * image says what the curve shows: the latest value and the range of a line, the total of a
+ * counter, the number of red half hours of an up/down strip.
+ */
 function drawSpark(doc, ctx, block) {
   const wrap = make(doc, "div", "mm-spark");
   wrap.setAttribute("data-style", block.look);
   const nowS = Math.floor(ctx.nowMs / 1000);
+  const num = (n) => formatNumber(n, ctx.lang, { maximumFractionDigits: 2 });
   let pic;
-  let bad = 0;
-  if (block.look === "up_down") ({ pic, bad } = sparkCells(doc, block.entries, nowS));
-  else pic = sparkLine(doc, block.entries, nowS);
-  const parts = [detailLabel(ctx.labels, block.title_key), bad > 0 ? `${label(ctx.labels, "status_bad")}: ${bad}` : ""];
-  const name = parts.filter((p) => p !== "").join(", ");
+  let name;
+  if (block.look === "up_down") {
+    const drawn = sparkCells(doc, block.entries, nowS);
+    pic = drawn.pic;
+    name = filled(label(ctx.labels, "spark_updown"), { n: num(drawn.bad) });
+  } else if (block.look === "counter") {
+    const drawn = sparkCounter(doc, block.entries, nowS);
+    pic = drawn.pic;
+    name = filled(label(ctx.labels, "spark_counter"), { n: num(drawn.total) });
+  } else {
+    const drawn = sparkLine(doc, block.entries, nowS, ctx.intervalS);
+    pic = drawn.pic;
+    name = filled(label(ctx.labels, "spark_line"), { value: num(drawn.latest), min: num(drawn.min), max: num(drawn.max) });
+  }
   if (name !== "") {
     wrap.setAttribute("role", "img");
     wrap.setAttribute("aria-label", name);
@@ -791,8 +878,8 @@ function drawBlock(doc, ctx, block, cut, id) {
  * makes the ids of the titles (`mm-bt-<card>-<n>`) different on every card of the page. `history`
  * is the entry's, for the spark blocks.
  */
-function drawBlocks(doc, details, history, size, opts, cardKey, nowMs) {
-  const ctx = { labels: opts.labels, lang: opts.lang, nowMs, history };
+function drawBlocks(doc, details, history, intervalS, size, opts, cardKey, nowMs) {
+  const ctx = { labels: opts.labels, lang: opts.lang, nowMs, history, intervalS };
   const picked = blocksFor(wellFormedBlocks(details, ctx), size);
   if (picked.length === 0) return null;
   const wrap = make(doc, "div", "mm-blocks");
@@ -864,7 +951,7 @@ function drawService(doc, el, ref, opts) {
     svc.appendChild(grid);
   }
 
-  const blocks = drawBlocks(doc, snap.details, snap.history, cardSizeOf(el), opts, el.getAttribute("data-card") ?? `s${ref.id}`, nowMs);
+  const blocks = drawBlocks(doc, snap.details, snap.history, intervalS, cardSizeOf(el), opts, el.getAttribute("data-card") ?? `s${ref.id}`, nowMs);
   if (blocks) svc.appendChild(blocks);
 
   foot.appendChild(drawStatus(doc, labels, statusOf(snap.status)));

@@ -129,31 +129,37 @@ static METRICS: [MetricDef; 6] = [
         id: "containers_running",
         label_key: "metric.unraid_containers_running",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "containers_stopped",
         label_key: "metric.unraid_containers_stopped",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "array",
         label_key: "metric.unraid_array",
         format: Format::Text,
+        peak: false,
     },
     MetricDef {
         id: "disk_used",
         label_key: "metric.unraid_disk_used",
         format: Format::Percent,
+        peak: false,
     },
     MetricDef {
         id: "parity_errors",
         label_key: "metric.unraid_parity_errors",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "parity_last",
         label_key: "metric.unraid_parity_last",
         format: Format::Since,
+        peak: false,
     },
 ];
 

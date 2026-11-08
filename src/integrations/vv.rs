@@ -81,31 +81,38 @@ static METRICS: [MetricDef; 6] = [
         id: "up",
         label_key: "metric.vv_up",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "down",
         label_key: "metric.vv_down",
         format: Format::Number,
+        // A monitor down for a minute shows in «Last 24 hours».
+        peak: true,
     },
     MetricDef {
         id: "uptime_30d",
         label_key: "metric.vv_uptime_30d",
         format: Format::Percent,
+        peak: false,
     },
     MetricDef {
         id: "uptime_24h",
         label_key: "metric.vv_uptime_24h",
         format: Format::Percent,
+        peak: false,
     },
     MetricDef {
         id: "paused",
         label_key: "metric.vv_paused",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "first_down",
         label_key: "metric.vv_first_down",
         format: Format::Text,
+        peak: false,
     },
 ];
 

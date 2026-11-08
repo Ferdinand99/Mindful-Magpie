@@ -10,7 +10,9 @@
 //! * The last 24 hours, at most [`MAX_POINTS`] (288) points per metric. A
 //!   service polled more often than every 5 minutes is thinned: it has one point
 //!   per 5-minute slot, its time is the start of the slot (a multiple of 300 s)
-//!   and the latest reading of the slot wins. A service polled every 5 minutes or
+//!   and the latest reading of the slot wins (the highest, for a metric the
+//!   kind marks as a peak, [`MetricDef::peak`]: a count of things that are
+//!   down keeps a short outage). A service polled every 5 minutes or
 //!   slower has a point per reading, at the time of the reading.
 //! * A metric the kind declares as a moment (`Format::Since`) is not recorded,
 //!   and a service keeps at most [`MAX_METRICS`] (64) distinct series: a new
@@ -195,6 +197,9 @@ pub struct Write {
     pub at: i64,
     /// The points to put in `service_history`, by metric.
     pub points: Vec<(String, Point)>,
+    /// The metrics of `points` whose stored point keeps the higher value
+    /// when the slot is already there.
+    pub peaks: BTreeSet<String>,
     /// Every number of the reading, for the daily rows.
     pub readings: Vec<(String, f64)>,
 }
@@ -207,7 +212,21 @@ impl History {
     /// Records the `readings` taken at `at` from service `id`, whose interval
     /// is `interval_s`, and says what to write to the tables. Prunes the
     /// service's series (all its metrics) to the window and the point cap.
+    /// The latest reading of a slot wins.
     pub fn record(&self, id: i64, interval_s: i64, at: i64, readings: Vec<(String, f64)>) -> Write {
+        self.record_with_peaks(id, interval_s, at, readings, &BTreeSet::new())
+    }
+
+    /// [`History::record`], where a metric in `peaks` keeps the highest
+    /// reading of a slot instead of the latest.
+    pub fn record_with_peaks(
+        &self,
+        id: i64,
+        interval_s: i64,
+        at: i64,
+        readings: Vec<(String, f64)>,
+        peaks: &BTreeSet<String>,
+    ) -> Write {
         let slot_at = if interval_s < SLOT_S {
             at - at.rem_euclid(SLOT_S)
         } else {
@@ -231,10 +250,16 @@ impl History {
             }
             let series = service.entry(metric.clone()).or_default();
             kept.push((metric.clone(), value));
-            let point = Point { at: slot_at, value };
+            let peak = peaks.contains(&metric);
+            let mut point = Point { at: slot_at, value };
             match series.back_mut() {
-                // The slot's latest reading wins.
-                Some(last) if last.at == slot_at => last.value = value,
+                // The slot's latest reading wins, or its highest for a peak.
+                Some(last) if last.at == slot_at => {
+                    if peak {
+                        point.value = last.value.max(value);
+                    }
+                    last.value = point.value;
+                }
                 // A reading from before the newest point (the clock went
                 // back): nothing to add.
                 Some(last) if last.at > slot_at => continue,
@@ -247,10 +272,16 @@ impl History {
         }
         // A series that only holds the new point and no old one stays; one
         // the window emptied was removed above.
+        let peaks = points
+            .iter()
+            .filter(|(metric, _)| peaks.contains(metric))
+            .map(|(metric, _)| metric.clone())
+            .collect();
         Write {
             service_id: id,
             at,
             points,
+            peaks,
             readings: kept,
         }
     }
@@ -370,9 +401,13 @@ pub fn write(conn: &mut Connection, w: &Write) -> rusqlite::Result<()> {
     let id = w.service_id;
     let cutoff = w.at - WINDOW_S;
     {
+        // A slot that is there already takes the new value, or the higher
+        // one for a peak metric (?5).
         let mut put = tx.prepare_cached(
-            "INSERT OR REPLACE INTO service_history (service_id, metric, at, value)
-             SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM services WHERE id = ?1)",
+            "INSERT INTO service_history (service_id, metric, at, value)
+             SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM services WHERE id = ?1)
+             ON CONFLICT (service_id, metric, at) DO UPDATE SET
+               value = CASE WHEN ?5 THEN MAX(value, excluded.value) ELSE excluded.value END",
         )?;
         let mut cap = tx.prepare_cached(
             "DELETE FROM service_history WHERE service_id = ?1 AND metric = ?2 AND at <
@@ -380,7 +415,13 @@ pub fn write(conn: &mut Connection, w: &Write) -> rusqlite::Result<()> {
                 ORDER BY at DESC LIMIT 1 OFFSET ?3)",
         )?;
         for (metric, point) in &w.points {
-            put.execute(params![id, metric, point.at, point.value])?;
+            put.execute(params![
+                id,
+                metric,
+                point.at,
+                point.value,
+                w.peaks.contains(metric)
+            ])?;
             cap.execute(params![id, metric, MAX_POINTS as i64 - 1])?;
         }
         let day = day_of(w.at);
@@ -464,6 +505,49 @@ mod tests {
 
     fn r(metric: &str, v: f64) -> Vec<(String, f64)> {
         vec![(metric.to_string(), v)]
+    }
+
+    #[test]
+    fn a_peak_keeps_the_highest_reading_of_its_slot_and_the_others_the_latest() {
+        let h = History::default();
+        let base = 1_760_000_100 - 1_760_000_100 % SLOT_S;
+        let peaks: BTreeSet<String> = ["down".to_string()].into();
+        let both =
+            |down: f64, other: f64| vec![("down".to_string(), down), ("other".to_string(), other)];
+        let w = h.record_with_peaks(1, 60, base + 10, both(1.0, 1.0), &peaks);
+        assert_eq!(w.peaks, peaks);
+        let w = h.record_with_peaks(1, 60, base + 70, both(0.0, 0.0), &peaks);
+        // What is written is the slot's value: the peak for `down`.
+        assert_eq!(
+            w.points,
+            vec![
+                (
+                    "down".to_string(),
+                    Point {
+                        at: base,
+                        value: 1.0
+                    }
+                ),
+                (
+                    "other".to_string(),
+                    Point {
+                        at: base,
+                        value: 0.0
+                    }
+                ),
+            ]
+        );
+        let w = h.record_with_peaks(1, 60, base + 130, both(3.0, 3.0), &peaks);
+        assert_eq!(w.points[0].1.value, 3.0);
+        // A service polled every 5 minutes or slower has a point per reading.
+        let w = h.record_with_peaks(2, 300, base, both(1.0, 1.0), &peaks);
+        let w2 = h.record_with_peaks(2, 300, base + 300, both(0.0, 0.0), &peaks);
+        assert_eq!((w.points[0].1.value, w2.points[0].1.value), (1.0, 0.0));
+        // `record` keeps no peak.
+        h.record(3, 60, base + 10, r("down", 1.0));
+        let w = h.record(3, 60, base + 70, r("down", 0.0));
+        assert!(w.peaks.is_empty());
+        assert_eq!(w.points[0].1.value, 0.0);
     }
 
     #[test]
@@ -584,11 +668,13 @@ mod tests {
                 id: "age",
                 label_key: "x",
                 format: Format::Since,
+                peak: false,
             },
             MetricDef {
                 id: "load",
                 label_key: "x",
                 format: Format::Number,
+                peak: false,
             },
         ];
         assert_eq!(numbers(&s, &defs), vec![("load".to_string(), 1.5)]);

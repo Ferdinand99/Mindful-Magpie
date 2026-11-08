@@ -101,26 +101,31 @@ static METRICS: [MetricDef; 5] = [
         id: "streams",
         label_key: "metric.tofa_streams",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "transcodes",
         label_key: "metric.tofa_transcodes",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "tasks_running",
         label_key: "metric.tofa_tasks_running",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "libraries_unhealthy",
         label_key: "metric.tofa_libraries_unhealthy",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "version",
         label_key: "metric.tofa_version",
         format: Format::Text,
+        peak: false,
     },
 ];
 

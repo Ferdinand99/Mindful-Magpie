@@ -877,13 +877,14 @@ async fn the_numbers_of_the_summary_are_not_repeated_in_a_block() {
     let (url, _) = serve(200, summary(totals(0, 0, 4), vec![])).await;
     let snapshot = fetch(&url, Some(TOKEN)).await.unwrap();
     assert_eq!(num(&snapshot, "visitors_today"), Some(120.0));
-    // Only the curve of today's visitors, drawn from the page's history.
+    // Only the visitors per hour, drawn from the page's history of today's
+    // count.
     assert_eq!(
         stored(snapshot),
         vec![Block::Spark {
-            title_key: "kk_visitors".into(),
+            title_key: "kk_visitors_hourly".into(),
             metric: "visitors_today".into(),
-            style: SparkStyle::Line,
+            style: SparkStyle::Counter,
             daily: false,
         }]
     );

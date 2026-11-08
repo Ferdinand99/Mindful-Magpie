@@ -72,26 +72,31 @@ static METRICS: [MetricDef; 5] = [
         id: "updates_ready",
         label_key: "metric.ww_updates_ready",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "agents_online",
         label_key: "metric.ww_agents_online",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "agents_total",
         label_key: "metric.ww_agents_total",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "last_run",
         label_key: "metric.ww_last_run",
         format: Format::Since,
+        peak: false,
     },
     MetricDef {
         id: "failed_targets",
         label_key: "metric.ww_failed_targets",
         format: Format::Number,
+        peak: false,
     },
 ];
 

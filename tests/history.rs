@@ -97,6 +97,65 @@ fn set(metrics: &[&str]) -> BTreeSet<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Peaks
+
+#[tokio::test]
+async fn a_peak_metric_keeps_the_highest_reading_of_a_slot_in_memory_and_in_the_table() {
+    let app = App::new().await;
+    let id = service(&app, "Monitor").await;
+    let h = History::default();
+    let peaks = set(&["down"]);
+    // A monitor is down at 00:00:10 and back at 00:01:10, in the same slot.
+    for (at, down, latency) in [(T0 + 10, 1.0, 5.0), (T0 + 70, 0.0, 6.0)] {
+        let w = h.record_with_peaks(
+            id,
+            60,
+            at,
+            vec![("down".into(), down), ("latency_ms".into(), latency)],
+            &peaks,
+        );
+        history::persist(&app.magpie.core, w).await.unwrap();
+    }
+    let held = h.series(id, &set(&["down", "latency_ms"]), T0 + 70);
+    assert_eq!(held["down"].len(), 1);
+    assert_eq!((held["down"][0].at, held["down"][0].value), (T0, 1.0));
+    // Any other metric: the latest wins, as before.
+    assert_eq!(held["latency_ms"][0].value, 6.0);
+    assert_eq!(rows(&app, id, "down").await, vec![(T0, 1.0)]);
+    assert_eq!(rows(&app, id, "latency_ms").await, vec![(T0, 6.0)]);
+
+    // The table keeps the peak also when the memory has not seen it (a
+    // restart in the middle of the slot).
+    let fresh = History::default();
+    let w = fresh.record_with_peaks(id, 60, T0 + 130, one("down", 0.0), &peaks);
+    assert_eq!(w.peaks, set(&["down"]));
+    history::persist(&app.magpie.core, w).await.unwrap();
+    assert_eq!(rows(&app, id, "down").await, vec![(T0, 1.0)]);
+
+    // The next slot starts again from its own readings.
+    let w = h.record_with_peaks(id, 60, T0 + 310, one("down", 0.0), &peaks);
+    history::persist(&app.magpie.core, w).await.unwrap();
+    assert_eq!(
+        rows(&app, id, "down").await,
+        vec![(T0, 1.0), (T0 + 300, 0.0)]
+    );
+}
+
+#[tokio::test]
+async fn vv_marks_its_down_count_as_a_peak_and_nothing_else_does() {
+    let peaks: Vec<(&str, &str)> = integrations::registry()
+        .iter()
+        .flat_map(|k| {
+            k.metrics()
+                .iter()
+                .filter(|m| m.peak)
+                .map(move |m| (k.kind(), m.id))
+        })
+        .collect();
+    assert_eq!(peaks, [("vv", "down")]);
+}
+
+// ---------------------------------------------------------------------------
 // Bounds
 
 #[tokio::test]
@@ -279,6 +338,7 @@ static METRICS: [MetricDef; 1] = [MetricDef {
     id: "ts",
     label_key: "kind.stub",
     format: Format::Since,
+    peak: false,
 }];
 
 impl Integration for Reader {

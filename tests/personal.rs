@@ -136,6 +136,19 @@ async fn en(web: &mut Web<'_>, path: &str) -> Res {
     web.send(req).await
 }
 
+/// The page without its `<script type="application/json" id="{id}">` block.
+fn without_block(page: &str, id: &str) -> String {
+    let open = format!(r#"<script type="application/json" id="{id}">"#);
+    let start = page.find(&open).unwrap_or_else(|| panic!("no {id} block"));
+    let end = page[start..]
+        .to_ascii_lowercase()
+        .find("</script>")
+        .expect("block never closes")
+        + start
+        + "</script>".len();
+    format!("{}{}", &page[..start], &page[end..])
+}
+
 async fn page(web: &mut Web<'_>) -> String {
     let res = en(web, "/").await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
@@ -1247,9 +1260,12 @@ async fn nobody_else_gets_it_by_any_path_not_even_an_admin() {
         let body = page(&mut web).await;
         assert!(!body.contains("Alice GitHub"), "{name}: the page names it");
         assert!(!body.contains("gh:review"), "{name}");
-        // The need's text ("Waiting for you: 3"); the label map carries the GitHub card's
-        // block title "Waiting for you" for every page, which names nothing.
-        assert!(!body.contains("Waiting for you:"), "{name}");
+        // The label map carries the GitHub card's block title "Waiting for you" on every
+        // page, which names nothing: the rest of the page must not have the need's text.
+        assert!(
+            !without_block(&body, "mm-labels").contains("Waiting for you"),
+            "{name}"
+        );
         let values = block(&body, "mm-values");
         assert_eq!(ids_of(&values["services"]), vec![w.blog], "{name}");
         assert!(values["needs"].as_array().unwrap().is_empty(), "{name}");

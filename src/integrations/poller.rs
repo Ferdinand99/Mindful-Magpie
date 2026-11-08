@@ -177,9 +177,19 @@ impl Shared {
                 return None;
             }
             let numbers = history::numbers(&snapshot, metrics);
+            let peaks = metrics
+                .iter()
+                .filter(|m| m.peak)
+                .map(|m| m.id.to_string())
+                .collect();
             let write = (!numbers.is_empty()).then(|| {
-                self.history
-                    .record(id, interval_s, snapshot.fetched_at.as_second(), numbers)
+                self.history.record_with_peaks(
+                    id,
+                    interval_s,
+                    snapshot.fetched_at.as_second(),
+                    numbers,
+                    &peaks,
+                )
             });
             state.snapshots.insert(id, snapshot);
             write
@@ -315,13 +325,28 @@ impl PollerHandle {
     /// snapshot. **For tests only** (hidden from the docs).
     #[doc(hidden)]
     pub fn record_history_for_tests(&self, service_id: i64, interval_s: i64, snapshot: &Snapshot) {
+        self.record_peaks_for_tests(service_id, interval_s, snapshot, &[]);
+    }
+
+    /// [`PollerHandle::record_history_for_tests`] where the metrics in `peaks`
+    /// keep the highest reading of a slot. **For tests only** (hidden from the
+    /// docs).
+    #[doc(hidden)]
+    pub fn record_peaks_for_tests(
+        &self,
+        service_id: i64,
+        interval_s: i64,
+        snapshot: &Snapshot,
+        peaks: &[&str],
+    ) {
         let numbers = history::numbers(snapshot, &[]);
         if !numbers.is_empty() {
-            self.shared.history.record(
+            self.shared.history.record_with_peaks(
                 service_id,
                 interval_s,
                 snapshot.fetched_at.as_second(),
                 numbers,
+                &peaks.iter().map(|p| p.to_string()).collect(),
             );
         }
     }

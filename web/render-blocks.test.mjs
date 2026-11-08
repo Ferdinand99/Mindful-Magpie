@@ -20,6 +20,9 @@ const LABELS = {
   status_unknown: "Status: unknown",
   updated: "Last updated {when}",
   block_more: "+ {n} more",
+  spark_line: "Now {value}, from {min} to {max}",
+  spark_counter: "{n} in the last 24 hours",
+  spark_updown: "{n} half hours with something down",
   "detail.down_now": "Down now",
   "detail.uptime": "Last 24 hours",
   "detail.disks": "Disks",
@@ -677,12 +680,14 @@ function drawSpark(details, history, card = boundCard("c1", 2)) {
 const yOf = (points) => points.split(" ").map((pair) => Number(pair.split(",")[1]));
 
 test("a_line_spark_is_an_svg_made_with_the_dom_and_scaled_to_the_lowest_and_highest_value", () => {
-  const { root } = drawSpark([SPARK], { lat: series([3600, 10], [1800, 30], [0, 20]), other: series([0, 1]) });
+  const { root } = drawSpark([SPARK], { lat: series([600, 10], [300, 30], [0, 20]), other: series([0, 1]) });
   const block = root.querySelector(".mm-block-spark");
   assert.ok(block, "a spark block");
   const wrap = block.querySelector(".mm-spark");
   assert.equal(wrap.getAttribute("role"), "img");
-  assert.equal(wrap.getAttribute("aria-label"), "Last 24 hours");
+  // The block's title names the group; the picture says what the line shows.
+  assert.equal(wrap.getAttribute("aria-label"), "Now 20, from 10 to 30");
+  assert.equal(block.getAttribute("aria-labelledby"), block.querySelector(".mm-block-title").id);
   const pic = wrap.querySelector("svg");
   assert.equal(pic.namespaceURI, SVG);
   assert.equal(pic.getAttribute("aria-hidden"), "true");
@@ -759,10 +764,11 @@ test("an_up_down_spark_is_a_strip_of_half_hours_bad_where_something_was_down", (
   assert.equal(states[47], "ok");
   assert.equal(states.filter((s) => s === "ok").length, 2);
   assert.equal(states.filter((s) => s === "none").length, 45);
-  assert.equal(wrap.getAttribute("aria-label"), "Last 24 hours, Status: problem: 1");
-  // A spark without a known title is a picture with nothing to say.
+  assert.equal(wrap.getAttribute("aria-label"), "1 half hours with something down");
+  // Without a known title the block has no heading, and the picture still says its count.
   const plain = drawSpark([{ ...UPDOWN, title_key: "nope" }], { down: series([0, 0]) });
-  assert.equal(plain.root.querySelector(".mm-spark").getAttribute("aria-hidden"), "true");
+  assert.equal(plain.root.querySelector(".mm-block-title"), null);
+  assert.equal(plain.root.querySelector(".mm-spark").getAttribute("aria-label"), "0 half hours with something down");
 });
 
 test("a_normal_card_counts_a_spark_as_its_one_visual", () => {
@@ -808,4 +814,76 @@ test("the_css_draws_the_spark_line_and_cells_in_the_status_colours", () => {
   assert.match(css, /\.mm-spark-cell\[data-status="bad"\] \{\s*fill: var\(--bad-text\);/);
   const source = readFileSync(new URL("../static/magpie/render.js", import.meta.url), "utf8");
   assert.match(source, /createElementNS\(SVG_NS/);
+});
+
+const COUNTER = { kind: "spark", title_key: "uptime", metric: "visits", style: "counter" };
+const barHeights = (root) => [...root.querySelectorAll(".mm-spark-counter rect")].map((r) => Number(r.getAttribute("height")));
+
+test("a_counter_spark_draws_what_the_count_grew_by_in_each_hour_and_a_reset_is_a_new_start", () => {
+  const { root } = drawSpark(
+    [COUNTER],
+    {
+      // Two hours ago 10, then 20 and 25 in the hour before last; at midnight (an hour ago) it
+      // starts again at 3, then 5 now.
+      visits: series([7200, 10], [6600, 20], [6000, 25], [3000, 3], [0, 5]),
+    },
+  );
+  const wrap = root.querySelector(".mm-spark");
+  assert.equal(wrap.getAttribute("data-style"), "counter");
+  const bars = [...root.querySelectorAll(".mm-spark-counter rect")];
+  assert.equal(bars.length, 24);
+  assert.ok(bars.every((b) => b.namespaceURI === SVG));
+  const h = barHeights(root);
+  assert.ok(h.every((x) => Number.isFinite(x) && x >= 0), "no negative bar");
+  // 10 + 5 in the hour before last; in the last hour the reset counts as 3 (not -22), then 2.
+  assert.equal(wrap.getAttribute("aria-label"), "20 in the last 24 hours");
+  assert.equal(h[22], 30, "the fullest hour is the full height");
+  assert.ok(h[23] > 0 && h[23] < h[22]);
+  assert.equal(h.filter((x) => x > 0).length, 2);
+  // Every bar sits on the bottom edge.
+  for (const b of bars) assert.equal(Number(b.getAttribute("y")) + Number(b.getAttribute("height")), 32);
+});
+
+test("a_counter_spark_takes_gaps_and_hostile_values_without_a_negative_bar_or_a_throw", () => {
+  const cases = [
+    // A gap of hours: the step after it counts in the hour that ends it.
+    [series([20 * 3600, 5], [3600, 9]), "4 in the last 24 hours"],
+    // Values that fall below 0, a huge jump, numbers too big to subtract.
+    [series([3000, 5], [2700, -4], [2400, 2], [2100, 1.7e308], [1800, -1.7e308], [1500, 1.7e308]), null],
+    // One point: nothing grew.
+    [series([0, 50]), "0 in the last 24 hours"],
+  ];
+  for (const [visits, label] of cases) {
+    const { root } = drawSpark([COUNTER], { visits });
+    const h = barHeights(root);
+    assert.equal(h.length, 24);
+    assert.ok(h.every((x) => Number.isFinite(x) && x >= 0 && x <= 32), JSON.stringify(h));
+    for (const r of root.querySelectorAll(".mm-spark-counter rect")) {
+      for (const a of ["x", "y", "width", "height"]) assert.doesNotMatch(r.getAttribute(a), /NaN|Infinity/);
+    }
+    if (label) assert.equal(root.querySelector(".mm-spark").getAttribute("aria-label"), label);
+  }
+  // A page that does not know a style draws a line; an old page does the same with "counter".
+  const odd = drawSpark([{ ...COUNTER, style: "pie" }], { visits: series([300, 1], [0, 2]) });
+  assert.equal(odd.root.querySelector(".mm-spark").getAttribute("data-style"), "line");
+});
+
+test("a_line_is_broken_where_readings_are_missing", () => {
+  // A service read every minute keeps a point per 5 minutes: a gap of more than 10 minutes breaks
+  // the line, and a lone reading between two gaps is a short dash of its own.
+  const { root } = drawSpark([SPARK], { lat: series([7200, 1], [6900, 2], [3600, 5], [600, 3], [300, 4], [0, 2]) });
+  const lines = [...root.querySelectorAll(".mm-spark-line polyline")];
+  assert.equal(lines.length, 3);
+  assert.deepEqual(lines.map((l) => l.getAttribute("points").split(" ").length), [2, 2, 3]);
+  const dash = lines[1].getAttribute("points").split(" ").map((p) => p.split(",").map(Number));
+  assert.equal(dash[0][1], dash[1][1]);
+  assert.ok(dash[1][0] - dash[0][0] <= 2);
+  // A service read every 15 minutes: points 15 minutes apart are not a gap.
+  const slow = drawSpark([SPARK], { lat: series([1800, 1], [900, 2], [0, 3]) }, boundCard("c1", 2));
+  const t = liveCard([SPARK]);
+  t.update([SPARK], { interval_s: 900, history: { lat: series([1800, 1], [900, 2], [0, 3]) } });
+  assert.equal(t.root.querySelectorAll(".mm-spark-line polyline").length, 1);
+  assert.equal(slow.root.querySelectorAll(".mm-spark-line polyline").length, 3, "at 60 s they are");
+  // The label says the latest value and the range of all of them.
+  assert.equal(root.querySelector(".mm-spark").getAttribute("aria-label"), "Now 2, from 1 to 5");
 });

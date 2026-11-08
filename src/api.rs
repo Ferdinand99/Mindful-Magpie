@@ -1,6 +1,6 @@
 //! Magpie's REST routes under `/api/v1`, for the browser extension:
 //!
-//! - `GET /api/v1/me/start`: the token owner's start page layout. Only an API
+//! - `GET /api/v1/me/start`: the token user's start page layout. Only an API
 //!   token opens it. The path is exempt from the CSRF guard, so a session
 //!   cookie, which a foreign page can make the browser send, is never enough.
 //! - `GET /api/v1/me/values`: the latest readings of the services bound to the
@@ -13,7 +13,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::time::Instant;
 
 use axum::body::{Body, to_bytes};
-use axum::extract::{Extension, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -31,6 +31,7 @@ use vole_kit::db::{self, api_tokens};
 use vole_kit::docs::{ErrorCode, RouteDoc, r};
 use vole_kit::http::ApiError;
 use vole_kit::http::ratelimit::{Rate, too_many_requests};
+use vole_kit::i18n;
 use vole_kit::state::Core;
 
 use crate::layout::Layout;
@@ -62,7 +63,7 @@ pub const ROUTES: &[RouteDoc] = &[
         "/api/v1/me/start",
         "viewer",
         "Start page",
-        "The start page layout of the token's owner, as the page shows it: `version`, `background`, `groups` of cards and `bookmarks`, and `services`: the services the owner may see, each `{id, name, kind, interval_s, link, size, metrics: [{id, label, format}]}` (`size` is `normal` or `wide`: the size a card of the service has when it names none; `link` is where a card without a link of its own opens: the service's own link, else its address up to the port, or empty; `label` in the request's language, `format` one of `number`, `percent`, `bytes`, `bytes_per_sec`, `duration`, `since`, `text`), never the address itself (only its origin, as `link`), a setting or a key. A card bound to a service has `service: {id, metrics: [ids]}` (one or more of the service's metrics, each once, in the order the card shows them) and may have `size`: `normal` or `wide` (absent means the service's `size`); the id may not be in `services` (the service was removed or is no longer visible). Any API token opens it (read access is enough); a session cookie never does. If the stored layout is unreadable, the answer is the empty layout at the stored version, as the page shows it. A picture background that is no longer the user's picture is shown as the `hedgerow` preset, with the stored version. Never cached (`Cache-Control: no-store`).",
+        "The start page layout of the token's user, as the page shows it: `version`, `background`, `groups` of cards and `bookmarks`, and `services`: the services the user may see, each `{id, name, kind, interval_s, link, size, metrics: [{id, label, format}]}` (`size` is `normal` or `wide`: the size a card of the service has when it names none; `link` is where a card without a link of its own opens: the service's own link, else its address up to the port, or empty; `label` in the request's language, `format` one of `number`, `percent`, `bytes`, `bytes_per_sec`, `duration`, `since`, `text`), never the address itself (only its origin, as `link`), a setting or a key. A card bound to a service has `service: {id, metrics: [ids]}` (one or more of the service's metrics, each once, in the order the card shows them) and may have `size`: `normal` or `wide` (absent means the service's `size`); the id may not be in `services` (the service was removed or is no longer visible). Any API token opens it (read access is enough); a session cookie never does. If the stored layout is unreadable, the answer is the empty layout at the stored version, as the page shows it. A picture background that is no longer the user's picture is shown as the `hedgerow` preset, with the stored version. Never cached (`Cache-Control: no-store`).",
     )
     .res(ME_START_EXAMPLE),
     r(
@@ -70,7 +71,7 @@ pub const ROUTES: &[RouteDoc] = &[
         "/api/v1/me/values",
         "viewer",
         "Service values",
-        "The latest reading of every service that is bound to a card on the start page of the token's user and that the user may see: `{now, services, needs}`, `now` being the server's clock in Unix seconds and `services` an object by service id with `{name, kind, interval_s, status, values, details, fetched_at, error_label}` for each (`details` is absent when the reading has none: a list of blocks `{kind: list|bars|strip|facts|spark, title_key, ...}` that a card draws next to its numbers, at most six, every text in them a short plain line; a client that does not know them ignores them). `status` is `ok`, `warn`, `bad` or `unknown`; `values` maps a metric id to `{num, text}` (either may be `null`); `fetched_at` is the time of the reading in Unix seconds, or `null` while the service has not been read yet (then `status` is `unknown` and `values` is empty); `error_label` is present when the last reading failed and says why in the request's language (a fixed set of texts, never the raw error). An entry also has Magpie's own history of the numbers its curves draw, for the metrics a `spark` block in its `details` names (`{kind: spark, title_key, metric, style: line|up_down, daily?}`) and no others: `history`, `{metric: [[unix_s, value], ...]}`, the last 24 hours, oldest first, at most 288 points per metric (one per 5 minutes for a service polled faster), values rounded to 4 significant digits; and `history_daily`, `{metric: [[\"YYYY-MM-DD\", min, max, avg], ...]}`, the last 30 UTC days, for a spark block with `daily: true`. A field is left out when it would be empty. `needs` (beside `services`) lists what needs the user's attention, worst first: `{service_id, service_name, key, level, label, since, acked}` for each need of those services, `level` being `warn` or `bad`, `label` the text in the request's language (without the service's name, which is `service_name`: show them side by side), `since` the time the need began in Unix seconds and `acked` whether the user has acknowledged it on the page and it has not got worse since (an acknowledgement is made on the start page only; a token cannot make one). A need that only an admin can act on (a service whose settings must be set up again) is listed only when the user is an admin and the request is their session or the browser extension's token; any other token never gets it. A service the user may not see is left out entirely, with its needs. Pages and the extension never wait for the service itself: this is the stored reading, and its age is `now - fetched_at`. Any API token opens it (read access is enough); a session cookie never does. Never cached (`Cache-Control: no-store`).",
+        "The latest reading of every service that is bound to a card on the start page of the token's user and that the user may see: `{now, services, needs}`, `now` being the server's clock in Unix seconds and `services` an object by service id with `{name, kind, interval_s, status, values, details, fetched_at, error_label}` for each (`details` is absent when the reading has none: a list of blocks `{kind: list|bars|strip|facts|spark, title_key, ...}` that a card draws next to its numbers, at most six, every text in them a short plain line; a client that does not know them ignores them). `status` is `ok`, `warn`, `bad` or `unknown`; `values` maps a metric id to `{num, text}` (either may be `null`); `fetched_at` is the time of the reading in Unix seconds, or `null` while the service has not been read yet (then `status` is `unknown` and `values` is empty); `error_label` is present when the last reading failed and says why in the request's language (a fixed set of texts, never the raw error). An entry also has Magpie's own history of the numbers its curves draw, for the metrics a `spark` block in its `details` names (`{kind: spark, title_key, metric, style: line|up_down, daily?}`) and no others: `history`, `{metric: [[unix_s, value], ...]}`, the last 24 hours, oldest first, at most 288 points per metric (one per 5 minutes for a service polled faster), values rounded to 4 significant digits; and `history_daily`, `{metric: [[\"YYYY-MM-DD\", min, max, avg], ...]}`, the last 30 UTC days, for a spark block with `daily: true`. A field is left out when it would be empty. With `?history=none` both are left out (the rest of the answer is the same): a client that polls often can take the curves less often and keep the ones it has. `needs` (beside `services`) lists what needs the user's attention, worst first: `{service_id, service_name, key, level, label, since, acked}` for each need of those services, `level` being `warn` or `bad`, `label` the text in the request's language (without the service's name, which is `service_name`: show them side by side), `since` the time the need began in Unix seconds and `acked` whether the user has acknowledged it on the page and it has not got worse since (an acknowledgement is made on the start page only; a token cannot make one). A need that only an admin can act on (a service whose settings must be set up again) is listed only when the user is an admin and the request is their session or the browser extension's token; any other token never gets it. A service the user may not see is left out entirely, with its needs. Pages and the extension never wait for the service itself: this is the stored reading, and its age is `now - fetched_at`. Any API token opens it (read access is enough); a session cookie never does. Never cached (`Cache-Control: no-store`).",
     )
     .res(ME_VALUES_EXAMPLE),
     r(
@@ -117,8 +118,29 @@ struct StartDoc {
 }
 
 /// `GET /api/v1/me/start`.
+/// The language of a `/api/v1/me/*` answer: the one the request asks for
+/// (`Accept-Language`; the extension sends the language it draws its own
+/// strings in), else the site's, else the default. The kit leaves `/api/`
+/// paths without a language, so these two routes choose their own.
+async fn request_language(core: &Core, headers: &HeaderMap) -> i18n::Lang {
+    match i18n::negotiate(headers) {
+        Some(lang) => lang,
+        None => i18n::site_language(core).await.unwrap_or_default(),
+    }
+}
+
 async fn me_start(
     State(core): State<Core>,
+    user: CurrentUser,
+    method: Option<Extension<AuthMethod>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let lang = request_language(&core, &headers).await;
+    i18n::scope(lang, me_start_in(core, user, method)).await
+}
+
+async fn me_start_in(
+    core: Core,
     user: CurrentUser,
     method: Option<Extension<AuthMethod>>,
 ) -> Result<Response, ApiError> {
@@ -139,14 +161,34 @@ async fn me_start(
         .into_response())
 }
 
+/// The query of `GET /api/v1/me/values`: `history=none` leaves the curves out.
+#[derive(Deserialize)]
+struct ValuesQuery {
+    history: Option<String>,
+}
+
 /// `GET /api/v1/me/values`: the readings of the services bound on the token
-/// owner's layout and visible to them, whole (see [`crate::values`]). Only a
-/// token opens it, as with `/api/v1/me/start`.
+/// user's layout and visible to them, whole (see [`crate::values`]), without
+/// the curves for `?history=none`. Only a token opens it, as with
+/// `/api/v1/me/start`.
 async fn me_values(
     State(core): State<Core>,
     Extension(magpie): Extension<Magpie>,
     user: CurrentUser,
     method: Option<Extension<AuthMethod>>,
+    Query(query): Query<ValuesQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let lang = request_language(&core, &headers).await;
+    i18n::scope(lang, me_values_in(core, magpie, user, method, query)).await
+}
+
+async fn me_values_in(
+    core: Core,
+    magpie: Magpie,
+    user: CurrentUser,
+    method: Option<Extension<AuthMethod>>,
+    query: ValuesQuery,
 ) -> Result<Response, ApiError> {
     if !matches!(method, Some(Extension(AuthMethod::Token { .. }))) {
         return Err(ApiError::Unauthorized);
@@ -155,7 +197,13 @@ async fn me_values(
         return Err(ApiError::Forbidden);
     }
     let (layout, _) = layout::load_or_default(&core, user.id).await?;
-    let doc = values_for(&core, &magpie.poller, Viewer::for_token(&user), &layout).await?;
+    let mut doc = values_for(&core, &magpie.poller, Viewer::for_token(&user), &layout).await?;
+    if query.history.as_deref() == Some("none") {
+        for entry in doc.services.values_mut() {
+            entry.history.clear();
+            entry.history_daily.clear();
+        }
+    }
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(doc)).into_response())
 }
 

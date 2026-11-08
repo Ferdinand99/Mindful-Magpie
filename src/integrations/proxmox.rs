@@ -81,36 +81,43 @@ static METRICS: [MetricDef; 7] = [
         id: "nodes_online",
         label_key: "metric.pve_nodes_online",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "nodes_total",
         label_key: "metric.pve_nodes_total",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "guests_running",
         label_key: "metric.pve_guests_running",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "guests_total",
         label_key: "metric.pve_guests_total",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "cpu",
         label_key: "metric.pve_cpu",
         format: Format::Percent,
+        peak: false,
     },
     MetricDef {
         id: "ram",
         label_key: "metric.pve_ram",
         format: Format::Percent,
+        peak: false,
     },
     MetricDef {
         id: "storage_max",
         label_key: "metric.pve_storage_max",
         format: Format::Percent,
+        peak: false,
     },
 ];
 

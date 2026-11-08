@@ -20,8 +20,8 @@
 //! status dot, how long ago it was first seen at the right; no link, since
 //! this kind has no public address of the app). The numbers of the summary
 //! are the card's metrics, so no block repeats them; a reading with today's
-//! visitors also gets «Visitors», the curve of that number over the last 24
-//! hours from Magpie's own history. Titles and project names come from
+//! visitors also gets «Visitors per hour», bars drawn from Magpie's own
+//! history of that number (a counter that starts again at midnight). Titles and project names come from
 //! outside and go only into the blocks.
 
 use std::collections::BTreeMap;
@@ -66,36 +66,43 @@ static METRICS: [MetricDef; 7] = [
         id: "new_issues",
         label_key: "metric.kk_new_issues",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "regressed_issues",
         label_key: "metric.kk_regressed_issues",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "unresolved_issues",
         label_key: "metric.kk_unresolved_issues",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "crash_free",
         label_key: "metric.kk_crash_free",
         format: Format::Percent,
+        peak: false,
     },
     MetricDef {
         id: "visitors_today",
         label_key: "metric.kk_visitors_today",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "app_users_today",
         label_key: "metric.kk_app_users_today",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "newest_issue",
         label_key: "metric.kk_newest_issue",
         format: Format::Text,
+        peak: false,
     },
 ];
 
@@ -252,9 +259,9 @@ fn read_summary(doc: &Json) -> Result<Snapshot, FetchError> {
         .is_some_and(|v| v.num.is_some())
     {
         snapshot.details.push(Block::Spark {
-            title_key: "kk_visitors".to_string(),
+            title_key: "kk_visitors_hourly".to_string(),
             metric: "visitors_today".to_string(),
-            style: SparkStyle::Line,
+            style: SparkStyle::Counter,
             daily: false,
         });
     }

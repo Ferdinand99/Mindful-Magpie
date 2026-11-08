@@ -583,8 +583,9 @@ a.mm-li-text:hover {
 }
 
 /* A curve (spark): an inline SVG of a metric's last 24 hours, as wide as the block. A line is
-   drawn in the brand colour; an up/down strip has one cell per half hour, coloured like the
-   strip's cells (blank where there was no reading). */
+   drawn in the brand colour (broken where readings are missing); an up/down strip has one cell per
+   half hour, coloured like the strip's cells (blank where there was no reading); a counter has a
+   bar per hour in the brand colour. */
 .mm-spark {
   display: block;
   height: 28px;
@@ -605,6 +606,9 @@ a.mm-li-text:hover {
   stroke-width: 1.5px;
   stroke-linejoin: round;
   stroke-linecap: round;
+}
+.mm-spark-bar {
+  fill: var(--brand);
 }
 .mm-spark-cell {
   fill: var(--fill);

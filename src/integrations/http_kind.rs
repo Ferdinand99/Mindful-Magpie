@@ -83,16 +83,19 @@ static METRICS: [MetricDef; 3] = [
         id: "status",
         label_key: "metric.http_status",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "latency_ms",
         label_key: "metric.http_latency",
         format: Format::Number,
+        peak: false,
     },
     MetricDef {
         id: "checked",
         label_key: "metric.http_checked",
         format: Format::Since,
+        peak: false,
     },
 ];
 

@@ -170,6 +170,11 @@ pub struct MetricDef {
     pub id: &'static str,
     pub label_key: &'static str,
     pub format: Format,
+    /// Whether the history keeps the highest reading of a 5-minute slot
+    /// instead of the latest (see [`crate::history`]): for a count of things
+    /// that are down, so that a short outage inside a slot is not overwritten
+    /// by the reading after it.
+    pub peak: bool,
 }
 
 /// How a metric's number is drawn, and what its unit is.
