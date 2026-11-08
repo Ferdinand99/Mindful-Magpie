@@ -1341,6 +1341,13 @@ async fn the_review_list_has_the_title_the_repository_and_author_the_age_and_a_l
     assert_eq!(items[0].text, "Fix the parser");
     assert_eq!(items[0].sub.as_deref(), Some("acme/parser \u{b7} kari"));
     assert_eq!(items[0].right.as_deref(), Some("2d"));
+    // The moment, for the page to count from; the text stays for an older
+    // page.
+    let at = items[0].at.expect("a moment");
+    assert!(
+        (Timestamp::now().as_second() - at - 2 * 86_400).abs() < 86_400,
+        "{at}"
+    );
     assert_eq!(
         items[0].href.as_deref(),
         Some("https://github.com/acme/parser/pull/12")
@@ -1577,6 +1584,10 @@ async fn the_releases_list_has_the_tag_the_repository_the_age_and_a_link() {
     assert_eq!(num(&snapshot, "releases_24h"), Some(2.0));
     let blocks = details(&snapshot);
     let items = list_of(&blocks, "gh_releases").expect("a releases list");
+    assert!(
+        items.iter().all(|i| i.at.is_some()),
+        "every release has its moment"
+    );
     let rows: Vec<_> = items
         .iter()
         .map(|i| {

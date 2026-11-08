@@ -1118,10 +1118,29 @@ async fn the_last_run_is_a_fact_with_its_result_and_the_day_is_counted() {
     assert_eq!(
         facts(&blocks, "ww_last_run").expect("the facts"),
         [
-            ("ww_run_failed", "target-1 · Server-1 · 1 h"),
+            ("ww_run_failed", "target-1 · Server-1"),
+            ("ww_run_at", "1 h"),
             ("ww_runs_updated_24h", "2"),
             ("ww_runs_failed_24h", "1"),
         ]
+    );
+    // When it was is a moment the page counts from (the text stays for an
+    // older page); the other rows are not moments.
+    let Some(Block::Facts { rows, .. }) = blocks
+        .iter()
+        .find(|b| matches!(b, Block::Facts { title_key, .. } if title_key == "ww_last_run"))
+    else {
+        panic!("the facts")
+    };
+    let at = rows[1].at.expect("a moment");
+    assert!(
+        (jiff::Timestamp::now().as_second() - at - 3600).abs() < 120,
+        "{at}"
+    );
+    assert!(
+        rows.iter()
+            .enumerate()
+            .all(|(i, r)| (i == 1) == r.at.is_some())
     );
 
     // A status the kind does not know still gets a label; no runs, no block.

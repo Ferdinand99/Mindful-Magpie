@@ -2,7 +2,7 @@
 //! of the last check and the range of the last hour, which is kept in memory per
 //! stored service until history is kept in the database.
 
-use mindful_magpie::integrations::block::{self, Block};
+use mindful_magpie::integrations::block::{self, Block, SparkStyle};
 use mindful_magpie::integrations::{self, FetchCtx, Snapshot, Status};
 use serde_json::json;
 
@@ -105,7 +105,19 @@ async fn one_answer_makes_no_range_and_the_card_numbers_are_not_repeated() {
     site.route("/", Answer::Status(200));
     let snapshot = check(&format!("{base}/"), Some(1)).await;
     assert_eq!(snapshot.values["status"].num, Some(200.0));
-    assert!(stored(snapshot).is_empty());
+    // Only the curve of the response time, which the page draws from its
+    // own history.
+    assert_eq!(stored(snapshot), vec![latency_curve()]);
+}
+
+/// The block of the response time's curve.
+fn latency_curve() -> Block {
+    Block::Spark {
+        title_key: "http_latency_24h".into(),
+        metric: "latency_ms".into(),
+        style: SparkStyle::Line,
+        daily: false,
+    }
 }
 
 #[tokio::test]
@@ -118,9 +130,12 @@ async fn a_bad_status_still_has_a_window_and_a_silent_site_does_not_break_it() {
     assert_eq!(snapshot.status, Status::Bad);
     let blocks = stored(snapshot);
     assert_eq!(facts(&blocks, "http_last_hour").unwrap()[1].1, "2");
+    // The curve comes first: it is the card's picture.
+    assert_eq!(blocks[0], latency_curve());
 
-    // A site that does not answer has no window yet: nothing to show.
+    // A site that does not answer has no window yet: only the curve of what
+    // it answered before.
     let snapshot = check("http://127.0.0.1:1/", Some(22)).await;
     assert_eq!(snapshot.status, Status::Bad);
-    assert!(stored(snapshot).is_empty());
+    assert_eq!(stored(snapshot), vec![latency_curve()]);
 }

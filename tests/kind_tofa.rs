@@ -726,10 +726,8 @@ async fn names_and_titles_from_tofa_never_reach_a_need_or_the_error() {
     let blocks = details(&s);
     let items = list_of(&blocks, "tofa_playing").unwrap();
     assert_eq!(items[0].text, "Film 0");
-    assert_eq!(
-        items[0].sub.as_deref(),
-        Some("user0 \u{b7} Tofa Web \u{b7} transcode")
-    );
+    assert_eq!(items[0].sub.as_deref(), Some("user0 \u{b7} Tofa Web"));
+    assert_eq!(items[0].badge_key.as_deref(), Some("tofa_transcode"));
     // The library name too, and nowhere else but the details.
     let libraries = list_of(&blocks, "tofa_libraries").unwrap();
     assert!(libraries[0].text.starts_with("Hemmelig"));
@@ -937,13 +935,16 @@ async fn every_session_is_a_line_of_the_now_playing_list() {
     assert_eq!(items[0].right, None, "the progress is in the bars");
     assert_eq!(items[0].status, Some(Status::Ok));
     assert_eq!(items[0].href, None);
-    // Paused: a warning. A transcode says so in the second line. No duration:
-    // no progress.
+    assert_eq!(items[0].badge_key, None, "no transcode, no badge");
+    // Paused: a warning. A transcode has a badge (a word the page shows in the
+    // reader's language), not a word in the second line. No duration: no
+    // progress.
     assert_eq!(items[1].text, "Alien");
     assert_eq!(
         items[1].sub.as_deref(),
-        Some("Ola (Main) \u{b7} Living room TV \u{b7} transcode")
+        Some("Ola (Main) \u{b7} Living room TV")
     );
+    assert_eq!(items[1].badge_key.as_deref(), Some("tofa_transcode"));
     assert_eq!(items[1].status, Some(Status::Warn));
     // Progress: one bar for the session that has one, with its title.
     let bars = bars_of(&blocks).expect("a progress block");

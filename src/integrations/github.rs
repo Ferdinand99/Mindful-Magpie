@@ -1162,6 +1162,7 @@ fn details(answer: &Answer, ci: &[Option<Ci>], now: Timestamp) -> Vec<Block> {
             status: None,
             right: review.created.map(|at| age(at, now)),
             href: review.url.clone(),
+            at: review.created.map(Timestamp::as_second),
             ..Default::default()
         })
         .collect();
@@ -1209,6 +1210,7 @@ fn details(answer: &Answer, ci: &[Option<Ci>], now: Timestamp) -> Vec<Block> {
             status: None,
             right: Some(age(release.at, now)),
             href: Some(release.url.clone()),
+            at: Some(release.at.as_second()),
             ..Default::default()
         })
         .collect();

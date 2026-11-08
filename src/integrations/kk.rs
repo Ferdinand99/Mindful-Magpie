@@ -19,8 +19,10 @@
 //! issues» (newest first; project name below the title, the level as the
 //! status dot, how long ago it was first seen at the right; no link, since
 //! this kind has no public address of the app). The numbers of the summary
-//! are the card's metrics, so no block repeats them. Titles and project names
-//! come from outside and go only into the blocks.
+//! are the card's metrics, so no block repeats them; a reading with today's
+//! visitors also gets «Visitors», the curve of that number over the last 24
+//! hours from Magpie's own history. Titles and project names come from
+//! outside and go only into the blocks.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -29,7 +31,7 @@ use jiff::Timestamp;
 use serde_json::Value as Json;
 
 use super::api::{self, OldAddresses, Reply};
-use super::block::{Block, ListItem, MAX_ITEMS, TEXT_CHARS};
+use super::block::{Block, ListItem, MAX_ITEMS, SparkStyle, TEXT_CHARS};
 use super::{
     BoxFuture, FetchCtx, FetchError, Field, FieldKind, Format, Integration, Level, MetricDef, Need,
     Snapshot, Status, Value,
@@ -159,6 +161,7 @@ fn newest_issues(doc: &Json, now: Timestamp) -> Option<Block> {
                         .and_then(level_status),
                     right: first_seen.map(|at| api::age_text(at, now)),
                     href: None,
+                    at: first_seen.map(Timestamp::as_second),
                     ..Default::default()
                 },
             ))
@@ -244,6 +247,17 @@ fn read_summary(doc: &Json) -> Result<Snapshot, FetchError> {
     snapshot.details = newest_issues(doc, snapshot.fetched_at)
         .into_iter()
         .collect();
+    if values
+        .get("visitors_today")
+        .is_some_and(|v| v.num.is_some())
+    {
+        snapshot.details.push(Block::Spark {
+            title_key: "kk_visitors".to_string(),
+            metric: "visitors_today".to_string(),
+            style: SparkStyle::Line,
+            daily: false,
+        });
+    }
     snapshot.values = values;
     snapshot.needs = needs;
     Ok(snapshot)

@@ -6,12 +6,12 @@
 //! The service's secret, when it has one, is sent as `Authorization: Bearer`,
 //! and then a redirect to another origin is refused.
 //!
-//! **Details.** For a stored service, the shortest, mean and longest response
-//! time of the last hour (the status, the response time and when it was
-//! checked are metrics already). The hour is a small window kept in memory per
-//! service (at most
-//! [`WINDOW_MAX`] answers; forgotten when the service is saved or tested, see
-//! [`api::on_forget`]) until history is kept in the database.
+//! **Details.** «Response time, 24 h», the curve of the response time drawn
+//! from Magpie's own history of it, and, for a stored service, the shortest,
+//! mean and longest response time of the last hour (the status, the response
+//! time and when it was checked are metrics already). The hour is a small
+//! window kept in memory per service (at most [`WINDOW_MAX`] answers;
+//! forgotten when the service is saved or tested, see [`api::on_forget`]).
 
 use std::collections::VecDeque;
 use std::ops::RangeInclusive;
@@ -24,7 +24,7 @@ use url::Url;
 use vole_kit::net::check_host;
 
 use super::api;
-use super::block::{Block, Fact};
+use super::block::{Block, Fact, SparkStyle};
 use super::{
     BoxFuture, FetchCtx, FetchError, Field, FieldKind, Format, Integration, MetricDef,
     SettingError, Snapshot, Status, Value, classify, read_capped,
@@ -189,25 +189,35 @@ fn fact(label_key: &str, value: String) -> Fact {
     }
 }
 
-/// The block of the last hour's range: shortest, mean and longest response
-/// time, and how many answers the window holds. Nothing until it holds at
+/// The curve of the response time over the last 24 hours, then the block of
+/// the last hour's range: shortest, mean and longest response time, and how
+/// many answers the window holds. The range waits until the window holds at
 /// least two answers (one says nothing a range could). The status, the
 /// response time and when it was checked are the card's metrics, so no block
 /// repeats them.
 fn details(hour: Option<Range>) -> Vec<Block> {
-    let Some(hour) = hour.filter(|r| r.count >= 2) else {
-        return Vec::new();
+    let curve = Block::Spark {
+        title_key: "http_latency_24h".to_string(),
+        metric: "latency_ms".to_string(),
+        style: SparkStyle::Line,
+        daily: false,
     };
-    vec![Block::Facts {
-        title_key: "http_last_hour".to_string(),
-        rows: vec![
-            fact(
-                "http_latency_range",
-                format!("{:.0} / {:.0} / {:.0} ms", hour.min, hour.mean, hour.max),
-            ),
-            fact("http_samples", hour.count.to_string()),
-        ],
-    }]
+    let Some(hour) = hour.filter(|r| r.count >= 2) else {
+        return vec![curve];
+    };
+    vec![
+        curve,
+        Block::Facts {
+            title_key: "http_last_hour".to_string(),
+            rows: vec![
+                fact(
+                    "http_latency_range",
+                    format!("{:.0} / {:.0} / {:.0} ms", hour.min, hour.mean, hour.max),
+                ),
+                fact("http_samples", hour.count.to_string()),
+            ],
+        },
+    ]
 }
 
 /// `snapshot` with the `checked` metric: when the reading was taken, also when

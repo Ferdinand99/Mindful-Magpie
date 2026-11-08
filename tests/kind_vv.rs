@@ -807,8 +807,17 @@ async fn the_down_list_has_name_message_age_and_a_bad_status() {
     assert_eq!(items[0].href, None);
     assert_eq!(items[1].sub, None);
     assert_eq!(items[1].right.as_deref(), Some("3 h"));
-    // Nothing has recovered yet.
+    // Since when, for the page to count from; the text stays for an older page.
+    let at = items[0].at.expect("a moment");
+    assert!(
+        (jiff::Timestamp::now().as_second() - at - 12 * 60).abs() < 120,
+        "{at}"
+    );
+    // Nothing has recovered yet. The strip of the last day comes after the
+    // list.
     assert!(list(&blocks, "vv_recovered").is_none());
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[1], last_day());
 }
 
 #[tokio::test]
@@ -844,9 +853,20 @@ async fn hostile_monitor_text_stays_text() {
     }
 }
 
+/// «Last 24 hours»: the strip the page draws from its history of `down`.
+fn last_day() -> Block {
+    Block::Spark {
+        title_key: "vv_last_24h".into(),
+        metric: "down".into(),
+        style: block::SparkStyle::UpDown,
+        daily: false,
+    }
+}
+
 #[tokio::test]
 async fn an_old_server_without_a_down_list_gets_no_list() {
-    // A summary with no `down`, or a null one.
+    // A summary with no `down`, or a null one: no list, only the strip of the
+    // count (Magpie keeps its history itself).
     for strip in [true, false] {
         let mut body = summary(5, 1, 0, 0, 0);
         if strip {
@@ -855,7 +875,7 @@ async fn an_old_server_without_a_down_list_gets_no_list() {
             body["down"] = Json::Null;
         }
         let (url, _) = serve(Answer::Json(body), Answer::Status(500)).await;
-        assert!(stored(fetch(&url).await).is_empty());
+        assert_eq!(stored(fetch(&url).await), vec![last_day()]);
     }
     // And a server that has only `/health`.
     let health =
@@ -863,7 +883,7 @@ async fn an_old_server_without_a_down_list_gets_no_list() {
     let (url, _) = serve(Answer::Status(404), Answer::Json(health)).await;
     let snapshot = fetch(&url).await;
     assert_eq!(snapshot.values["down"].num, Some(1.0));
-    assert!(stored(snapshot).is_empty());
+    assert_eq!(stored(snapshot), vec![last_day()]);
 }
 
 #[tokio::test]
@@ -890,6 +910,11 @@ async fn monitors_that_left_the_list_are_recovered_until_the_service_is_saved() 
     assert_eq!(recovered[0].text, "Alpha");
     assert_eq!(recovered[0].status, Some(Status::Ok));
     assert_eq!(recovered[0].right.as_deref(), Some("0 s"));
+    let at = recovered[0].at.expect("when it was seen back");
+    assert!(
+        (jiff::Timestamp::now().as_second() - at).abs() < 120,
+        "{at}"
+    );
     // It is still remembered at the next fetch, and Beta is still down.
     let third = stored(fetch(&base).await);
     assert_eq!(list(&third, "vv_recovered").unwrap()[0].text, "Alpha");

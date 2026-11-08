@@ -15,11 +15,13 @@
 //! metric.
 //!
 //! **Details.** A summary that lists `down` gives the list «Down now» (name,
-//! message, how long). The kind also remembers, in memory per address, which
+//! message, since when). The kind also remembers, in memory per address, which
 //! monitors were down at the last fetch: one that has left the list since is
-//! «Recently recovered» for 24 hours. Saving or testing the service forgets
-//! that memory (see [`api::on_forget`]). An older server whose summary has no
-//! `down` list gets neither block.
+//! «No longer down» for 24 hours. Saving or testing the service forgets that
+//! memory (see [`api::on_forget`]). An older server whose summary has no
+//! `down` list gets neither list. Every reading with a `down` count also gets
+//! «Last 24 hours», a strip drawn from Magpie's own history of that count (a
+//! red cell where something was down).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
@@ -29,7 +31,7 @@ use jiff::Timestamp;
 use serde_json::Value as Json;
 
 use super::api::{self, OldAddresses, Reply};
-use super::block::{Block, ListItem, MAX_ITEMS, TEXT_CHARS};
+use super::block::{Block, ListItem, MAX_ITEMS, SparkStyle, TEXT_CHARS};
 use super::{
     BoxFuture, FetchCtx, FetchError, Field, FieldKind, Format, Integration, Level, MetricDef, Need,
     Snapshot, Status, Value,
@@ -339,49 +341,62 @@ fn forget(prefix: &str) {
         .retain(|(key, _)| key != prefix);
 }
 
-/// The blocks of a summary: «Down now» and «Recently recovered». None without
-/// a `down` list in the answer.
+/// «Last 24 hours»: the strip of the `down` count's history, when the reading
+/// has the count.
+fn last_day(reading: &Reading) -> Option<Block> {
+    reading.down.map(|_| Block::Spark {
+        title_key: "vv_last_24h".to_string(),
+        metric: "down".to_string(),
+        style: SparkStyle::UpDown,
+        daily: false,
+    })
+}
+
+/// The blocks of a summary: «Down now», «Last 24 hours» and «No longer down».
+/// Without a `down` list in the answer only the strip.
 fn details(key: &str, reading: &Reading, now: Timestamp) -> Vec<Block> {
     let Some(down) = &reading.down_list else {
-        return Vec::new();
+        return last_day(reading).into_iter().collect();
     };
     let cut_short = reading.down.is_some_and(|n| n > down.len() as f64);
     let recovered = remember(key, |memory| {
         memory.track(now, down, cut_short);
         memory.recovered.clone()
     });
-    vec![
-        Block::List {
-            title_key: "vv_down_now".to_string(),
-            items: down
-                .iter()
-                .take(MAX_ITEMS)
-                .map(|d| ListItem {
-                    text: d.name.clone(),
-                    sub: d.message.clone(),
-                    status: Some(Status::Bad),
-                    right: d.since.map(|since| api::age_text(since, now)),
-                    href: None,
-                    ..Default::default()
-                })
-                .collect(),
-        },
-        Block::List {
-            title_key: "vv_recovered".to_string(),
-            items: recovered
-                .iter()
-                .take(MAX_ITEMS)
-                .map(|r| ListItem {
-                    text: r.name.clone(),
-                    sub: None,
-                    status: Some(Status::Ok),
-                    right: Some(api::age_text(r.at, now)),
-                    href: None,
-                    ..Default::default()
-                })
-                .collect(),
-        },
-    ]
+    let mut blocks = vec![Block::List {
+        title_key: "vv_down_now".to_string(),
+        items: down
+            .iter()
+            .take(MAX_ITEMS)
+            .map(|d| ListItem {
+                text: d.name.clone(),
+                sub: d.message.clone(),
+                status: Some(Status::Bad),
+                right: d.since.map(|since| api::age_text(since, now)),
+                href: None,
+                at: d.since.map(Timestamp::as_second),
+                ..Default::default()
+            })
+            .collect(),
+    }];
+    blocks.extend(last_day(reading));
+    blocks.push(Block::List {
+        title_key: "vv_recovered".to_string(),
+        items: recovered
+            .iter()
+            .take(MAX_ITEMS)
+            .map(|r| ListItem {
+                text: r.name.clone(),
+                sub: None,
+                status: Some(Status::Ok),
+                right: Some(api::age_text(r.at, now)),
+                href: None,
+                at: Some(r.at.as_second()),
+                ..Default::default()
+            })
+            .collect(),
+    });
+    blocks
 }
 
 async fn read(ctx: &FetchCtx) -> Result<Snapshot, FetchError> {
@@ -405,7 +420,9 @@ async fn read(ctx: &FetchCtx) -> Result<Snapshot, FetchError> {
     // here too is not Vigilant Vole, or older than any this kind knows.
     let url = api::endpoint(&base, &path("health"), None)?;
     let doc: Json = api::get_json(&ctx.http, url, &auth).await?.found()?;
-    health(&doc).map(snapshot)
+    let reading = health(&doc)?;
+    let blocks = last_day(&reading).into_iter().collect();
+    Ok(snapshot(reading).with_details(blocks))
 }
 
 impl Integration for VvKind {

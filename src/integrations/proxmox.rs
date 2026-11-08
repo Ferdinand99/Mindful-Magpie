@@ -371,6 +371,19 @@ fn byte_bar(label: String, item: &Json, used: &str, max: &str) -> Option<Bar> {
     })
 }
 
+/// `bar` coloured as a disk is: yellow from [`STORAGE_WARN`] and red from
+/// [`STORAGE_BAD`] (the thresholds of the storage needs), neutral below.
+fn disk_fill(mut bar: Bar) -> Bar {
+    bar.status = if bar.pct >= STORAGE_BAD {
+        Some(Status::Bad)
+    } else if bar.pct >= STORAGE_WARN {
+        Some(Status::Warn)
+    } else {
+        None
+    };
+    bar
+}
+
 /// Most nodes a block shows when the disk bars have gone too: two bars each.
 const MAX_NODES_SHORT: usize = MAX_ITEMS / 2;
 
@@ -417,7 +430,7 @@ fn node_blocks(doc: &Json) -> Vec<Block> {
             }
             bars.extend(byte_bar(label("RAM"), node, "mem", "maxmem"));
             if with_disk {
-                bars.extend(byte_bar(label("Disk"), node, "disk", "maxdisk"));
+                bars.extend(byte_bar(label("Disk"), node, "disk", "maxdisk").map(disk_fill));
             }
         }
         bars
@@ -618,7 +631,7 @@ fn storage_bars(doc: &Json) -> Option<Block> {
             };
             // Only a storage that gives a bar counts as seen: a shared one
             // that is unreadable on one node may be readable on the next.
-            let bar = byte_bar(label, storage, "disk", "maxdisk")?;
+            let bar = disk_fill(byte_bar(label, storage, "disk", "maxdisk")?);
             seen.insert((name, place));
             Some(bar)
         })

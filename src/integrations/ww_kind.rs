@@ -423,9 +423,11 @@ fn ready_list(targets: &[Target]) -> Option<Block> {
     })
 }
 
-/// The newest run (the highest id) as a fact whose label is its result, and
-/// how many updates went through and failed in the last 24 hours. `None`
-/// without a run.
+/// The newest run (the highest id) as a fact whose label is its result and
+/// whose value names the target and the server, a fact of when it was (`at`,
+/// with the age as text for an older page), and how many updates went through
+/// and failed in the last 24 hours. A run without names has its time as the
+/// value of the first fact. `None` without a run.
 fn last_run_facts(runs: &[Run], now: Timestamp) -> Option<Block> {
     let newest = runs.iter().max_by_key(|run| run.id)?;
     let status = newest.status.as_deref().unwrap_or_default();
@@ -434,25 +436,40 @@ fn last_run_facts(runs: &[Run], now: Timestamp) -> Option<Block> {
         | "refused" | "cancelled" | "lapsed" => format!("ww_run_{status}"),
         _ => "ww_run_other".to_string(),
     };
-    let value = [
+    let names = [
         text(newest.target.as_ref().and_then(|t| t.name.as_deref())),
         text(newest.server.as_ref().and_then(|s| s.name.as_deref())),
-        newest.time().map(|at| api::age_text(at, now)),
     ]
     .into_iter()
     .flatten()
     .collect::<Vec<_>>()
     .join(" · ");
-    let mut rows = vec![Fact {
-        label_key: Some(label_key),
-        label: None,
-        value: if value.is_empty() {
-            "-".to_string()
-        } else {
-            value
-        },
-        ..Default::default()
-    }];
+    let when = newest.time();
+    let age = when.map(|at| api::age_text(at, now));
+    let mut rows = if names.is_empty() {
+        vec![Fact {
+            label_key: Some(label_key),
+            label: None,
+            value: age.unwrap_or_else(|| "-".to_string()),
+            at: when.map(Timestamp::as_second),
+        }]
+    } else {
+        let mut rows = vec![Fact {
+            label_key: Some(label_key),
+            label: None,
+            value: names,
+            ..Default::default()
+        }];
+        if let (Some(at), Some(age)) = (when, age) {
+            rows.push(Fact {
+                label_key: Some("ww_run_at".to_string()),
+                label: None,
+                value: age,
+                at: Some(at.as_second()),
+            });
+        }
+        rows
+    };
     let (mut updated, mut failed) = (0, 0);
     for run in runs {
         let status = run.status.as_deref().unwrap_or_default();
@@ -505,6 +522,9 @@ fn agents_list(servers: &[Server], now: Timestamp) -> Option<Block> {
                     .filter(|_| status != Status::Ok)
                     .map(|at| api::age_text(at, now)),
                 href: None,
+                at: seen
+                    .filter(|_| status != Status::Ok)
+                    .map(Timestamp::as_second),
                 ..Default::default()
             })
         })

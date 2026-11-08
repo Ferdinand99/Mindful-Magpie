@@ -15,7 +15,7 @@ use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use jiff::{SignedDuration, Timestamp};
-use mindful_magpie::integrations::block::{self, Block};
+use mindful_magpie::integrations::block::{self, Block, SparkStyle};
 use mindful_magpie::integrations::{
     self, FetchCtx, FetchError, Integration, Level, Snapshot, Status,
 };
@@ -856,6 +856,13 @@ async fn the_newest_issues_are_listed_newest_first_with_project_level_and_age() 
     assert_eq!(items[0].sub.as_deref(), Some("hedgerow-ios"));
     assert_eq!(items[0].status, Some(Status::Bad));
     assert_eq!(items[0].right.as_deref(), Some("14 min"));
+    // The moment it was first seen, for the page to count from (the text
+    // stays for an older page).
+    let at = items[0].at.expect("a moment");
+    assert!(
+        (jiff::Timestamp::now().as_second() - at - 14 * 60).abs() < 120,
+        "{at}"
+    );
     assert_eq!(items[1].status, None);
     assert_eq!(items[1].right.as_deref(), Some("2 h"));
     assert_eq!(items[2].status, Some(Status::Warn));
@@ -870,7 +877,16 @@ async fn the_numbers_of_the_summary_are_not_repeated_in_a_block() {
     let (url, _) = serve(200, summary(totals(0, 0, 4), vec![])).await;
     let snapshot = fetch(&url, Some(TOKEN)).await.unwrap();
     assert_eq!(num(&snapshot, "visitors_today"), Some(120.0));
-    assert!(stored(snapshot).is_empty());
+    // Only the curve of today's visitors, drawn from the page's history.
+    assert_eq!(
+        stored(snapshot),
+        vec![Block::Spark {
+            title_key: "kk_visitors".into(),
+            metric: "visitors_today".into(),
+            style: SparkStyle::Line,
+            daily: false,
+        }]
+    );
 }
 
 #[tokio::test]

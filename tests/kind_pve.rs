@@ -967,6 +967,51 @@ async fn storage_is_listed_by_use_with_a_shared_storage_once() {
 }
 
 #[tokio::test]
+async fn storage_and_node_disk_bars_turn_yellow_and_red_at_the_thresholds_of_the_needs() {
+    let mut doc = cluster();
+    for item in doc["data"].as_array_mut().unwrap() {
+        match item["id"].as_str() {
+            Some("storage/pve1/local") => item["disk"] = json!(96 * GIB),
+            Some("storage/pve2/local") => item["disk"] = json!(85 * GIB),
+            Some("node/pve2") => item["disk"] = json!(90 * GIB),
+            _ => {}
+        }
+    }
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let s = fetch(&url).await;
+    let storage: Vec<_> = bars_of(&s, "pve_storage")
+        .unwrap()
+        .iter()
+        .map(|b| (b.label.as_str(), b.status))
+        .collect();
+    assert_eq!(
+        storage,
+        [
+            ("local · pve1", Some(Status::Bad)),
+            ("local · pve2", Some(Status::Warn)),
+            ("nas", None),
+        ]
+    );
+    let nodes: Vec<_> = bars_of(&s, "pve_nodes")
+        .unwrap()
+        .iter()
+        .map(|b| (b.label.as_str(), b.status))
+        .collect();
+    assert_eq!(
+        nodes,
+        [
+            ("pve1 CPU", None),
+            ("pve1 RAM", None),
+            ("pve1 Disk", None),
+            ("pve2 CPU", None),
+            ("pve2 RAM", None),
+            ("pve2 Disk", Some(Status::Warn)),
+        ],
+        "CPU and RAM stay neutral"
+    );
+}
+
+#[tokio::test]
 async fn the_blocks_come_in_the_order_of_the_card_and_every_key_resolves() {
     let _app = common::App::new().await;
     let (url, _) = serve(Answer::Json(cluster())).await;

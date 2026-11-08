@@ -363,8 +363,9 @@ fn used_of(used_kib: f64, size_kib: f64) -> String {
 }
 
 /// One bar for a disk or a cache: its name, how full it is, the figures and
-/// the temperature when the answer has it. A disk with no name or no file
-/// system figures has no bar.
+/// the temperature when the answer has it, yellow from [`DISK_WARN`] and red
+/// from [`DISK_BAD`] (the thresholds of the needs). A disk with no name or no
+/// file system figures has no bar.
 fn disk_bar(disk: &Json) -> Option<Bar> {
     let name = api::clean_text(disk.get("name")?.as_str()?, LINE_NAME_CHARS);
     if name.is_empty() {
@@ -375,12 +376,25 @@ fn disk_bar(disk: &Json) -> Option<Bar> {
     if let Some(temp) = amount(disk.get("temp")).filter(|t| *t <= 150.0) {
         text.push_str(&format!(" · {} °C", short_number(temp)));
     }
+    let pct = ratio(used, size)?;
     Some(Bar {
         label: name,
-        pct: ratio(used, size)?,
+        pct,
         text,
-        ..Default::default()
+        status: fill_status(pct),
     })
+}
+
+/// How a disk bar is coloured: yellow and red at the thresholds of the needs,
+/// neutral below them.
+fn fill_status(pct: f64) -> Option<Status> {
+    if pct >= DISK_BAD {
+        Some(Status::Bad)
+    } else if pct >= DISK_WARN {
+        Some(Status::Warn)
+    } else {
+        None
+    }
 }
 
 /// «Disker»: the data disks and then the caches. More than a block holds: the
@@ -437,35 +451,37 @@ fn parity_facts(data: &Json) -> Option<Block> {
         .and_then(Json::as_bool)
         .unwrap_or(false);
     let mut rows = Vec::new();
-    let mut row = |key: &str, value: Option<String>| {
+    let mut row = |key: &str, value: Option<String>, at: Option<i64>| {
         if let Some(value) = value {
             rows.push(Fact {
                 label_key: Some(key.to_string()),
                 label: None,
                 value,
-                ..Default::default()
+                at,
             });
         }
     };
     if !running {
+        // The page shows how long ago it was; the date is the text for an
+        // older page.
+        let last = parity.get("date").and_then(Json::as_str).and_then(moment);
         row(
             "unraid_parity_last",
-            parity
-                .get("date")
-                .and_then(Json::as_str)
-                .and_then(moment)
-                .and_then(day),
+            last.and_then(day),
+            last.map(|seconds| seconds as i64),
         );
         row(
             "unraid_parity_duration",
             amount(parity.get("duration"))
                 .filter(|s| *s > 0.0)
                 .map(length),
+            None,
         );
     }
     row(
         "unraid_parity_errors",
         api::count(parity.get("errors")).map(|n| format!("{n:.0}")),
+        None,
     );
     (!rows.is_empty()).then(|| Block::Facts {
         title_key: "unraid_parity".into(),

@@ -30,8 +30,9 @@
 //! so it is a nudge, not an alarm.
 //!
 //! **Details.** The reading carries blocks for the card: what is playing (a
-//! list, one line per session: title, «user (profile) · client», and warning
-//! while paused), a bar block with each session's progress, the libraries
+//! list, one line per session: title, «user (profile) · client», a
+//! «Transcoding» badge for a transcode, and warning while paused), a bar block
+//! with each session's progress, the libraries
 //! (worst first, with the episode count) and facts (background tasks, server
 //! version). Titles, library names and user and profile names go into these
 //! blocks only, as text, never into the numbers, the needs or an error. They
@@ -263,8 +264,10 @@ struct LibraryRow {
 #[derive(Debug, Clone, PartialEq)]
 struct Play {
     title: String,
-    /// «user (profile) · client», and «transcode» for a transcode.
+    /// «user (profile) · client».
     sub: Option<String>,
+    /// Whether the server transcodes it (the line's «Transcoding» badge).
+    transcode: bool,
     /// Whole percent played, when the session says where it is and how long
     /// the media is.
     progress: Option<u32>,
@@ -487,7 +490,6 @@ fn read_plays(doc: &Json) -> Vec<Play> {
                     line_of(session, "profile_name"),
                 ),
                 line_of(session, "client_name"),
-                transcode.then(|| "transcode".to_string()),
             ]
             .into_iter()
             .flatten()
@@ -497,6 +499,7 @@ fn read_plays(doc: &Json) -> Vec<Play> {
             Some(Play {
                 title,
                 sub: (!parts.is_empty()).then(|| parts.join(" \u{b7} ")),
+                transcode,
                 progress: position
                     .zip(duration)
                     .map(|(at, of)| (at / of * 100.0).round().clamp(0.0, 100.0) as u32),
@@ -617,6 +620,7 @@ fn details(version: Option<&str>, plays: &[Play], slow: &Slow) -> Vec<Block> {
                     }),
                     right: None,
                     href: None,
+                    badge_key: play.transcode.then(|| "tofa_transcode".to_string()),
                     ..Default::default()
                 })
                 .collect(),
