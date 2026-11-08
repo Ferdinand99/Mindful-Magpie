@@ -1,7 +1,13 @@
-//! Services: the admin's instances of an integration kind (a website, later a
-//! monitor, a code host …), with their address, settings, sealed secret,
-//! fetch interval and who may see them. [`store`] keeps them in the database,
-//! [`pages`] is the admin's Settings page for them.
+//! Services: instances of an integration kind (a website, a monitor, a code
+//! host …), with their address, settings, sealed secret, fetch interval and
+//! who may see them. [`store`] keeps them in the database, [`pages`] holds the
+//! Settings pages for them.
+//!
+//! A service is **shared** (set up by an admin, seen by the people its
+//! visibility names) or **personal** (`owner_user_id` set: a kind such as
+//! `github` whose key is one user's own). A personal service is seen, changed,
+//! tested and used by its user only, admins included: [`Scope`] is how every
+//! store function says which of the two it means.
 //!
 //! A service's secret is sealed (`vole_kit::crypto`, purpose
 //! [`SECRET_PURPOSE`]) and leaves the store only inside a
@@ -24,6 +30,13 @@ use crate::integrations::{self, Integration};
 
 /// The purpose a service's secret is sealed for.
 pub const SECRET_PURPOSE: &str = "magpie.service.secret";
+
+/// The form field (and error field) of the pinned certificate's fingerprint,
+/// the same as its settings key.
+pub const CERT_FIELD: &str = integrations::pin::SETTING;
+
+/// The most personal services one user may have.
+pub const MAX_PERSONAL: i64 = 10;
 
 /// The longest interval an admin may choose (a day).
 pub const MAX_INTERVAL_S: i64 = 86_400;
@@ -84,8 +97,33 @@ impl Visibility {
     }
 }
 
+/// Which services a store call is about: the shared ones, or the personal
+/// ones of one user. A service of the other kind does not exist for the call
+/// (it is not listed, not found, not changed and not deleted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Services set up by an admin (none belongs to a user).
+    Shared,
+    /// The personal services of this user.
+    Personal(i64),
+}
+
+impl Scope {
+    /// The user a service of this scope belongs to (`None` for shared services).
+    pub fn owner(self) -> Option<i64> {
+        match self {
+            Scope::Shared => None,
+            Scope::Personal(user) => Some(user),
+        }
+    }
+
+    pub fn is_personal(self) -> bool {
+        matches!(self, Scope::Personal(_))
+    }
+}
+
 /// Who is asking, for [`store::visible_to`] and [`store::can_see`]. Admins see
-/// every service.
+/// every shared service, and nobody's personal service but their own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Viewer {
     pub id: i64,
@@ -135,6 +173,8 @@ pub struct Service {
     pub visibility: Visibility,
     /// The users who see it when `visibility` is [`Visibility::Users`].
     pub users: Vec<i64>,
+    /// The user a personal service belongs to; `None` for a shared one.
+    pub owner_user_id: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -146,7 +186,8 @@ impl Service {
     }
 }
 
-/// What anyone who may see a service learns about it: no address, no settings.
+/// What anyone who may see a service learns about it: no address, no
+/// settings, only the link a card may point at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceSummary {
     pub id: i64,
@@ -154,6 +195,47 @@ pub struct ServiceSummary {
     pub name: String,
     /// Seconds between fetches; a page needs it to tell a stale value.
     pub interval_s: i64,
+    /// Where a card of the service links when it has no link of its own: the
+    /// service's own «Lenke på kort», else the origin of its address (see
+    /// [`card_link`]). Empty when the service has neither.
+    pub link: String,
+    /// A personal service of the viewer who asked (so they, not an admin, are
+    /// the one who sets it up again when it needs that).
+    pub personal: bool,
+}
+
+/// The setting that holds a service's «Lenke på kort». It is not a field of
+/// any kind: it is kept in the settings object next to them, reserved for
+/// this, and nothing fetches it.
+pub const LINK_KEY: &str = "link";
+
+/// The link a card of a service points at when it has none of its own: the
+/// service's `link` setting if it has one, else the origin of its address
+/// (scheme, host and port: no user name, path or query), else empty.
+pub fn card_link(settings: &Json, url: Option<&str>) -> String {
+    card_link_for(None, settings, url)
+}
+
+/// [`card_link`] for the kind `kind`: the service's own link, else the kind's
+/// [`Integration::default_link`], else the origin of the address.
+pub fn card_link_for(kind: Option<&str>, settings: &Json, url: Option<&str>) -> String {
+    if let Some(link) = settings
+        .get(LINK_KEY)
+        .and_then(Json::as_str)
+        .filter(|l| !l.is_empty())
+    {
+        return link.to_string();
+    }
+    if let Some(link) = kind
+        .and_then(integrations::find)
+        .and_then(|k| k.default_link())
+    {
+        return link.to_string();
+    }
+    url.and_then(|u| Url::parse(u.trim()).ok())
+        .filter(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some())
+        .map(|u| u.origin().ascii_serialization())
+        .unwrap_or_default()
 }
 
 /// A change to the set of services, announced after it is stored (the
@@ -240,6 +322,27 @@ pub fn without_userinfo(url: &str) -> String {
     }
 }
 
+/// `settings` as they are stored: a pin in any usual spelling as 64 lowercase
+/// hex characters, an empty one left out.
+pub fn canonical_settings(settings: &Json) -> Json {
+    let mut settings = settings.clone();
+    if let Some(map) = settings.as_object_mut() {
+        let pin = map.get(integrations::pin::SETTING).and_then(Json::as_str);
+        match pin.map(str::trim) {
+            Some("") => {
+                map.remove(integrations::pin::SETTING);
+            }
+            Some(text) => {
+                if let Some(hex) = integrations::pin::normalize(text) {
+                    map.insert(integrations::pin::SETTING.to_string(), Json::String(hex));
+                }
+            }
+            None => {}
+        }
+    }
+    settings
+}
+
 impl ServiceInput {
     /// The kind, if this build has it.
     pub fn integration(&self) -> Option<&'static dyn Integration> {
@@ -257,6 +360,10 @@ impl ServiceInput {
             errors.push(FieldError::new("kind", "err.kind"));
             return errors;
         };
+        // A kind with a fixed address has no address to enter.
+        if kind.personal() && self.url.as_deref().is_some_and(|u| !u.trim().is_empty()) {
+            errors.push(FieldError::new("url", "err.url"));
+        }
         let min = i64::try_from(kind.min_interval().as_secs()).unwrap_or(i64::MAX);
         if self.interval_s < min || self.interval_s > MAX_INTERVAL_S {
             errors.push(FieldError::new("interval", "err.interval"));
@@ -284,15 +391,31 @@ impl ServiceInput {
         }
         let empty = Map::new();
         let settings = self.settings.as_object().unwrap_or(&empty);
+        // «Lenke på kort»: a link for the browser, checked like a card's. It is
+        // never fetched, so what it points at is not checked. Empty is none.
+        if let Some(link) = settings.get(LINK_KEY) {
+            let fine = link.as_str().is_some_and(|l| {
+                l.is_empty()
+                    || (crate::layout::model::link_problem(l).is_none()
+                        && Url::parse(l)
+                            .is_ok_and(|u| u.username().is_empty() && u.password().is_none()))
+            });
+            if !fine {
+                errors.push(FieldError::new("link", "err.link"));
+            }
+        }
         for field in kind.fields().iter().filter(|f| !f.secret && f.required) {
             if !settings.contains_key(field.key) {
                 errors.push(FieldError::new(format!("f_{}", field.key), "err.required"));
             }
         }
         for (key, value) in settings {
-            if value
-                .as_str()
-                .is_some_and(|text| text.chars().count() > 1024)
+            // The pin has its own message, and the link its own limit (2048).
+            if key != integrations::pin::SETTING
+                && key != LINK_KEY
+                && value
+                    .as_str()
+                    .is_some_and(|text| text.chars().count() > 1024)
             {
                 errors.push(FieldError::new(format!("f_{key}"), "err.too_long"));
             }
@@ -302,6 +425,21 @@ impl ServiceInput {
                 format!("f_{}", problem.field),
                 problem.message_key,
             ));
+        }
+        match integrations::pin::from_settings(&self.settings) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                // A pin is for TLS: on a plain-http address it would pin nothing.
+                let https = self
+                    .url
+                    .as_deref()
+                    .and_then(|url| Url::parse(url.trim()).ok())
+                    .is_some_and(|url| url.scheme() == "https");
+                if !https {
+                    errors.push(FieldError::new(CERT_FIELD, "err.fingerprint_https"));
+                }
+            }
+            Err(_) => errors.push(FieldError::new(CERT_FIELD, "err.fingerprint")),
         }
         if let SecretChange::Replace(secret) = &self.secret {
             let has_field = kind.fields().iter().any(|f| f.secret);

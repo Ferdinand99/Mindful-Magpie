@@ -1,6 +1,9 @@
 //! What a page or the extension may know about a service it can see: its
-//! number, name, kind, interval and the metrics a card can show. Never the
-//! address, the settings or the secret (none of them is a field here).
+//! number, name, kind, interval, the metrics a card can show and the link a
+//! card may point at. Never the address, the settings or the secret (none of
+//! them is a field here; the link is the service's «Lenke på kort», or the
+//! origin of its address when there is none, which is the part of the address
+//! a browser needs to open it and no more).
 
 use serde::Serialize;
 use vole_kit::db::DbError;
@@ -9,6 +12,7 @@ use vole_kit::state::Core;
 
 use super::{ServiceSummary, Viewer, store};
 use crate::integrations::{self, Format};
+use crate::layout::Size;
 
 /// One metric a card can show, with its label in the request's language.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -32,13 +36,19 @@ pub struct ServiceView {
     /// The kind's metrics, in its own order. Empty for a kind this build does
     /// not have (a service made by a newer version).
     pub metrics: Vec<MetricView>,
+    /// Where a card of the service links when it has no link of its own.
+    /// Empty when the service has no link and no address.
+    pub link: String,
+    /// The size a card of this service has when its card names none.
+    pub size: Size,
 }
 
 /// The services `viewer` may see, by name, with their metrics. Labels come in
 /// the current request's language (English outside a request).
 ///
-/// Visibility is [`store::visible_to`]'s: admins see every service, anyone
-/// else the ones for everybody and the ones that name them.
+/// Visibility is [`store::visible_to`]'s: admins see every shared service,
+/// anyone else the ones for everybody and the ones that name them, and a
+/// personal service is only its user's.
 pub async fn services_for(
     core: &Core,
     viewer: impl Into<Viewer>,
@@ -61,11 +71,14 @@ pub fn view_of(s: &ServiceSummary) -> ServiceView {
                 .collect()
         })
         .unwrap_or_default();
+    let size = integrations::find(&s.kind).map_or(Size::Normal, |kind| kind.default_size());
     ServiceView {
         id: s.id,
         name: s.name.clone(),
         kind: s.kind.clone(),
         interval_s: s.interval_s,
         metrics,
+        link: s.link.clone(),
+        size,
     }
 }

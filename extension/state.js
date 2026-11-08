@@ -51,8 +51,10 @@ export function startUrl(serverUrl) {
   return `${serverUrl.replace(/\/+$/, "")}/api/v1/me/start`;
 }
 
-export function valuesUrl(serverUrl) {
-  return `${serverUrl.replace(/\/+$/, "")}/api/v1/me/values`;
+// `history: false` asks for the values without the curves (`?history=none`); a server from before
+// the flag sends them anyway, which is harmless.
+export function valuesUrl(serverUrl, { history = true } = {}) {
+  return `${serverUrl.replace(/\/+$/, "")}/api/v1/me/values${history ? "" : "?history=none"}`;
 }
 
 // One GET with the token in the Authorization header and nothing else. `classify(status, body)`
@@ -118,9 +120,34 @@ export function classifyValuesResponse(status, body) {
   return { ok: false, kind: "network" };
 }
 
-export async function fetchValues(fetchImpl, serverUrl, token, timeoutMs = 5000) {
+export async function fetchValues(fetchImpl, serverUrl, token, timeoutMs = 5000, options = {}) {
   if (!serverUrl || !token) return { ok: false, kind: "network" };
-  return getJson(fetchImpl, valuesUrl(serverUrl), token, timeoutMs, classifyValuesResponse);
+  return getJson(fetchImpl, valuesUrl(serverUrl, options), token, timeoutMs, classifyValuesResponse);
+}
+
+const isEntry = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+
+/**
+ * A values document fetched without the curves, with the curves of `previous` put back: an entry
+ * that has no `history` (or `history_daily`) of its own keeps the one the previous document had
+ * for the same service. Neither argument is changed.
+ */
+export function keepCurves(previous, fresh) {
+  const before = isEntry(previous?.services) ? previous.services : {};
+  if (!isEntry(fresh?.services)) return fresh;
+  const services = {};
+  for (const [id, entry] of Object.entries(fresh.services)) {
+    const old = Object.hasOwn(before, id) ? before[id] : null;
+    if (!isEntry(entry) || !isEntry(old)) {
+      services[id] = entry;
+      continue;
+    }
+    const kept = { ...entry };
+    if (kept.history === undefined && old.history !== undefined) kept.history = old.history;
+    if (kept.history_daily === undefined && old.history_daily !== undefined) kept.history_daily = old.history_daily;
+    services[id] = kept;
+  }
+  return { ...fresh, services };
 }
 
 /**

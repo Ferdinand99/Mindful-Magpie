@@ -22,7 +22,8 @@
 // (`{ upload(file), remove(id) }`, the two calls of the background picture; each
 // resolves to `{ status, body }` like `save`. Without it the picker offers the
 // four presets only) and `services` (the services the person may use, from
-// #mm-services: `[{ id, name, kind, interval_s, metrics: [{ id, label, format }] }]`;
+// #mm-services: `[{ id, name, kind, interval_s, size, metrics: [{ id, label, format }] }]`, `size`
+// being the size a card of the service has when it names none;
 // the card form binds a card to one of them, see `serviceField`), `getValues`
 // (gives the readings of the services, from #mm-values, that the page is drawn with
 // when edit mode ends) and `onEnd` (called when edit mode has ended, however).
@@ -87,7 +88,11 @@ export const LABEL_KEYS = [
   "help_service",
   "field_metrics",
   "help_metrics",
-  "metrics_full",
+  "metrics_all",
+  "field_size",
+  "size_normal",
+  "size_wide",
+  "help_size",
   "metrics_gone",
   "optional",
   "help_url",
@@ -480,9 +485,12 @@ export function startEditing(root, getLayout, save, opts = {}) {
       "data-id": id,
       draggable: "true",
     });
-    // Edit mode never follows a link.
-    el.removeAttribute("href");
-    el.removeAttribute("rel");
+    // Edit mode never follows a link: not the item's own (a bookmark pill) and not the one inside it
+    // (a card's title, which is stretched over the card).
+    for (const link of [el, ...el.querySelectorAll("a[href]")]) {
+      link.removeAttribute("href");
+      link.removeAttribute("rel");
+    }
     el.parentNode.replaceChild(wrapper, el);
     wrapper.appendChild(el);
     wrapper.appendChild(itemControls(kind, id, title));
@@ -801,16 +809,25 @@ export function startEditing(root, getLayout, save, opts = {}) {
 
   /** Whether a checkbox is on (where `checked` is not a property, the attribute says). */
   const isOn = (el) => el.checked ?? el.hasAttribute("checked");
+  /** Turns a checkbox or radio on or off, through the attribute and, where there is one, the property. */
+  const setOn = (el, on) => {
+    if (on) el.setAttribute("checked", "");
+    else el.removeAttribute("checked");
+    if (typeof el.checked === "boolean") el.checked = on;
+  };
 
   /**
    * «Tjeneste»: a select (None, then the services by name) and, once one is
-   * chosen, a checkbox for each of its metrics, at most four. At four the other
-   * boxes are disabled and the hint says why (it is a live region). A card whose
+   * chosen, a checkbox for each of its metrics (any number, one up to all; «Velg
+   * alle» ticks them all) and «Størrelse», Vanlig or Bred, with the size of the
+   * service's kind chosen until the person picks one. A card whose
    * service is no longer in the list (removed, or hidden from this person) gets
    * an extra choice, «Tjenesten finnes ikke lenger», selected: saving as it is
    * keeps the card's binding, and the person may pick another service or None.
+   * `onChoose(service)` is called when the person picks a service (not None, not
+   * the gone one), so the form can offer its name as the title.
    */
-  function serviceField(card) {
+  function serviceField(card, onChoose = () => {}) {
     const bound = card?.service ?? null;
     const gone = bound !== null && !services.some((s) => s.id === bound.id);
     const selectId = uid("mm-f-service");
@@ -841,13 +858,44 @@ export function startEditing(root, getLayout, save, opts = {}) {
 
     const chosen = () => [...select.querySelectorAll("option")].find((o) => o.selected ?? o.hasAttribute("selected"));
     const boxes = () => [...group.querySelectorAll('input[name="metric"]')];
-    const refreshLimit = () => {
-      const full = boxes().filter(isOn).length >= LIMITS.serviceMetrics;
-      for (const box of boxes()) {
-        if (full && !isOn(box)) box.setAttribute("disabled", "");
-        else box.removeAttribute("disabled");
+    hint.textContent = L("help_metrics");
+    const selectAll = h(doc, "button", { type: "button", class: "btn btn-secondary btn-sm", "data-act": "select-all", text: L("metrics_all") });
+    selectAll.addEventListener("click", () => {
+      for (const box of boxes()) setOn(box, true);
+    });
+    picker.appendChild(selectAll);
+
+    // «Størrelse»: until the person picks one it follows the service (the card's own size when
+    // the card keeps its service).
+    const sizeId = uid("mm-f-size");
+    const sizeWrap = h(doc, "div", { class: "field", role: "radiogroup", "aria-labelledby": sizeId, "data-field": "size" });
+    sizeWrap.appendChild(h(doc, "span", { class: "label", id: sizeId, text: L("field_size") }));
+    const segmented = h(doc, "div", { class: "segmented" });
+    for (const [size, text] of [
+      ["normal", L("size_normal")],
+      ["wide", L("size_wide")],
+    ]) {
+      const radio = h(doc, "input", { type: "radio", name: "size", value: size });
+      radio.addEventListener("change", () => {
+        sizeTouched = true;
+      });
+      segmented.appendChild(h(doc, "label", {}, [radio, h(doc, "span", { text })]));
+    }
+    sizeWrap.appendChild(segmented);
+    sizeWrap.appendChild(h(doc, "p", { class: "help", text: L("help_size") }));
+    sizeWrap.appendChild(h(doc, "p", { class: "field-error", "data-for": "size", hidden: true }));
+    let sizeTouched = false;
+    const defaultSizeOf = (service) => (service?.size === "wide" ? "wide" : "normal");
+    const showSize = (service) => {
+      if (!service) {
+        sizeWrap.setAttribute("hidden", "");
+        return;
       }
-      hint.textContent = full ? L("metrics_full") : L("help_metrics");
+      sizeWrap.removeAttribute("hidden");
+      if (sizeTouched) return;
+      const own = bound && bound.id === service.id ? card?.size : undefined;
+      const size = own ?? defaultSizeOf(service);
+      for (const radio of sizeWrap.querySelectorAll('input[name="size"]')) setOn(radio, radio.value === size);
     };
     // `keep`: the metric ids to tick when the boxes are made.
     const fill = (keep) => {
@@ -857,6 +905,7 @@ export function startEditing(root, getLayout, save, opts = {}) {
         option && option.value !== "" && !option.hasAttribute("data-gone")
           ? services.find((s) => String(s.id) === option.value)
           : null;
+      showSize(service);
       if (!service) {
         picker.setAttribute("hidden", "");
         return;
@@ -872,7 +921,6 @@ export function startEditing(root, getLayout, save, opts = {}) {
       for (const metric of service.metrics) {
         const box = h(doc, "input", { type: "checkbox", name: "metric", value: metric.id, "aria-describedby": hintId });
         if (start.includes(metric.id)) box.setAttribute("checked", "");
-        box.addEventListener("change", refreshLimit);
         group.appendChild(
           h(doc, "label", { class: "check" }, [
             box,
@@ -880,17 +928,21 @@ export function startEditing(root, getLayout, save, opts = {}) {
           ]),
         );
       }
-      refreshLimit();
     };
     select.addEventListener("change", () => {
       const option = chosen();
       fill(option && bound && String(bound.id) === option.value ? bound.metrics : undefined);
+      if (option && option.value !== "" && !option.hasAttribute("data-gone")) {
+        const picked = services.find((s) => String(s.id) === option.value);
+        if (picked) onChoose(picked);
+      }
     });
 
     wrap.appendChild(labelEl);
     wrap.appendChild(select);
     wrap.appendChild(h(doc, "p", { class: "help", id: helpId, text: L("help_service") }));
     wrap.appendChild(picker);
+    wrap.appendChild(sizeWrap);
     wrap.appendChild(h(doc, "p", { class: "field-error", id: errorId, "data-for": "service", hidden: true }));
     fill(bound?.metrics);
     return wrap;
@@ -911,18 +963,47 @@ export function startEditing(root, getLayout, save, opts = {}) {
     return { id: Number(value), metrics };
   }
 
+  /**
+   * The size the card form says: "normal" or "wide" when the person's choice differs from what a
+   * card of the service's kind has anyway, else null (the card then follows the kind). A card whose
+   * service is gone keeps the size it had; a card with no service has none.
+   */
+  function readSize(form, card) {
+    const option = [...form.querySelectorAll('select[name="service"] option')].find((o) => o.selected ?? o.hasAttribute("selected"));
+    const value = option?.value ?? "";
+    if (value === "") return null;
+    if (option.hasAttribute("data-gone")) return card?.size ?? null;
+    const service = services.find((s) => String(s.id) === value);
+    const chosen = [...form.querySelectorAll('input[name="size"]')].find(isOn)?.value;
+    if (!service || (chosen !== "normal" && chosen !== "wide")) return null;
+    return chosen === (service.size === "wide" ? "wide" : "normal") ? null : chosen;
+  }
+
   function cardForm({ groupId, card }, trigger, errors) {
     const adding = !card;
+    // «Tjeneste» comes first: choosing one fills in the title when there is none.
+    // A title the person typed is never replaced; one this filled in is, when
+    // another service is chosen.
+    const titleField = field("title", L("field_title"), card?.title ?? "", { kind: "card" });
+    let filledIn = "";
+    const offerTitle = (service) => {
+      const input = titleField.querySelector('input[name="title"]');
+      if (!input) return;
+      if (input.value.trim() === "" || input.value === filledIn) {
+        input.value = service.name;
+        filledIn = service.name;
+      }
+    };
     formSheet({
       title: adding ? L("card_form_add") : L("card_form_edit"),
       kind: "card",
       fields: [
-        field("title", L("field_title"), card?.title ?? "", { kind: "card" }),
+        serviceField(card, offerTitle),
+        titleField,
         field("url", L("field_url"), card?.url ?? "", { help: L("help_url"), inputmode: "url", kind: "url" }),
         field("description", L("field_description"), card?.description ?? "", { optional: true, kind: "card" }),
         field("emoji", L("field_emoji"), card?.icon?.emoji ?? "", { help: L("help_emoji"), optional: true, kind: "card" }),
         colourField(card?.icon?.colour ?? DEFAULT_COLOUR),
-        serviceField(card),
       ],
       read: (form) => ({
         title: valueOf(form, "title").trim(),
@@ -931,6 +1012,7 @@ export function startEditing(root, getLayout, save, opts = {}) {
         emoji: valueOf(form, "emoji").trim(),
         colour: chosenColour(form),
         service: readService(form, card),
+        size: readSize(form, card),
       }),
       check: checkCard,
       trigger,
@@ -947,6 +1029,9 @@ export function startEditing(root, getLayout, save, opts = {}) {
         // off is `null`, which the server reads as none.
         if (values.service) data.service = values.service;
         else if (card?.service) data.service = null;
+        // The same for the size: only a card with a service has one, and none means the kind's.
+        if (values.size) data.size = values.size;
+        else if (card?.size) data.size = null;
         if (adding) {
           draft = addCard(draft, groupId, data);
           const id = draft.groups.find((g) => g.id === groupId).cards.at(-1).id;
@@ -1428,7 +1513,7 @@ export function startEditing(root, getLayout, save, opts = {}) {
   }
 
   function fieldName(field) {
-    const key = { title: "field_title", url: "field_url", description: "field_description", emoji: "field_emoji", colour: "field_colour", service: "field_service" }[field];
+    const key = { title: "field_title", url: "field_url", description: "field_description", emoji: "field_emoji", colour: "field_colour", service: "field_service", size: "field_size" }[field];
     return key ? L(key) : field;
   }
 

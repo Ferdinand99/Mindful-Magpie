@@ -24,12 +24,13 @@ use axum::response::Redirect;
 use axum::routing::get;
 use common::App;
 use jiff::Timestamp;
+use mindful_magpie::integrations::block::ListItem;
 use mindful_magpie::integrations::poller::{
     CONFIG_KEY, Change, DOWN_KEY, FETCH_DEADLINE, Options, Poller, PollerHandle,
 };
 use mindful_magpie::integrations::{
-    self, BoxFuture, FetchCtx, FetchError, Field, Integration, Level, MetricDef, Need, Snapshot,
-    Status, Value,
+    self, Block, BoxFuture, FetchCtx, FetchError, Field, Integration, Level, MetricDef, Need,
+    Snapshot, Status, Value,
 };
 use mindful_magpie::services::{SecretChange, ServiceEvent, ServiceInput, Visibility, store};
 use serde_json::{Value as Json, json};
@@ -89,6 +90,17 @@ enum Mode {
     Bad,
     /// `Ok` with a bad reading that says `HTTP 500`.
     Http500,
+    /// `Ok` with a bad reading that says `HTTP 404`.
+    Http404,
+    /// `Err(Status(500))`: the fetch failed with a server error.
+    Err500,
+    /// `Ok` with a bad reading of the kind's own (it has a need of its own)
+    /// that also carries `Invalid`, the error of a call that failed.
+    OwnBadInvalid,
+    /// The same, carrying `Timeout`.
+    OwnBadTimeout,
+    /// `Ok` with a warning that carries `Timeout`, and a need of its own.
+    OwnWarnTimeout,
     /// `Ok` with a bad reading: the address is not allowed.
     BadForbidden,
     /// `Ok` with a bad reading: a redirect to another scheme.
@@ -99,12 +111,16 @@ enum Mode {
     ErrConnect,
     /// `Err(SecretUnreadable)`.
     ErrSecret,
+    ErrAuth,
+    ErrKkTooOld,
     /// Never answers.
     Hang,
     /// Answers when the test opens the gate of its tag (see [`gate`]).
     Block,
     /// Panics.
     Panic,
+    /// An ok reading whose details are far over every limit, with hostile text.
+    Details,
 }
 
 #[derive(Clone)]
@@ -177,8 +193,49 @@ fn gate(tag: &str) -> Arc<Notify> {
     g
 }
 
+/// Eleven blocks of which the first is a list of 40 hostile lines.
+fn hostile_details() -> Vec<Block> {
+    // A right-to-left override, built here because source with the character in it is refused.
+    let rlo = char::from_u32(0x202E).unwrap();
+    let mut blocks = vec![Block::List {
+        title_key: "stub.title".into(),
+        items: (0..40)
+            .map(|i| {
+                let mut item = ListItem::new(format!("<b>{rlo}line {i}</b> {}", "x".repeat(300)));
+                item.href = Some("javascript:alert(1)".into());
+                item
+            })
+            .collect(),
+    }];
+    blocks.extend((0..10).map(|i| Block::Strip {
+        title_key: format!("stub.strip{i}"),
+        cells: vec![Status::Ok; 100],
+    }));
+    blocks
+}
+
 static NO_FIELDS: [Field; 0] = [];
 static NO_METRICS: [MetricDef; 0] = [];
+
+/// A reading a kind makes of a server that answered: a state of its own with a
+/// need of its own, and the error of one call that failed on the way.
+fn own_reading(status: Status, error: FetchError) -> Snapshot {
+    let mut snapshot = Snapshot::new(status);
+    snapshot.error = Some(error.to_string());
+    snapshot.needs.push(Need {
+        key: "own:thing".into(),
+        level: if status == Status::Bad {
+            Level::Bad
+        } else {
+            Level::Warn
+        },
+        label_key: "need.other".into(),
+        params: Default::default(),
+        score: 2.0,
+        since: None,
+    });
+    snapshot
+}
 
 fn ok_snapshot(n: usize, marker: String) -> Snapshot {
     let mut snapshot = Snapshot::new(Status::Ok);
@@ -235,11 +292,19 @@ impl Integration for Stub {
                 Mode::Err => Err(FetchError::Config),
                 Mode::ErrConnect => Err(FetchError::Connect),
                 Mode::ErrSecret => Err(FetchError::SecretUnreadable),
+                Mode::ErrAuth => Err(FetchError::Auth),
+                Mode::ErrKkTooOld => Err(FetchError::KkTooOld),
                 Mode::Bad => Ok(Snapshot::failed(&FetchError::Connect)),
                 Mode::BadForbidden => Ok(Snapshot::failed(&FetchError::Forbidden)),
                 Mode::BadRedirectScheme => Ok(Snapshot::failed(&FetchError::RedirectScheme)),
                 Mode::Http500 => Ok(Snapshot::failed(&FetchError::Status(500))),
+                Mode::Http404 => Ok(Snapshot::failed(&FetchError::Status(404))),
+                Mode::Err500 => Err(FetchError::Status(500)),
+                Mode::OwnBadInvalid => Ok(own_reading(Status::Bad, FetchError::Invalid)),
+                Mode::OwnBadTimeout => Ok(own_reading(Status::Bad, FetchError::Timeout)),
+                Mode::OwnWarnTimeout => Ok(own_reading(Status::Warn, FetchError::Timeout)),
                 Mode::Ok => Ok(ok_snapshot(n, marker)),
+                Mode::Details => Ok(ok_snapshot(n, marker).with_details(hostile_details())),
             }
         })
     }
@@ -642,6 +707,34 @@ async fn a_snapshot_is_stored_and_loaded_on_restart_before_the_first_fetch() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn details_are_cut_down_before_they_are_stored_and_announced() {
+    let app = App::new().await;
+    tokio::time::pause();
+    set_mode("t_details", Mode::Details);
+    let id = add_stub(&app, "Details", "t_details", "d", 60).await;
+    let poller = start_with(&app, stub_kinds, 0).await;
+    wait_calls("t_details", 1).await;
+    let snap = wait_snapshot(&poller, id, |s| !s.details.is_empty()).await;
+    assert_eq!(snap.details.len(), 6, "at most six blocks");
+    let Block::List { items, .. } = &snap.details[0] else {
+        panic!("the list comes first")
+    };
+    assert_eq!(items.len(), 8);
+    for item in items {
+        assert!(item.text.chars().count() <= 80, "{}", item.text);
+        assert!(!item.text.contains(char::from_u32(0x202E).unwrap()));
+        assert_eq!(item.href, None, "a javascript: link is dropped");
+    }
+    let Block::Strip { cells, .. } = &snap.details[1] else {
+        panic!("a strip")
+    };
+    assert_eq!(cells.len(), 48);
+    // What is stored is what was cut down.
+    let stored: Snapshot = serde_json::from_str(&stored_json(&app, id).await.unwrap()).unwrap();
+    assert_eq!(stored.details, snap.details);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn an_older_stored_shape_loads_and_a_corrupt_row_is_skipped() {
     let app = App::new().await;
     tokio::time::pause();
@@ -966,7 +1059,12 @@ async fn unusable_settings_or_secret_need_an_admin_not_the_site() {
     let app = App::new().await;
     tokio::time::pause();
     // The kind has no "down" rule at all; the config need is the engine's.
-    for (tag, mode) in [("t_cfg", Mode::Err), ("t_cfg_secret", Mode::ErrSecret)] {
+    for (tag, mode) in [
+        ("t_cfg", Mode::Err),
+        ("t_cfg_secret", Mode::ErrSecret),
+        ("t_cfg_auth", Mode::ErrAuth),
+        ("t_cfg_kk_old", Mode::ErrKkTooOld),
+    ] {
         set_mode(tag, mode);
         let id = add_stub(&app, tag, tag, "", 10).await;
         let poller = start_with(&app, stub_kinds, 0).await;
@@ -1038,15 +1136,105 @@ async fn a_supervisor_that_panics_is_logged_at_error() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn a_kind_without_the_rule_gets_no_down_need() {
+async fn a_kind_other_than_http_gets_the_generic_down_need() {
     let app = App::new().await;
     tokio::time::pause();
-    set_mode("t_no_rule", Mode::Bad);
-    let id = add_stub(&app, "NoRule", "t_no_rule", "", 10).await;
+    // A fetch that fails the way a service that does not answer does: twice in
+    // a row is the need, for every kind, with the generic text.
+    for (tag, mode) in [("t_gd_conn", Mode::ErrConnect), ("t_gd_500", Mode::Err500)] {
+        set_mode(tag, mode);
+        let id = add_stub(&app, tag, tag, "", 10).await;
+        let poller = start_with(&app, stub_kinds, 0).await;
+        wait_calls(tag, 1).await;
+        let first = wait_snapshot(&poller, id, |_| true).await;
+        assert!(first.needs.is_empty(), "{tag}: one failure is not a need");
+        wait_calls(tag, 2).await;
+        let second = wait_snapshot(&poller, id, |s| !s.needs.is_empty()).await;
+        assert_eq!(second.needs.len(), 1, "{tag}");
+        let need = &second.needs[0];
+        assert_eq!(need.key, DOWN_KEY, "{tag}");
+        assert_eq!(need.label_key, "need.service_down", "{tag}");
+        assert_eq!(need.level, Level::Bad, "{tag}");
+        assert!(need.params.is_empty(), "{tag}");
+        drop(poller);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_failure_only_an_admin_can_fix_never_gives_the_down_need() {
+    let app = App::new().await;
+    tokio::time::pause();
+    for (tag, mode) in [
+        ("t_nd_cfg", Mode::Err),
+        ("t_nd_secret", Mode::ErrSecret),
+        ("t_nd_auth", Mode::ErrAuth),
+        ("t_nd_old", Mode::ErrKkTooOld),
+        ("t_nd_forbidden", Mode::BadForbidden),
+        ("t_nd_scheme", Mode::BadRedirectScheme),
+    ] {
+        set_mode(tag, mode);
+        let id = add_stub(&app, tag, tag, "", 10).await;
+        let poller = start_with(&app, stub_kinds, 0).await;
+        wait_calls(tag, 3).await;
+        let s = wait_snapshot(&poller, id, |s| !s.needs.is_empty()).await;
+        let keys: Vec<_> = s.needs.iter().map(|n| n.key.as_str()).collect();
+        assert_eq!(keys, [CONFIG_KEY], "{tag}");
+        assert_eq!(s.needs[0].label_key, "need.service_config", "{tag}");
+        drop(poller);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_kinds_own_bad_reading_with_an_error_in_it_is_not_down() {
+    // The server answered: the reading is the kind's own state, with its own
+    // need, and the error of a call that failed on the way is not «down».
+    let app = App::new().await;
+    tokio::time::pause();
+    for (tag, mode) in [
+        ("t_own_invalid", Mode::OwnBadInvalid),
+        ("t_own_timeout", Mode::OwnBadTimeout),
+        ("t_own_warn", Mode::OwnWarnTimeout),
+    ] {
+        set_mode(tag, mode);
+        let id = add_stub(&app, tag, tag, "", 10).await;
+        let poller = start_with(&app, stub_kinds, 0).await;
+        wait_calls(tag, 3).await;
+        let s = wait_snapshot(&poller, id, |s| !s.needs.is_empty()).await;
+        let keys: Vec<_> = s.needs.iter().map(|n| n.key.as_str()).collect();
+        assert_eq!(keys, ["own:thing"], "{tag}: only its own need shows");
+        drop(poller);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_real_failed_fetch_still_gives_down_after_the_same_number_of_readings() {
+    // Unlike the readings above, here the fetch itself failed (no reading was
+    // made), so the service is «not answering».
+    let app = App::new().await;
+    tokio::time::pause();
+    set_mode("t_real_fail", Mode::ErrConnect);
+    let id = add_stub(&app, "Real", "t_real_fail", "", 10).await;
     let poller = start_with(&app, stub_kinds, 0).await;
-    wait_calls("t_no_rule", 3).await;
+    wait_calls("t_real_fail", 1).await;
+    let first = wait_snapshot(&poller, id, |_| true).await;
+    assert!(first.needs.is_empty());
+    wait_calls("t_real_fail", 2).await;
+    let second = wait_snapshot(&poller, id, |s| !s.needs.is_empty()).await;
+    assert_eq!(second.needs[0].key, DOWN_KEY);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_client_error_or_a_good_reading_gives_no_down_need() {
+    let app = App::new().await;
+    tokio::time::pause();
+    // A 4xx answer is neither «not answering» nor something the poller can
+    // name: no need.
+    set_mode("t_nd_404", Mode::Http404);
+    let id = add_stub(&app, "NoNeed", "t_nd_404", "", 10).await;
+    let poller = start_with(&app, stub_kinds, 0).await;
+    wait_calls("t_nd_404", 3).await;
     let s = wait_snapshot(&poller, id, |_| true).await;
-    assert!(s.needs.is_empty());
+    assert!(s.needs.is_empty(), "{:?}", s.needs);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1422,4 +1610,67 @@ async fn a_site_that_never_answers_is_bad_with_a_timeout_and_the_others_go_on() 
         "the other service kept updating meanwhile: {}",
         calls("t_real_other").len()
     );
+}
+
+/// The prefixes the kinds' memory was told to forget (see
+/// `integrations::api::on_forget`).
+static FORGOTTEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn note_forgotten(prefix: &str) {
+    FORGOTTEN.lock().unwrap().push(prefix.to_string());
+}
+
+fn forgotten(prefix: &str) -> usize {
+    FORGOTTEN
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|p| p.as_str() == prefix)
+        .count()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_removed_service_makes_the_kinds_forget_its_address_unless_another_still_uses_it() {
+    integrations::api::on_forget(note_forgotten);
+    let app = App::new().await;
+    tokio::time::pause();
+    let poller = start_with(&app, stub_kinds, 1000).await;
+    let shared = "http://forget-shared.example/app/";
+    let alone = "http://forget-alone.example/";
+    let add = |name: &'static str, tag: &'static str, url: &'static str| {
+        add_service(
+            &app,
+            "stub",
+            name,
+            Some(url.to_string()),
+            json!({ "tag": tag, "marker": "" }),
+            600,
+        )
+    };
+    let (a, b) = (
+        add("A", "t_fg_a", shared).await,
+        add("B", "t_fg_b", shared).await,
+    );
+    let c = add("C", "t_fg_c", alone).await;
+    for id in [a, b, c] {
+        poller.reload(id);
+        wait_snapshot(&poller, id, |_| true).await;
+    }
+    let (shared_before, alone_before) = (forgotten(shared), forgotten(alone));
+    let mut rx = poller.subscribe();
+
+    // Two services share an address: the first one to go leaves the memory.
+    poller.remove_for_tests(a);
+    wait_removed(&mut rx, a).await;
+    assert_eq!(forgotten(shared), shared_before, "B still polls it");
+
+    // The last one takes it with it.
+    poller.remove_for_tests(b);
+    wait_removed(&mut rx, b).await;
+    assert_eq!(forgotten(shared), shared_before + 1);
+    assert_eq!(forgotten(alone), alone_before, "C is untouched");
+
+    poller.remove_for_tests(c);
+    wait_removed(&mut rx, c).await;
+    assert_eq!(forgotten(alone), alone_before + 1);
 }

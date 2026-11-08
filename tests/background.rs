@@ -1338,9 +1338,9 @@ async fn upgrading_from_the_schema_of_main_applies_only_the_new_migrations() {
 }
 
 #[tokio::test]
-async fn upgrading_from_the_schema_before_services_applies_only_0006_to_0008() {
+async fn upgrading_from_the_schema_before_services_applies_only_0006_to_0009() {
     // A database as 0005 left it: no services, snapshots or acknowledgements,
-    // but a layout and a token. This build adds 0006 to 0008 and nothing else.
+    // but a layout and a token. This build adds 0006 to 0009 and nothing else.
     let app = App::new().await;
     let mut web = Web::new(&app, "ada", "admin").await;
     let uid = user_id(&app, "ada").await;
@@ -1358,18 +1358,19 @@ async fn upgrading_from_the_schema_before_services_applies_only_0006_to_0008() {
          DROP TABLE services;
          DELETE FROM schema_migrations WHERE name LIKE '%0006_services%'
                                           OR name LIKE '%0007_snapshots%'
-                                          OR name LIKE '%0008_acks%';"
+                                          OR name LIKE '%0008_acks%'
+                                          OR name LIKE '%0009_personal_services%';"
             .to_string(),
     )
     .await;
     assert_eq!(
         app.count("SELECT COUNT(*) FROM schema_migrations").await,
-        applied - 3
+        applied - 4
     );
     drop(web);
 
     let app = app.restart().await;
-    // The three new migrations ran, once each, and no other was applied again.
+    // The four new migrations ran, once each, and no other was applied again.
     assert_eq!(
         app.count("SELECT COUNT(*) FROM schema_migrations").await,
         applied
@@ -1386,6 +1387,10 @@ async fn upgrading_from_the_schema_before_services_applies_only_0006_to_0008() {
         (
             "0008",
             "SELECT COUNT(*) FROM schema_migrations WHERE name LIKE '%0008_acks%'",
+        ),
+        (
+            "0009",
+            "SELECT COUNT(*) FROM schema_migrations WHERE name LIKE '%0009_personal_services%'",
         ),
     ] {
         assert_eq!(app.count(sql).await, 1, "{name}");

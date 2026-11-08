@@ -7,13 +7,14 @@ import { parseHTML } from "linkedom";
 import {
   fetchValues,
   isValidValues,
+  keepCurves,
   nextValues,
   serverNowMs,
   statusText,
   statusWithValues,
   valuesUrl,
 } from "../extension/state.js";
-import { connectionChanged, start } from "../extension/newtab-core.js";
+import { HISTORY_MS, REFRESH_MS, connectionChanged, start } from "../extension/newtab-core.js";
 import { createView } from "../extension/newtab-view.js";
 import { render, updateValues, tickAges } from "../extension/vendor/render.js";
 
@@ -86,6 +87,8 @@ const reply = (status, body) => ({ status, json: async () => body });
 test("valuesUrl joins the server and the values endpoint once", () => {
   assert.equal(valuesUrl("http://h:1/"), "http://h:1/api/v1/me/values");
   assert.equal(valuesUrl("https://h/magpie//"), "https://h/magpie/api/v1/me/values");
+  assert.equal(valuesUrl("http://h:1/", { history: false }), "http://h:1/api/v1/me/values?history=none");
+  assert.equal(valuesUrl("http://h:1/", { history: true }), "http://h:1/api/v1/me/values");
 });
 
 test("isValidValues accepts the values document and rejects other shapes", () => {
@@ -248,7 +251,7 @@ function env({ stored = {}, startReply, valuesReply, hidden = false, t = DEVICE_
       },
       fetchImpl: async (url) => {
         fetches.push(url);
-        const r = url.endsWith("/api/v1/me/values") ? e.valuesReply() : e.startReply();
+        const r = VALUES_PATH.test(url) ? e.valuesReply(url) : e.startReply();
         if (r instanceof Error) throw r;
         return r;
       },
@@ -263,7 +266,8 @@ function env({ stored = {}, startReply, valuesReply, hidden = false, t = DEVICE_
   };
   return e;
 }
-const valuesFetches = (e) => e.fetches.filter((u) => u.endsWith("/api/v1/me/values")).length;
+const VALUES_PATH = /\/api\/v1\/me\/values(\?history=none)?$/;
+const valuesFetches = (e) => e.fetches.filter((u) => VALUES_PATH.test(u)).length;
 
 test("cached values are drawn before any fetch, with ages counted from the estimated server clock", async () => {
   const e = env({ stored: { last: layout(), lastValues: cache() }, t: DEVICE_T + 300_000 });
@@ -722,9 +726,9 @@ test("update on a view with no layout draws the empty state", () => {
 
 // ---------------------------------------------------------------- files
 
-test("v0.3.0 is the manifest version, Firefox 140 the floor, and Android needs 142 (data collection keys)", () => {
+test("v0.4.0 is the manifest version, Firefox 140 the floor, and Android needs 142 (data collection keys)", () => {
   const m = JSON.parse(read("manifest.json"));
-  assert.equal(m.version, "0.3.0");
+  assert.equal(m.version, "0.4.0");
   assert.equal(m.browser_specific_settings.gecko.strict_min_version, "140.0");
   assert.deepEqual(m.browser_specific_settings.gecko_android, { strict_min_version: "142.0" });
   assert.deepEqual(m.browser_specific_settings.gecko.data_collection_permissions, { required: ["none"] });
@@ -761,4 +765,112 @@ test("only a real change of the server or token stops the tabs, not saving the s
   assert.equal(connectionChanged({ last: { oldValue: 1, newValue: 2 } }, "local"), false);
   assert.equal(connectionChanged({ token: { oldValue: "a", newValue: "b" } }, "sync"), false);
   assert.equal(connectionChanged(undefined, "local"), false);
+});
+
+// ---------------------------------------------------------------- curves (history)
+
+test("keepCurves puts the previous curves back into a document fetched without them", () => {
+  const curve = { lat: [[SERVER_NOW - 300, 1], [SERVER_NOW, 2]] };
+  const days = { lat: [["2023-11-14", 1, 2, 1.5]] };
+  const previous = values({ history: curve, history_daily: days });
+  const frozen = JSON.stringify(previous);
+  const light = { now: SERVER_NOW + 30, services: { 1: { ...values().services[1], status: "warn" }, 2: { name: "New" } } };
+  const kept = keepCurves(previous, light);
+  assert.deepEqual(kept.services[1].history, curve);
+  assert.deepEqual(kept.services[1].history_daily, days);
+  assert.equal(kept.services[1].status, "warn");
+  assert.deepEqual(kept.services[2], { name: "New" });
+  assert.equal(kept.now, SERVER_NOW + 30);
+  assert.equal(JSON.stringify(previous), frozen);
+  // A document that brings its own curves keeps them; odd input does not throw.
+  const own = { now: 1, services: { 1: { history: { lat: [[1, 9]] } } } };
+  assert.deepEqual(keepCurves(previous, own).services[1].history, { lat: [[1, 9]] });
+  assert.deepEqual(keepCurves(null, light).services[2], { name: "New" });
+  assert.deepEqual(keepCurves({ services: { __proto__: null } }, light).services[1].status, "warn");
+  assert.equal(keepCurves(previous, { now: 1, services: null }).services, null);
+});
+
+test("the 30 s refresh leaves the curves out and keeps them; every 5 minutes they come again", async () => {
+  const curve = (v) => ({ lat: [[SERVER_NOW, v]] });
+  const e = env({
+    valuesReply: (url) => reply(200, url.endsWith("?history=none") ? values() : values({ history: curve(e.clock.t) })),
+  });
+  await start(e.deps);
+  const urls = () => e.fetches.filter((u) => VALUES_PATH.test(u));
+  assert.equal(urls().length, 1);
+  assert.equal(urls()[0], `${SERVER}/api/v1/me/values`, "the first fetch takes the curves");
+  const first = e.draws.at(-1).view.values.services[1].history;
+  assert.deepEqual(first, curve(DEVICE_T));
+
+  // Refreshes inside 5 minutes: without the curves, and the page keeps the ones it has.
+  for (let i = 1; i < HISTORY_MS / REFRESH_MS; i += 1) {
+    e.clock.t = DEVICE_T + i * REFRESH_MS;
+    await e.timers.fire();
+    assert.ok(urls().at(-1).endsWith("?history=none"), `refresh ${i}`);
+    assert.deepEqual(e.updates.at(-1).view.values.services[1].history, first, `refresh ${i}`);
+  }
+  // The cache keeps them too.
+  assert.deepEqual(e.store.lastValues.values.services[1].history, first);
+
+  // 5 minutes after the last curves: they come again.
+  e.clock.t = DEVICE_T + HISTORY_MS;
+  await e.timers.fire();
+  assert.equal(urls().at(-1), `${SERVER}/api/v1/me/values`);
+  assert.deepEqual(e.updates.at(-1).view.values.services[1].history, curve(DEVICE_T + HISTORY_MS));
+});
+
+// ---------------------------------------------------------------- one language on the whole page
+
+test("a Norwegian browser gets Norwegian metric labels from the server and Norwegian detail titles", async () => {
+  const asked = [];
+  // A server that names the metrics in the language the request asks for, as Magpie does.
+  const server = async (url, opts = {}) => {
+    const lang = opts.headers?.["Accept-Language"];
+    asked.push([url, lang]);
+    assert.equal(opts.headers.Authorization, `Bearer ${TOKEN}`, "the token still goes");
+    if (VALUES_PATH.test(url)) {
+      return reply(200, values({ details: [{ kind: "list", title_key: "vv_down_now", items: [{ text: "Sylo", status: "bad" }] }] }));
+    }
+    const label = lang === "nb" ? "HTTP-status" : "HTTP status";
+    const services = [{ ...SERVICES[0], metrics: [{ id: "status", label, format: "number" }, SERVICES[0].metrics[1]] }];
+    return reply(200, layout({ services }));
+  };
+  for (const [language, metric, title] of [
+    ["nb-NO", "HTTP-status", "Nede nå"],
+    ["en-GB", "HTTP status", "Down now"],
+  ]) {
+    asked.length = 0;
+    const p = page();
+    const draw = createView({
+      doc: p.doc,
+      statusEl: p.statusEl,
+      root: p.root,
+      language,
+      fetchImpl: server,
+      openOptions: () => {},
+      objectUrl: { create: () => "blob:x", revoke: () => {} },
+    });
+    const e = env();
+    await start({ ...e.deps, fetchImpl: server, draw, update: draw.update, language });
+    const want = language.startsWith("nb") ? "nb" : "en";
+    assert.ok(asked.length >= 2 && asked.every(([, lang]) => lang === want), JSON.stringify(asked));
+    const labels = [...p.root.querySelectorAll(".mm-metric-label")].map((n) => n.textContent);
+    assert.equal(labels[0], metric, language);
+    assert.equal(p.root.querySelector(".mm-block-title").textContent, title, language);
+    assert.equal(p.doc.documentElement.getAttribute("lang"), want);
+  }
+  // Without a language the request is as it was: no header of the page's own.
+  const e = env();
+  const seen = [];
+  await start({ ...e.deps, fetchImpl: async (url, opts) => (seen.push(opts.headers), e.deps.fetchImpl(url)) });
+  assert.ok(seen.every((h) => !("Accept-Language" in h)));
+});
+
+test("the new tab uses the width of the screen", () => {
+  const html = read("newtab.html");
+  assert.match(html, /<main class="shell newtab">/);
+  const css = read("shell.css");
+  const rule = css.match(/\.shell\.newtab \{([^}]*)\}/)[1];
+  assert.match(rule, /max-width: 2400px;/);
+  assert.match(rule, /padding-inline: clamp\(16px, 3vw, 48px\);/);
 });

@@ -854,7 +854,7 @@ async fn the_http_kind_describes_itself() {
     let ids: Vec<_> = kind.metrics().iter().map(|m| m.id).collect();
     assert_eq!(ids, ["status", "latency_ms", "checked"]);
     assert!(kind.fields().iter().any(|f| f.secret));
-    assert_eq!(integrations::registry().len(), 1);
+    assert!(integrations::registry().iter().any(|k| k.kind() == "http"));
     assert!(integrations::find("nope").is_none());
 }
 
@@ -1228,17 +1228,24 @@ async fn test_never_sends_a_stored_secret_to_another_address() {
 }
 
 #[tokio::test]
-async fn a_redirect_to_another_origin_drops_the_authorization_header() {
+async fn a_redirect_to_another_origin_is_refused_when_a_secret_is_sent() {
     let (a, _, log_a) = recorder().await;
     let (_, port_b, log_b) = recorder().await;
     let snap = fetch(&format!("{a}/jump/{port_b}"), Some(SECRET)).await;
+    assert_eq!(snap.status, Status::Bad);
+    assert_eq!(snap.error.as_deref(), Some("redirect not allowed"));
+    assert!(log_a.lock().unwrap().is_empty(), "A only redirected");
+    assert!(log_b.lock().unwrap().is_empty(), "B saw nothing");
+}
+
+#[tokio::test]
+async fn a_redirect_to_another_origin_is_followed_when_no_secret_is_sent() {
+    let (a, _, log_a) = recorder().await;
+    let (_, port_b, log_b) = recorder().await;
+    let snap = fetch(&format!("{a}/jump/{port_b}"), None).await;
     assert_eq!(snap.status, Status::Ok, "{:?}", snap.error);
     assert!(log_a.lock().unwrap().is_empty(), "A only redirected");
-    assert_eq!(
-        *log_b.lock().unwrap(),
-        [None],
-        "B got no Authorization header"
-    );
+    assert_eq!(*log_b.lock().unwrap(), [None], "B was reached");
 }
 
 #[tokio::test]
@@ -1361,7 +1368,7 @@ async fn a_refused_secret_is_said_before_the_unreadable_note() {
 async fn the_interval_input_has_the_kinds_floor_as_its_minimum() {
     let app = App::new().await;
     let mut admin = Web::new(&app, "root", "admin").await;
-    let res = admin.get("/settings/services/new").await;
+    let res = admin.get("/settings/services/new?kind=http").await;
     assert!(res.body.contains("name=\"interval\""));
     assert!(res.body.contains("min=\"15\""), "{}", res.body);
 }
@@ -1477,5 +1484,103 @@ async fn nothing_that_is_logged_holds_a_secret() {
     );
     for needle in [FIRST, SECOND, "Bearer"] {
         assert!(!log.contains(needle), "the log holds {needle:?}:\n{log}");
+    }
+}
+
+#[tokio::test]
+async fn the_link_on_cards_is_optional_checked_and_kept() {
+    let app = App::new().await;
+    let mut admin = Web::new(&app, "root", "admin").await;
+    let settings_of = |id: i64| {
+        let app = &app;
+        async move {
+            let text: String = app
+                .magpie
+                .core
+                .with_conn(move |c| {
+                    c.query_row("SELECT settings FROM services WHERE id = ?1", [id], |r| {
+                        r.get(0)
+                    })
+                })
+                .await
+                .unwrap();
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()
+        }
+    };
+
+    // Empty: nothing is stored under `link`.
+    let blog = create_via_page(&mut admin, "Blog", "http://10.0.0.5:8080/path", SECRET).await;
+    assert!(settings_of(blog).await.get("link").is_none());
+
+    // A link is stored with the settings and shown again on the edit page.
+    let mut f = form("Wiki", "http://10.0.0.6/", "");
+    f.push(("link", " https://wiki.example.com/home "));
+    let res = admin.post("/settings/services/new", &f).await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    let wiki = last_id(&app).await;
+    assert_eq!(
+        settings_of(wiki).await["link"],
+        "https://wiki.example.com/home"
+    );
+    let edit = admin.get(&format!("/settings/services/{wiki}")).await;
+    assert!(edit.body.contains("Link on cards"), "{}", edit.body);
+    assert!(edit.body.contains("https://wiki.example.com/home"));
+    // The help says it is optional and what it falls back to.
+    assert!(edit.body.contains("Optional"));
+
+    // It is checked like a card's link; the form comes back with the problem.
+    for bad in [
+        "ftp://x/",
+        "not a link",
+        "https:///x",
+        "javascript:alert(1)",
+    ] {
+        let mut f = form("Bad", "http://10.0.0.7/", "");
+        f.push(("link", bad));
+        let res = admin.post("/settings/services/new", &f).await;
+        assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
+        assert!(
+            res.body.contains("Use a link that starts with http"),
+            "{bad}: {}",
+            res.body
+        );
+    }
+    assert_eq!(app.count("SELECT COUNT(*) FROM services").await, 2);
+
+    // An address that Magpie itself would not fetch is fine as a link.
+    let mut f = form("Meta", "http://10.0.0.8/", "");
+    f.push(("link", "http://169.254.169.254/latest"));
+    let res = admin.post("/settings/services/new", &f).await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+
+    // Editing keeps it, and emptying the field takes it away.
+    let mut f = form("Wiki", "http://10.0.0.6/", "");
+    f.push(("link", "https://wiki.example.com/other"));
+    let res = admin.post(&format!("/settings/services/{wiki}"), &f).await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    assert_eq!(
+        settings_of(wiki).await["link"],
+        "https://wiki.example.com/other"
+    );
+    let res = admin
+        .post(
+            &format!("/settings/services/{wiki}"),
+            &form("Wiki", "http://10.0.0.6/", ""),
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    assert!(settings_of(wiki).await.get("link").is_none());
+}
+
+#[tokio::test]
+async fn no_kind_has_a_setting_called_link() {
+    // `link` is the service's own setting (the link on cards), kept next to the
+    // kind's: a kind must not take the name.
+    for kind in integrations::registry() {
+        assert!(
+            kind.fields().iter().all(|f| f.key != "link"),
+            "{} has a field called link",
+            kind.kind()
+        );
     }
 }

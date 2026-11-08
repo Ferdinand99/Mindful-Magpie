@@ -380,6 +380,25 @@ function serviceRef(card) {
   return ref;
 }
 
+/** Whether the card has a link of its own typed (an empty one is none). */
+function hasOwnUrl(card) {
+  return typeof card?.url === "string" && card.url !== "";
+}
+
+/**
+ * Where a card opens: its own link when it has one (always wins, even a bad
+ * one: the card is then drawn as invalid), else, for a card with a service, the
+ * service's `link` from `services`. Null when there is nothing to open: a
+ * service that is gone, or has no link.
+ */
+function cardHref(card, services) {
+  if (hasOwnUrl(card)) return safeHref(card.url);
+  const ref = Array.isArray(services) ? serviceRef(card) : null;
+  if (!ref) return null;
+  const service = services.find((s) => isObject(s) && s.id === ref.id);
+  return service ? safeHref(service.link) : null;
+}
+
 /** True when the value is older than three intervals (`fetchedMs`, `nowMs` in ms, `intervalS` in s). */
 function isStale(fetchedMs, nowMs, intervalS) {
   return Number.isFinite(intervalS) && intervalS > 0 && nowMs - fetchedMs > STALE_FACTOR * intervalS * 1000;
@@ -406,10 +425,473 @@ function drawStatus(doc, labels, status) {
   return dot;
 }
 
-/** The service part of a bound card: the notice, or the cells, the status and the age. */
+// ---- detail blocks ------------------------------------------------------------------
+//
+// A service's reading may carry `details`: blocks of kind list, bars, strip, facts or spark (see
+// src/integrations/block.rs for the shapes). Everything in them is text from outside, so it is set
+// with textContent only; a link goes through safeHref; a bar's width is a CSS custom property set
+// through the CSS object model. A block that is not well formed is left out, and the counts are
+// capped again here, because the extension may talk to a server that does not cap them.
+//
+// A spark block names a metric; its curve is drawn from the entry's `history` of that metric
+// (`[[unix_s, value], ...]`, the last 24 hours) as a small inline SVG, made with the DOM (no
+// markup): a line scaled to the lowest and highest value (broken where readings are missing), for
+// `up_down` a strip of cells (bad where the value is above 0, good where it is 0, blank where there
+// is no point), and for `counter` (a count that grows and starts again, like today's visitors)
+// bars of what it grew by in each hour.
+
+const BLOCK_KINDS = ["list", "bars", "strip", "facts", "spark"];
+const MAX_BLOCKS = 6;
+const MAX_ITEMS = 8;
+const MAX_CELLS = 48;
+// The lines of the first list a normal card shows.
+const NORMAL_LINES = 3;
+// The key a block names its title or a row's label by (the same shape the server enforces).
+const DETAIL_KEY = /^[a-z0-9_.]{1,64}$/;
+// The window a spark draws (seconds), the most points it reads, and its picture's size in SVG
+// units (the style sheet sets the size on the page).
+const SPARK_WINDOW_S = 24 * 60 * 60;
+const SPARK_MAX_POINTS = 600;
+const SPARK_W = 288;
+const SPARK_H = 32;
+// The cells of an up/down strip: one per half hour.
+const SPARK_SLOTS = 48;
+// The bars of a counter: one per hour.
+const SPARK_HOURS = 24;
+// The history keeps one point per 5 minutes for a service polled faster; a line is broken where two
+// points are more than twice the spacing apart (a reading or more is missing).
+const SPARK_SLOT_S = 300;
+const SPARK_STYLES = ["up_down", "counter"];
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+/** The text of a detail key in the page's labels (`detail.<key>`), "" when the key is not known. */
+function detailLabel(labels, key) {
+  return typeof key === "string" && DETAIL_KEY.test(key) ? label(labels, `detail.${key}`) : "";
+}
+
+/** The size of a card element: "wide" or "normal". */
+function cardSizeOf(el) {
+  return el.getAttribute("data-size") === "wide" ? "wide" : "normal";
+}
+
+/** An `at` (epoch seconds) as milliseconds, or null when it is not a number. */
+function momentMs(at) {
+  return typeof at === "number" && Number.isFinite(at) ? at * 1000 : null;
+}
+
+/**
+ * The points of a spark's curve: the entry's history of `metric` within the last 24 hours before
+ * `nowS`, each `[t, v]` with finite numbers, oldest first, at most SPARK_MAX_POINTS (the newest).
+ */
+function sparkPoints(history, metric, nowS) {
+  if (!isObject(history) || typeof metric !== "string" || !Object.hasOwn(history, metric)) return [];
+  const series = history[metric];
+  if (!Array.isArray(series)) return [];
+  const from = nowS - SPARK_WINDOW_S;
+  const points = series
+    .filter((p) => Array.isArray(p) && Number.isFinite(p[0]) && Number.isFinite(p[1]) && p[0] >= from && p[0] <= nowS + 300)
+    .map((p) => [p[0], p[1]])
+    .sort((a, b) => a[0] - b[0]);
+  return points.slice(-SPARK_MAX_POINTS);
+}
+
+/**
+ * A block as it is drawn: its kind, title key and the entries that can be drawn (at most the caps),
+ * or null when none can (a block with nothing to show is not drawn, not even its title). A spark's
+ * entries are its points (`ctx.history`, counted back from `ctx.nowMs`).
+ */
+function shapeBlock(block, ctx) {
+  const labels = ctx.labels;
+  const list = (value) => (Array.isArray(value) ? value.filter(isObject) : []);
+  let entries;
+  if (block.kind === "spark") {
+    entries = sparkPoints(ctx.history, block.metric, Math.floor(ctx.nowMs / 1000));
+    if (entries.length === 0) return null;
+    return { kind: "spark", title_key: block.title_key, look: SPARK_STYLES.includes(block.style) ? block.style : "line", entries };
+  }
+  if (block.kind === "list") {
+    entries = list(block.items)
+      .filter((item) => text(item.text) !== "")
+      .slice(0, MAX_ITEMS);
+  } else if (block.kind === "bars") {
+    entries = list(block.bars).slice(0, MAX_ITEMS);
+  } else if (block.kind === "strip") {
+    entries = (Array.isArray(block.cells) ? block.cells : []).slice(0, MAX_CELLS);
+  } else {
+    // A row with no usable label (an unknown key and no text) says nothing: it is left out.
+    entries = list(block.rows)
+      .map((row) => ({ row, name: detailLabel(labels, row.label_key) || text(row.label) }))
+      .filter(({ name }) => name !== "")
+      .slice(0, MAX_ITEMS);
+  }
+  return entries.length === 0 ? null : { kind: block.kind, title_key: block.title_key, entries };
+}
+
+/** The blocks of `details` that can be drawn, at most six. */
+function wellFormedBlocks(details, ctx) {
+  if (!Array.isArray(details)) return [];
+  const out = [];
+  for (const block of details) {
+    if (!isObject(block) || !BLOCK_KINDS.includes(block.kind)) continue;
+    const shaped = shapeBlock(block, ctx);
+    if (shaped) out.push(shaped);
+    if (out.length === MAX_BLOCKS) break;
+  }
+  return out;
+}
+
+/**
+ * What a card of `size` draws of `blocks`: all of them when wide; when normal the first list (cut to
+ * three lines) and the first visual (bars, strip or spark). Each is `{ block, cut }`.
+ */
+function blocksFor(blocks, size) {
+  if (size === "wide") return blocks.map((block) => ({ block, cut: false }));
+  const picked = [];
+  let list = false;
+  let visual = false;
+  for (const block of blocks) {
+    if (block.kind === "list" && !list) {
+      list = true;
+      picked.push({ block, cut: true });
+    } else if ((block.kind === "bars" || block.kind === "strip" || block.kind === "spark") && !visual) {
+      visual = true;
+      picked.push({ block, cut: false });
+    }
+  }
+  return picked;
+}
+
+/** A relative age in `className`, counted from the moment `thenMs` (tickAges() keeps it current). */
+function drawMoment(doc, className, thenMs, ctx) {
+  const el = isolated(doc, "span", className, formatRelative(Math.min(thenMs, ctx.nowMs), ctx.nowMs, ctx.lang));
+  el.setAttribute("data-since", String(thenMs));
+  return el;
+}
+
+function drawListItem(doc, ctx, item) {
+  const li = make(doc, "li", "mm-li");
+  const href = safeHref(item.href);
+  const itemText = text(item.text);
+  // What a changed list is matched to the one on the page by: the line's link, else its text.
+  li.setAttribute("data-key", href ?? itemText);
+  // The slot is always there, so that a line that gains or loses its dot keeps its place.
+  const slot = make(doc, "span", "mm-li-slot");
+  if (STATUSES.includes(item.status)) {
+    li.setAttribute("data-status", item.status);
+    slot.appendChild(drawStatus(doc, ctx.labels, item.status));
+  }
+  li.appendChild(slot);
+  const main = make(doc, "span", "mm-li-main");
+  let line;
+  if (href) {
+    line = isolated(doc, "a", "mm-li-text mm-li-link", itemText);
+    line.setAttribute("href", href);
+    line.setAttribute("rel", "noreferrer");
+  } else {
+    line = isolated(doc, "span", "mm-li-text", itemText);
+  }
+  main.appendChild(line);
+  const sub = text(item.sub);
+  if (sub !== "") main.appendChild(isolated(doc, "span", "mm-li-sub", sub));
+  // A badge is a detail key; one the page does not know shows nothing.
+  const badge = detailLabel(ctx.labels, item.badge_key);
+  if (badge !== "") main.appendChild(make(doc, "span", "mm-badge", badge));
+  li.appendChild(main);
+  const at = momentMs(item.at);
+  const right = text(item.right);
+  if (at !== null) li.appendChild(drawMoment(doc, "mm-li-right", at, ctx));
+  else if (right !== "") li.appendChild(isolated(doc, "span", "mm-li-right", right));
+  return li;
+}
+
+function drawList(doc, ctx, block, cut) {
+  const ul = make(doc, "ul", "mm-list");
+  const shown = cut ? block.entries.slice(0, NORMAL_LINES) : block.entries;
+  for (const item of shown) ul.appendChild(drawListItem(doc, ctx, item));
+  const more = block.entries.length - shown.length;
+  if (more > 0) {
+    ul.appendChild(make(doc, "li", "mm-block-more", label(ctx.labels, "block_more").split("{n}").join(String(more))));
+  }
+  return ul;
+}
+
+function drawBars(doc, block) {
+  const wrap = make(doc, "div", "mm-bars");
+  for (const bar of block.entries) {
+    const name = text(bar.label);
+    const barText = text(bar.text);
+    const pct = Number.isFinite(bar.pct) ? Math.min(100, Math.max(0, bar.pct)) : 0;
+    const row = make(doc, "div", "mm-bar-row");
+    row.appendChild(isolated(doc, "span", "mm-bar-label", name));
+    const track = make(doc, "span", "mm-bar");
+    track.setAttribute("role", "progressbar");
+    track.setAttribute("aria-valuemin", "0");
+    track.setAttribute("aria-valuemax", "100");
+    track.setAttribute("aria-valuenow", String(Math.round(pct)));
+    // What the bar says in words ("12,3 av 14 TB") is what a screen reader reads.
+    if (barText !== "") track.setAttribute("aria-valuetext", barText);
+    if (name !== "") track.setAttribute("aria-label", name);
+    const fill = make(doc, "span", "mm-bar-fill");
+    if (STATUSES.includes(bar.status)) fill.setAttribute("data-status", bar.status);
+    // Through the CSS object model: the page's CSP allows that, not a style attribute.
+    fill.style.setProperty("--mm-pct", `${pct}%`);
+    track.appendChild(fill);
+    row.appendChild(track);
+    row.appendChild(isolated(doc, "span", "mm-bar-text", barText));
+    wrap.appendChild(row);
+  }
+  return wrap;
+}
+
+function drawStrip(doc, ctx, block) {
+  const strip = make(doc, "div", "mm-strip");
+  const cells = block.entries;
+  // The cells are colours: the strip is one picture, named by its title, with the count of what is
+  // not well in its description. One that has no name has nothing to say to a screen reader.
+  const bad = cells.filter((c) => c === "bad").length;
+  const warn = cells.filter((c) => c === "warn").length;
+  const parts = [
+    detailLabel(ctx.labels, block.title_key),
+    bad > 0 ? `${label(ctx.labels, "status_bad")}: ${bad}` : "",
+    warn > 0 ? `${label(ctx.labels, "status_warn")}: ${warn}` : "",
+  ];
+  const name = parts.filter((p) => p !== "").join(", ");
+  if (name !== "") {
+    strip.setAttribute("role", "img");
+    strip.setAttribute("aria-label", name);
+  } else {
+    strip.setAttribute("aria-hidden", "true");
+  }
+  for (const cell of cells) {
+    const c = make(doc, "span", "mm-cell");
+    c.setAttribute("data-status", statusOf(cell));
+    strip.appendChild(c);
+  }
+  return strip;
+}
+
+function drawFacts(doc, ctx, block) {
+  const wrap = make(doc, "div", "mm-facts");
+  for (const { row, name } of block.entries) {
+    const fact = make(doc, "div", "mm-fact");
+    fact.appendChild(isolated(doc, "span", "mm-fact-label", name));
+    const at = momentMs(row.at);
+    fact.appendChild(at !== null ? drawMoment(doc, "mm-fact-value", at, ctx) : isolated(doc, "span", "mm-fact-value", text(row.value)));
+    wrap.appendChild(fact);
+  }
+  return wrap;
+}
+
+function svg(doc, tag, className) {
+  const el = doc.createElementNS(SVG_NS, tag);
+  if (className) el.setAttribute("class", className);
+  return el;
+}
+
+/** A number for an SVG attribute: two decimals at most, never NaN. */
+function coord(n) {
+  return Number.isFinite(n) ? String(Math.round(n * 100) / 100) : "0";
+}
+
+/**
+ * A line through the points, x by time over the last 24 hours and y between the lowest and the
+ * highest value. One point, or values that are all the same (or too far apart to subtract), give a
+ * flat line in the middle. Where two points are more than twice the spacing of the readings apart
+ * (`intervalS`, at least 5 minutes) the line is broken: one polyline per run of readings, and a
+ * lone reading between two gaps is a short dash. Returns the picture, the lowest, the highest and
+ * the latest value.
+ */
+function sparkLine(doc, points, nowS, intervalS) {
+  const pic = svg(doc, "svg", "mm-spark-svg mm-spark-line");
+  pic.setAttribute("viewBox", `0 0 ${SPARK_W} ${SPARK_H}`);
+  pic.setAttribute("preserveAspectRatio", "none");
+  pic.setAttribute("focusable", "false");
+  let min = Infinity;
+  let max = -Infinity;
+  for (const [, v] of points) {
+    if (v < min) min = v;
+    if (v > max) max = v;
+  }
+  const span = max - min;
+  const flat = !(Number.isFinite(span) && span > 0);
+  const from = nowS - SPARK_WINDOW_S;
+  const x = (t) => Math.min(SPARK_W, Math.max(0, ((t - from) / SPARK_WINDOW_S) * SPARK_W));
+  const pad = 3;
+  const y = (v) => (flat ? SPARK_H / 2 : SPARK_H - pad - ((v - min) / span) * (SPARK_H - 2 * pad));
+  const runs = [];
+  if (points.length === 1) {
+    runs.push([[0, y(points[0][1])], [SPARK_W, y(points[0][1])]]);
+  } else {
+    const gap = 2 * Math.max(SPARK_SLOT_S, Number.isFinite(intervalS) ? intervalS : 0);
+    let run = [];
+    points.forEach(([t, v], i) => {
+      if (i > 0 && t - points[i - 1][0] > gap) {
+        runs.push(run);
+        run = [];
+      }
+      run.push([x(t), y(v)]);
+    });
+    runs.push(run);
+  }
+  for (const run of runs) {
+    // A lone reading: a dash of its own, so that it shows.
+    const drawn = run.length === 1 ? [[Math.max(0, run[0][0] - 1), run[0][1]], [Math.min(SPARK_W, run[0][0] + 1), run[0][1]]] : run;
+    const line = svg(doc, "polyline", "mm-spark-path");
+    line.setAttribute("points", drawn.map(([a, b]) => `${coord(a)},${coord(b)}`).join(" "));
+    line.setAttribute("vector-effect", "non-scaling-stroke");
+    pic.appendChild(line);
+  }
+  return { pic, min, max, latest: points[points.length - 1][1] };
+}
+
+/**
+ * Bars of what a counter grew by in each hour of the last 24. A counter counts up and starts again
+ * (today's visitors at midnight): each step adds `v - prev`, or `v` when the value fell (it started
+ * again); the first reading adds nothing, and a step that is not a finite number of at least 0 adds
+ * nothing either. A step after a gap counts in the hour of the reading that ends it. Returns the
+ * picture and the total.
+ */
+function sparkCounter(doc, points, nowS) {
+  const pic = svg(doc, "svg", "mm-spark-svg mm-spark-counter");
+  pic.setAttribute("viewBox", `0 0 ${SPARK_HOURS} ${SPARK_H}`);
+  pic.setAttribute("preserveAspectRatio", "none");
+  pic.setAttribute("focusable", "false");
+  const bins = new Array(SPARK_HOURS).fill(0);
+  const from = nowS - SPARK_WINDOW_S;
+  for (let i = 1; i < points.length; i += 1) {
+    const [t, v] = points[i];
+    const prev = points[i - 1][1];
+    const step = v < prev ? v : v - prev;
+    if (!(Number.isFinite(step) && step > 0)) continue;
+    const bin = Math.min(SPARK_HOURS - 1, Math.max(0, Math.floor((t - from) / 3600)));
+    bins[bin] += step;
+  }
+  let top = 0;
+  for (const n of bins) if (n > top) top = n;
+  const total = bins.reduce((sum, n) => sum + n, 0);
+  bins.forEach((n, i) => {
+    const h = top > 0 && Number.isFinite(top) ? (n / top) * (SPARK_H - 2) : 0;
+    const bar = svg(doc, "rect", "mm-spark-bar");
+    bar.setAttribute("x", coord(i + 0.12));
+    bar.setAttribute("y", coord(SPARK_H - h));
+    bar.setAttribute("width", "0.76");
+    bar.setAttribute("height", coord(h));
+    pic.appendChild(bar);
+  });
+  return { pic, total };
+}
+
+/**
+ * A strip of half-hour cells over the last 24 hours: bad where a point in the cell is above 0, good
+ * where the cell has points and all are 0, blank where it has none (or only values below 0).
+ * Returns the picture and how many cells are bad.
+ */
+function sparkCells(doc, points, nowS) {
+  const pic = svg(doc, "svg", "mm-spark-svg mm-spark-updown");
+  pic.setAttribute("viewBox", `0 0 ${SPARK_SLOTS} 1`);
+  pic.setAttribute("preserveAspectRatio", "none");
+  pic.setAttribute("focusable", "false");
+  const slots = new Array(SPARK_SLOTS).fill("none");
+  const from = nowS - SPARK_WINDOW_S;
+  const size = SPARK_WINDOW_S / SPARK_SLOTS;
+  for (const [t, v] of points) {
+    const i = Math.min(SPARK_SLOTS - 1, Math.max(0, Math.floor((t - from) / size)));
+    if (v > 0) slots[i] = "bad";
+    else if (v === 0 && slots[i] === "none") slots[i] = "ok";
+  }
+  slots.forEach((state, i) => {
+    const cell = svg(doc, "rect", "mm-spark-cell");
+    cell.setAttribute("x", coord(i + 0.08));
+    cell.setAttribute("y", "0");
+    cell.setAttribute("width", "0.84");
+    cell.setAttribute("height", "1");
+    cell.setAttribute("data-status", state);
+    pic.appendChild(cell);
+  });
+  return { pic, bad: slots.filter((state) => state === "bad").length };
+}
+
+/** A label's text with its `{name}` placeholders filled in. */
+function filled(text, values) {
+  let out = text;
+  for (const [name, value] of Object.entries(values)) out = out.split(`{${name}}`).join(value);
+  return out;
+}
+
+/**
+ * A spark block's picture: one image. The block's title names it already (the group), so the
+ * image says what the curve shows: the latest value and the range of a line, the total of a
+ * counter, the number of red half hours of an up/down strip.
+ */
+function drawSpark(doc, ctx, block) {
+  const wrap = make(doc, "div", "mm-spark");
+  wrap.setAttribute("data-style", block.look);
+  const nowS = Math.floor(ctx.nowMs / 1000);
+  const num = (n) => formatNumber(n, ctx.lang, { maximumFractionDigits: 2 });
+  let pic;
+  let name;
+  if (block.look === "up_down") {
+    const drawn = sparkCells(doc, block.entries, nowS);
+    pic = drawn.pic;
+    name = filled(label(ctx.labels, "spark_updown"), { n: num(drawn.bad) });
+  } else if (block.look === "counter") {
+    const drawn = sparkCounter(doc, block.entries, nowS);
+    pic = drawn.pic;
+    name = filled(label(ctx.labels, "spark_counter"), { n: num(drawn.total) });
+  } else {
+    const drawn = sparkLine(doc, block.entries, nowS, ctx.intervalS);
+    pic = drawn.pic;
+    name = filled(label(ctx.labels, "spark_line"), { value: num(drawn.latest), min: num(drawn.min), max: num(drawn.max) });
+  }
+  if (name !== "") {
+    wrap.setAttribute("role", "img");
+    wrap.setAttribute("aria-label", name);
+  } else {
+    wrap.setAttribute("aria-hidden", "true");
+  }
+  pic.setAttribute("aria-hidden", "true");
+  wrap.appendChild(pic);
+  return wrap;
+}
+
+function drawBlock(doc, ctx, block, cut, id) {
+  const el = make(doc, "div", `mm-block mm-block-${block.kind}`);
+  const titleText = detailLabel(ctx.labels, block.title_key);
+  if (titleText !== "") {
+    const title = make(doc, "span", "mm-block-title", titleText);
+    title.setAttribute("id", id);
+    el.appendChild(title);
+    // The block is named by its visible title.
+    el.setAttribute("role", "group");
+    el.setAttribute("aria-labelledby", id);
+  }
+  if (block.kind === "list") el.appendChild(drawList(doc, ctx, block, cut));
+  else if (block.kind === "bars") el.appendChild(drawBars(doc, block));
+  else if (block.kind === "strip") el.appendChild(drawStrip(doc, ctx, block));
+  else if (block.kind === "spark") el.appendChild(drawSpark(doc, ctx, block));
+  else el.appendChild(drawFacts(doc, ctx, block));
+  return el;
+}
+
+/**
+ * The blocks of a reading for a card of `size`, or null when there is nothing to draw. `cardKey`
+ * makes the ids of the titles (`mm-bt-<card>-<n>`) different on every card of the page. `history`
+ * is the entry's, for the spark blocks.
+ */
+function drawBlocks(doc, details, history, intervalS, size, opts, cardKey, nowMs) {
+  const ctx = { labels: opts.labels, lang: opts.lang, nowMs, history, intervalS };
+  const picked = blocksFor(wellFormedBlocks(details, ctx), size);
+  if (picked.length === 0) return null;
+  const wrap = make(doc, "div", "mm-blocks");
+  wrap.setAttribute("data-count", String(picked.length));
+  picked.forEach(({ block, cut }, i) => wrap.appendChild(drawBlock(doc, ctx, block, cut, `mm-bt-${cardKey}-${i}`)));
+  return wrap;
+}
+
+/** The service part of a bound card: the notice, or the cells, the blocks, the status and the age. */
 function drawService(doc, el, ref, opts) {
   const labels = opts.labels;
-  const svc = make(doc, "span", "mm-svc");
+  const svc = make(doc, "div", "mm-svc");
   el.setAttribute("data-service", String(ref.id));
   el.setAttribute("data-metrics", JSON.stringify(ref.metrics));
 
@@ -442,7 +924,6 @@ function drawService(doc, el, ref, opts) {
   const catalogue = Array.isArray(service.metrics) ? service.metrics : [];
   const shown = [];
   for (const id of ref.metrics) {
-    if (shown.length === 4) break;
     const metric = catalogue.find((m) => isObject(m) && m.id === id);
     // A metric listed twice is drawn once.
     if (metric && !shown.includes(metric)) shown.push(metric);
@@ -469,6 +950,9 @@ function drawService(doc, el, ref, opts) {
     }
     svc.appendChild(grid);
   }
+
+  const blocks = drawBlocks(doc, snap.details, snap.history, intervalS, cardSizeOf(el), opts, el.getAttribute("data-card") ?? `s${ref.id}`, nowMs);
+  if (blocks) svc.appendChild(blocks);
 
   foot.appendChild(drawStatus(doc, labels, statusOf(snap.status)));
   foot.appendChild(make(doc, "span", "mm-age", ageText(labels, opts.lang, fetchedMs, nowMs, stale)));
@@ -502,6 +986,11 @@ export function tickAges(root, opts = {}) {
     const thenMs = Number(age.getAttribute("data-since"));
     if (Number.isFinite(thenMs)) age.textContent = formatRelative(Math.min(thenMs, nowMs), nowMs, opts.lang);
   }
+  // The ages inside blocks (a line's "12 min ago", a fact's).
+  for (const el of root.querySelectorAll(".mm-li-right[data-since], .mm-fact-value[data-since]")) {
+    const thenMs = Number(el.getAttribute("data-since"));
+    if (Number.isFinite(thenMs)) el.textContent = formatRelative(Math.min(thenMs, nowMs), nowMs, opts.lang);
+  }
   for (const valueEl of root.querySelectorAll(".mm-metric-value[data-since]")) {
     const thenMs = Number(valueEl.getAttribute("data-since"));
     if (!Number.isFinite(thenMs)) continue;
@@ -513,27 +1002,43 @@ export function tickAges(root, opts = {}) {
   }
 }
 
+/** The size a card has: its own when it names one, else the one of its service's kind, else normal. */
+function cardSize(card, services) {
+  if (card?.size === "wide" || card?.size === "normal") return card.size;
+  const ref = Array.isArray(services) ? serviceRef(card) : null;
+  const service = ref ? services.find((s) => isObject(s) && s.id === ref.id) : null;
+  return service?.size === "wide" ? "wide" : "normal";
+}
+
 function drawCard(doc, card, opts) {
-  const href = safeHref(card?.url);
+  const href = cardHref(card, opts.services);
   const ref = Array.isArray(opts.services) ? serviceRef(card) : null;
-  const el = href
-    ? make(doc, "a", "mm-card glass")
-    : make(doc, "div", "mm-card mm-card-invalid glass");
-  if (href) {
-    el.setAttribute("href", href);
-    el.setAttribute("rel", "noreferrer");
-  }
+  // A card with a service and no link of its own, whose service has none to
+  // lend (it is gone, or has no address), is not invalid: it is just not a link.
+  const unlinked = !href && ref !== null && !hasOwnUrl(card);
+  // The card is a box, not a link: its title is the link, stretched over the whole card by the
+  // style sheet (a card may hold links of its own, in its blocks, and a link cannot hold a link).
+  const el = make(doc, "div", href ? "mm-card glass" : unlinked ? "mm-card mm-card-nolink glass" : "mm-card mm-card-invalid glass");
   el.appendChild(drawTile(doc, card, opts.lang));
   const body = make(doc, "span", "mm-card-text");
-  body.appendChild(isolated(doc, "span", "mm-card-title", text(card?.title)));
+  if (href) {
+    const title = isolated(doc, "a", "mm-card-title mm-card-link", text(card?.title));
+    title.setAttribute("href", href);
+    title.setAttribute("rel", "noreferrer");
+    body.appendChild(title);
+  } else {
+    body.appendChild(isolated(doc, "span", "mm-card-title", text(card?.title)));
+  }
   const description = text(card?.description);
   if (description !== "") {
     body.appendChild(isolated(doc, "span", "mm-card-desc", description));
   }
-  if (!href) body.appendChild(invalidMarker(doc, opts.labels));
+  if (!href && !unlinked) body.appendChild(invalidMarker(doc, opts.labels));
   el.appendChild(body);
   if (ref) {
-    el.setAttribute("class", `${el.getAttribute("class")} mm-bound`);
+    const size = cardSize(card, opts.services);
+    el.setAttribute("class", `${el.getAttribute("class")} mm-bound${size === "wide" ? " mm-card-wide" : ""}`);
+    el.setAttribute("data-size", size);
     // What updateValues() finds the card by.
     if (typeof card.id === "string" && card.id !== "") el.setAttribute("data-card", card.id);
     el.appendChild(drawService(doc, el, ref, opts));
@@ -541,13 +1046,85 @@ function drawCard(doc, card, opts) {
   return el;
 }
 
+/** Whether two nodes can be one: text with text, or elements of the same tag and class. */
+function sameKind(a, b) {
+  if (a.nodeType === 3 && b.nodeType === 3) return true;
+  return (
+    a.nodeType === 1 &&
+    b.nodeType === 1 &&
+    a.nodeName === b.nodeName &&
+    a.getAttribute("class") === b.getAttribute("class")
+  );
+}
+
+/**
+ * Makes `oldEl` (on the page) the same as `freshEl` (just drawn, not on the page) by changing it in
+ * place: attributes and text are rewritten, and the children are matched. A child with a `data-key`
+ * (a line of a list) is matched to the old child with the same key, wherever that stands; the others
+ * are matched by position among the others. What cannot be matched (another tag or class, or one
+ * more or one fewer) is replaced, added or removed. An element that stays is the same element, so a
+ * focused link in a block keeps its focus, also when the list around it is reordered: the element
+ * with the focus is never moved, the others are moved around it. The one style the renderer sets on
+ * elements, `--mm-pct` of a bar, goes through the CSS object model.
+ */
+function morph(oldEl, freshEl) {
+  for (const attr of [...oldEl.attributes]) {
+    if (attr.name !== "style" && !freshEl.hasAttribute(attr.name)) oldEl.removeAttribute(attr.name);
+  }
+  for (const attr of [...freshEl.attributes]) {
+    if (attr.name !== "style" && oldEl.getAttribute(attr.name) !== attr.value) oldEl.setAttribute(attr.name, attr.value);
+  }
+  const pct = freshEl.style?.getPropertyValue?.("--mm-pct") ?? "";
+  if (pct !== "" && oldEl.style.getPropertyValue("--mm-pct") !== pct) oldEl.style.setProperty("--mm-pct", pct);
+  const olds = [...oldEl.childNodes];
+  const keyOf = (node) => (node.nodeType === 1 ? node.getAttribute("data-key") : null);
+  // Old children with a key wait for the fresh child with the same key (in order, for a repeated
+  // one); the others wait their turn by position.
+  const byKey = new Map();
+  const unkeyed = [];
+  for (const old of olds) {
+    const key = keyOf(old);
+    if (key === null) unkeyed.push(old);
+    else byKey.set(key, [...(byKey.get(key) ?? []), old]);
+  }
+  let turn = 0;
+  const wanted = [...freshEl.childNodes].map((next) => {
+    const key = keyOf(next);
+    const prev = key === null ? (unkeyed[turn++] ?? null) : (byKey.get(key)?.shift() ?? null);
+    if (!prev || !sameKind(prev, next)) return next;
+    if (next.nodeType === 3) {
+      if (prev.nodeValue !== next.nodeValue) prev.nodeValue = next.nodeValue;
+    } else {
+      morph(prev, next);
+    }
+    return prev;
+  });
+  const kept = new Set(wanted);
+  for (const old of olds) if (!kept.has(old)) oldEl.removeChild(old);
+  // Put them in order without moving the one that has the focus (moving an element takes its focus).
+  const active = oldEl.ownerDocument?.activeElement;
+  const anchor = wanted.findIndex((node) => node.nodeType === 1 && active && (node === active || node.contains?.(active)));
+  let before = anchor >= 0 ? wanted[anchor] : null;
+  for (let i = anchor + 1; i < wanted.length; i += 1) {
+    const expected = before ? before.nextSibling : oldEl.firstChild;
+    if (expected !== wanted[i]) oldEl.insertBefore(wanted[i], expected);
+    before = wanted[i];
+  }
+  for (let i = anchor - 1; i >= 0; i -= 1) {
+    if (wanted[i].nextSibling !== wanted[i + 1]) oldEl.insertBefore(wanted[i], wanted[i + 1]);
+  }
+}
+
 /**
  * Brings the service part of every bound card up to date after new `opts.values`
- * (or `opts.services`) without drawing the page again. Per card it replaces only
- * `.mm-svc` and the `data-fetched`, `data-interval` and `data-stale` attributes;
- * the card's own element, its tile and its text stay, so a focused link keeps
- * focus. A card whose service or metrics changed is redrawn on its own (it loses
- * focus). Plain cards are not touched.
+ * (or `opts.services`) without drawing the page again. Per card it changes only
+ * `.mm-svc` and the `data-fetched`, `data-interval` and `data-stale` attributes, in
+ * place (see morph): the card's own element, its tile and its text stay, and so do
+ * the elements of the service part that still fit (a list line, a bar), so a focused
+ * link, also one inside a block, keeps focus. Only what cannot be matched (a block
+ * that changed its kind, a line more or fewer) is drawn anew. A card whose service,
+ * metrics or size changed is redrawn on its own (it loses focus). Plain cards are
+ * not touched.
  *
  * `layout` is the one given to the last render(); `opts` the same as for
  * render(). Returns true when every bound card of the layout was found on the
@@ -584,7 +1161,10 @@ export function updateValues(root, layout, opts = {}) {
       handled.add(el);
       if (
         el.getAttribute("data-service") !== String(ref.id) ||
-        el.getAttribute("data-metrics") !== JSON.stringify(ref.metrics)
+        el.getAttribute("data-metrics") !== JSON.stringify(ref.metrics) ||
+        el.getAttribute("data-size") !== cardSize(card, settings.services) ||
+        // The service's link changed (or came or went) under a card with no link of its own.
+        (el.querySelector(".mm-card-link")?.getAttribute("href") ?? null) !== (cardHref(card, settings.services) ?? null)
       ) {
         el.parentNode.replaceChild(drawCard(doc, card, settings), el);
         continue;
@@ -592,7 +1172,7 @@ export function updateValues(root, layout, opts = {}) {
       for (const name of ["data-fetched", "data-interval", "data-stale"]) el.removeAttribute(name);
       const old = el.querySelector(".mm-svc");
       const fresh = drawService(doc, el, ref, settings);
-      if (old) el.replaceChild(fresh, old);
+      if (old) morph(old, fresh);
       else el.appendChild(fresh);
     }
   }
@@ -624,14 +1204,14 @@ function needList(values) {
   return values.needs.filter(isNeed);
 }
 
-/** The address of the first card of the layout that is bound to the service and has an http(s) link. */
-function needHref(layout, serviceId) {
+/** The address of the first card of the layout that is bound to the service and opens an http(s) link. */
+function needHref(layout, serviceId, services) {
   for (const group of Array.isArray(layout?.groups) ? layout.groups : []) {
     for (const card of Array.isArray(group?.cards) ? group.cards : []) {
       if (!card || typeof card !== "object") continue;
       const ref = serviceRef(card);
       if (!ref || ref.id !== serviceId) continue;
-      const href = safeHref(card.url);
+      const href = cardHref(card, services);
       if (href) return href;
     }
   }
@@ -713,7 +1293,7 @@ function needsSignature(items, hrefs, opts) {
 function drawNeeds(doc, items, layout, opts, open) {
   const nowMs = toMs(opts.values?.now) ?? Date.now();
   const hrefs = new Map();
-  for (const item of items) hrefs.set(item.service_id, needHref(layout, item.service_id));
+  for (const item of items) hrefs.set(item.service_id, needHref(layout, item.service_id, opts.services));
   const section = make(doc, "section", "mm-needs glass");
   const title = label(opts.labels, "needs");
   section.setAttribute("data-open", open ? "true" : "false");
@@ -972,27 +1552,48 @@ function applyBackground(doc, background, opts) {
  * path of a background image, for a page on another origin.
  *
  * Cards may be bound to a service (`card.service` is `{ id, metrics: [ids] }`,
- * null or absent for a plain link card). Two more options draw them; without
+ * null or absent for a plain link card; `card.size` is "normal" or "wide", or absent for the
+ * size of the service). Two more options draw them; without
  * `services` a bound card is drawn as a plain one:
  *
- *   - `opts.services`: `[{ id, name, kind, interval_s, metrics: [{ id, label,
- *     format }] }]`, the services the viewer can see. A bound id that is not in
- *     the list gets the notice `service_missing`; the card keeps its link.
+ *   - `opts.services`: `[{ id, name, kind, interval_s, link, size, metrics: [{ id,
+ *     label, format }] }]`, the services the viewer can see (`size` is the size a card
+ *     of the service has when it names none; absent reads normal). A bound id that is
+ *     not in the list gets the notice `service_missing`; the card keeps its own
+ *     link, and a card that has none is drawn as a plain element, not a link.
+ *     A card with a service and an empty `url` opens the service's `link`; the
+ *     card's own `url` always wins.
  *   - `opts.values`: `{ now, services: { "<id>": { name, kind, interval_s,
- *     status, values: { "<metric>": { num, text } }, fetched_at,
- *     error_label? } } }`. `now` and `fetched_at` are ISO 8601 strings or epoch
+ *     status, values: { "<metric>": { num, text } }, details?, fetched_at,
+ *     error_label? } } }`. `details` is the reading's blocks (see below). `now` and `fetched_at` are ISO 8601 strings or epoch
  *     seconds; ages count from `now`, never from the clock, so a page can draw
  *     the same thing twice. A service with no entry shows `service_waiting`.
  *     `status` is ok, warn, bad or unknown (anything else reads unknown).
  *
  * A bound card gets `data-service` (the id), a status dot (`.mm-status`, its
- * text in `aria-label`), up to four cells (`.mm-metric`: label and value), the
- * age (`.mm-age`) and, older than three intervals, `data-stale`. The extra
- * labels: `service_missing`, `service_waiting`, `status_ok`, `status_warn`,
- * `status_bad`, `status_unknown` and `updated` (with `{when}`). tickAges()
- * keeps the ages current later, updateValues() swaps new values in without
- * touching the cards' own elements (so focus stays), and formatValue() is the
- * number formatting.
+ * text in `aria-label`), a cell for each chosen metric (`.mm-metric`: label and
+ * value; two columns on a normal card, up to five on a wide one), the blocks, the
+ * age (`.mm-age`) and, older than three intervals, `data-stale`. A card is
+ * `data-size="normal"` or `"wide"` (class `mm-card-wide`, two grid columns on a
+ * wide screen). The extra labels: `service_missing`, `service_waiting`,
+ * `status_ok`, `status_warn`, `status_bad`, `status_unknown`, `updated` (with
+ * `{when}`) and `block_more` (with `{n}`). tickAges() keeps the ages current
+ * later, updateValues() changes the new values into the page in place (so focus
+ * stays, also on a link inside a block), and formatValue() is the number
+ * formatting.
+ *
+ * Blocks: `details` is a list of `{ kind: "list" | "bars" | "strip" | "facts",
+ * title_key, ... }` (see src/integrations/block.rs). A title is the label
+ * `detail.<title_key>` (the `[detail]` section of the locale files; a key that is
+ * not there shows no title). A normal card draws the first list, cut to three
+ * lines and "+ N more", and the first bars or strip; a wide card draws all of them
+ * (at most six), in two columns on a wide screen. Everything in a block is text,
+ * a link goes through safeHref and opens in the same tab, a bar's width is a CSS
+ * custom property. A list line may have `at` (epoch seconds; a fact too): it is drawn as
+ * an age ("12 min ago", counted again by tickAges()) in place of `right` (`value`), and
+ * `badge_key` (a detail key; an unknown one shows nothing); a bar may have `status`
+ * (its fill is green, yellow or red). A card is a box and its title is the link,
+ * stretched over the box by render.css, so links in the blocks can be links of their own.
  *
  * «Trenger deg»: `opts.values.needs` is `[{ service_id, service_name, key, level
  * (warn|bad), label, since (epoch seconds), acked }]`, the server's list for this

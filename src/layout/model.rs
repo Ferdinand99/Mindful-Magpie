@@ -30,8 +30,12 @@ pub const MAX_ID: usize = 40;
 /// of combining marks.
 pub const MAX_EMOJI_BYTES: usize = 64;
 
-/// The most numbers one card shows from its service.
-pub const MAX_METRICS: usize = 4;
+/// The most numbers one card can name from its service. A card shows any
+/// number of its kind's metrics, one up to all of them, each at most once; this
+/// is only a ceiling above the largest catalogue, so that a list of any length
+/// is refused by its length and not walked (a test keeps it above every kind's
+/// catalogue). The save checks the names against the kind's own.
+pub const MAX_METRICS: usize = 32;
 
 /// Longest id of an uploaded background image, in characters (the renderer
 /// accepts the same shape, `render.js`).
@@ -100,12 +104,28 @@ pub struct Card {
     /// the key, so such a layout reads and saves back unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<ServiceRef>,
+    /// How much room a card with a service takes. Absent means the default of
+    /// the service's kind (`Integration::default_size`), so a layout saved
+    /// before sizes existed reads and saves back unchanged. A card without a
+    /// service has no size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<Size>,
 }
 
-/// A card's binding to a service: which one, and 1 to 4 of its metrics, in
-/// the order the card shows them. The ids are the kind's (`MetricDef::id`);
-/// [`validate`] checks their shape and count, and the save checks the service
-/// exists, is visible to the user and has these metrics.
+/// A card's size: one grid column, or two on a wide screen (one below about
+/// 700 px).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Size {
+    Normal,
+    Wide,
+}
+
+/// A card's binding to a service: which one, and 1 or more of its metrics (at
+/// most all the kind has, none twice), in the order the card shows them. The
+/// ids are the kind's (`MetricDef::id`); [`validate`] checks their shape, count
+/// and that none is repeated, and the save checks the service exists, is
+/// visible to the user and has these metrics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceRef {
@@ -133,7 +153,7 @@ pub struct Bookmark {
 /// One thing wrong with a document: where, and a stable machine code
 /// (`too_long`, `required`, `bad_url`, `bad_scheme`, `too_many`, `bad_id`,
 /// `duplicate_id`, `bad_colour`, `bad_emoji`, `bad_preset`, `bad_image`,
-/// `bad_service`, `bad_metric`).
+/// `bad_service`, `bad_metric`, `bad_size`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FieldError {
     /// For example `groups[0].cards[2].url`.
@@ -149,6 +169,33 @@ fn plain_authority(value: &str) -> bool {
         .split_once(':')
         .and_then(|(_, rest)| rest.strip_prefix("//"))
         .is_some_and(|host| !host.starts_with(['/', '\\']))
+}
+
+/// What is wrong with a link that a browser is to follow (a card's, a
+/// bookmark's, a service's), as the error code: `required`, `too_long`,
+/// `bad_url` or `bad_scheme`. `None` for a well-formed `http` or `https` URL.
+/// Nothing is fetched from it, so no address is refused for what it points at.
+pub fn link_problem(value: &str) -> Option<&'static str> {
+    if value.trim().is_empty() {
+        return Some("required");
+    }
+    if value.chars().count() > MAX_URL {
+        return Some("too_long");
+    }
+    // The URL parser strips tabs and line breaks and trims the ends, so what
+    // is stored could differ from what a browser follows: refuse it.
+    if value != value.trim() || value.chars().any(char::is_control) {
+        return Some("bad_url");
+    }
+    match url::Url::parse(value) {
+        Err(_) => Some("bad_url"),
+        Ok(u) if !matches!(u.scheme(), "http" | "https") => Some("bad_scheme"),
+        Ok(u) if u.host_str().is_none_or(str::is_empty) => Some("bad_url"),
+        // `https:example.com` and `https:///example.com` parse as links too;
+        // keep only the plain `scheme://host` shape.
+        Ok(_) if !plain_authority(value) => Some("bad_url"),
+        Ok(_) => None,
+    }
 }
 
 /// Characters of Unicode category Cf (format): invisible, and a few reverse
@@ -197,7 +244,7 @@ fn is_visible_symbol(emoji: &str) -> bool {
 }
 
 /// Whether `value` is 1 to 40 of `[A-Za-z0-9_-]`.
-fn id_shape(value: &str) -> bool {
+pub(crate) fn id_shape(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_ID
         && value
@@ -244,30 +291,13 @@ impl Checker {
 
     /// A link: present, not too long, a well-formed `http` or `https` URL.
     fn url(&mut self, path: String, value: &str) {
-        if value.trim().is_empty() {
-            return self.err(path, "required");
-        }
-        if value.chars().count() > MAX_URL {
-            return self.err(path, "too_long");
-        }
-        // The URL parser strips tabs and line breaks and trims the ends, so
-        // what is stored could differ from what a browser follows: refuse it.
-        if value != value.trim() || value.chars().any(char::is_control) {
-            return self.err(path, "bad_url");
-        }
-        match url::Url::parse(value) {
-            Err(_) => self.err(path, "bad_url"),
-            Ok(u) if !matches!(u.scheme(), "http" | "https") => self.err(path, "bad_scheme"),
-            Ok(u) if u.host_str().is_none_or(str::is_empty) => self.err(path, "bad_url"),
-            // `https:example.com` and `https:///example.com` parse as links
-            // too; keep only the plain `scheme://host` shape.
-            Ok(_) if !plain_authority(value) => self.err(path, "bad_url"),
-            Ok(_) => {}
+        if let Some(code) = link_problem(value) {
+            self.err(path, code);
         }
     }
 
     /// A card's service binding, as far as it can be told without the
-    /// database: an id that can be one, and 1 to 4 metric ids of the shape of
+    /// database: an id that can be one, and 1 or more metric ids of the shape of
     /// an id, none twice. One problem at most is reported: `bad_service` on
     /// `…service`, or one code on `…service.metrics`.
     fn service(&mut self, path: &str, service: &ServiceRef) {
@@ -364,10 +394,17 @@ pub fn validate(layout: &Layout) -> Result<(), Vec<FieldError>> {
                 MAX_DESCRIPTION,
                 false,
             );
-            c.url(format!("{cp}.url"), &card.url);
+            // A card with a service may have no link of its own: the page
+            // links it to the service's. A card without one needs a link.
+            if !(card.url.is_empty() && card.service.is_some()) {
+                c.url(format!("{cp}.url"), &card.url);
+            }
             c.icon(&format!("{cp}.icon"), &card.icon);
             if let Some(service) = &card.service {
                 c.service(&cp, service);
+            } else if card.size.is_some() {
+                // A size is the size of a service's card.
+                c.err(format!("{cp}.size"), "bad_size");
             }
         }
     }

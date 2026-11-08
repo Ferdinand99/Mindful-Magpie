@@ -443,11 +443,68 @@ function toMs(value) {
   return Math.abs(n) < 1e11 ? n * 1000 : n;
 }
 
+// How long a curve reaches back (seconds).
+const HISTORY_S = 24 * 60 * 60;
+
+const isPlain = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+
+/** The metrics an entry's spark blocks draw: the only series worth keeping. */
+function curveMetrics(entry) {
+  const names = new Set();
+  for (const block of Array.isArray(entry?.details) ? entry.details : []) {
+    if (isPlain(block) && block.kind === "spark" && typeof block.metric === "string") names.add(block.metric);
+  }
+  return names;
+}
+
+/**
+ * The entry of a delta event merged with the one the page has: everything but the history is the
+ * event's; `history` and `history_daily` replace the page's series of the metrics they name, and
+ * each point of `history_append` is added to the end of its series, or replaces the last point when
+ * that has the same time (a slot that was rewritten). Points older than 24 hours before `nowS` go,
+ * and so do the series of metrics no spark block of the entry draws any more.
+ */
+function mergeEntry(old, fresh, nowS) {
+  const { history_append: append, ...entry } = fresh;
+  const series = isPlain(old?.history) ? { ...old.history } : {};
+  const days = isPlain(old?.history_daily) ? { ...old.history_daily } : {};
+  if (isPlain(fresh.history)) Object.assign(series, fresh.history);
+  if (isPlain(fresh.history_daily)) Object.assign(days, fresh.history_daily);
+  if (isPlain(append)) {
+    for (const [metric, point] of Object.entries(append)) {
+      if (!Array.isArray(point) || point.length < 2) continue;
+      const list = Array.isArray(series[metric]) ? [...series[metric]] : [];
+      const last = list[list.length - 1];
+      if (Array.isArray(last) && last[0] === point[0]) list[list.length - 1] = point;
+      else list.push(point);
+      series[metric] = list;
+    }
+  }
+  const drawn = curveMetrics(entry);
+  const keep = (store) => {
+    for (const metric of Object.keys(store)) if (!drawn.has(metric) || !Array.isArray(store[metric])) delete store[metric];
+  };
+  keep(series);
+  keep(days);
+  if (Number.isFinite(nowS)) {
+    for (const metric of Object.keys(series)) {
+      series[metric] = series[metric].filter((p) => Array.isArray(p) && p[0] >= nowS - HISTORY_S);
+    }
+  }
+  delete entry.history;
+  delete entry.history_daily;
+  if (Object.keys(series).length > 0) entry.history = series;
+  if (Object.keys(days).length > 0) entry.history_daily = days;
+  return entry;
+}
+
 /**
  * Merges a stream event into the values the page has. A `full` event replaces
  * them; any other event adds and replaces the entries it carries and drops the
- * ids in `removed`. The needs list (the person's «Trenger deg», acknowledgements
- * applied) is replaced when the event carries one and kept when it does not.
+ * ids in `removed`. An entry of such an event keeps the curves the page has and
+ * adds the event's history to them (see mergeEntry). The needs list (the person's
+ * «Trenger deg», acknowledgements applied) is replaced when the event carries one
+ * and kept when it does not.
  * Returns `{ values, removed }`, `removed` being every id whose values the person
  * no longer gets (the service was deleted, hidden or unbound). It says nothing of
  * the services list the editor offers: that follows `services_visible` (see
@@ -459,7 +516,14 @@ export function mergeValues(current, update) {
   const listed = Array.isArray(update?.removed) ? update.removed.map(String) : [];
   const services = update?.full ? {} : { ...before };
   for (const id of listed) delete services[id];
-  Object.assign(services, sent);
+  const nowS = Number(toMs(update?.now ?? current?.now)) / 1000;
+  for (const [id, fresh] of Object.entries(sent)) {
+    if (!isPlain(fresh)) {
+      services[id] = fresh;
+      continue;
+    }
+    services[id] = update?.full ? mergeEntry(null, fresh, nowS) : mergeEntry(services[id], fresh, nowS);
+  }
   const removed = new Set(listed);
   if (update?.full) {
     for (const id of Object.keys(before)) if (!(id in sent)) removed.add(id);

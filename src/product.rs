@@ -89,6 +89,16 @@ pub const SERVICES_TAB: SettingsTab = SettingsTab {
     access: TabAccess::Admins,
 };
 
+/// Every signed-in user's page for their own integrations
+/// (`/settings/integrations`): the services that belong to the user alone.
+pub const INTEGRATIONS_TAB: SettingsTab = SettingsTab {
+    id: "integrations",
+    href: "/settings/integrations",
+    label: "nav.my_integrations",
+    icon: "key",
+    access: TabAccess::Everyone,
+};
+
 pub static KIT: KitConfig = KitConfig {
     product: NAME,
     slug: "mindful-magpie",
@@ -140,6 +150,7 @@ pub static KIT: KitConfig = KitConfig {
         settings_tabs: &[
             SettingsTab::GENERAL,
             SERVICES_TAB,
+            INTEGRATIONS_TAB,
             SettingsTab::USERS,
             SettingsTab::SECURITY,
             SettingsTab::TOKENS,

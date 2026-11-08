@@ -2029,10 +2029,11 @@ test("an_editor_whose_page_was_swapped_away_is_dropped_by_afterSettle", async ()
 // ---- cards bound to services ---------------------------------------------------
 
 const metric = (id, label, format = "number") => ({ id, label, format });
-const service = (id, name, metrics) => ({ id, name, kind: "http", interval_s: 60, metrics });
+const service = (id, name, metrics, size = "normal") => ({ id, name, kind: "http", interval_s: 60, size, metrics });
 const SERVICES = [
   service(1, "Blog", [metric("status", "HTTP status"), metric("latency_ms", "Response time (ms)"), metric("checked", "Last checked", "since")]),
-  service(2, "Big one", ["a", "b", "c", "d", "e"].map((id) => metric(id, `Number ${id}`))),
+  // A kind whose cards are wide unless the person says otherwise.
+  service(2, "Big one", ["a", "b", "c", "d", "e"].map((id) => metric(id, `Number ${id}`)), "wide"),
 ];
 
 /** Picks the service in the form's select, as a person (or their keyboard) does. */
@@ -2086,10 +2087,10 @@ test("the_card_form_offers_a_labelled_service_select_with_none_first_in_the_tab_
   // Nothing is chosen on a card without a service, and no boxes are shown.
   assert.ok(metricsPicker(dialog).hasAttribute("hidden"));
   assert.equal(boxes(dialog).length, 0);
-  // Reachable by Tab in the order of the form: after the colours, before the buttons.
+  // Reachable by Tab in the order of the form: first, above the title, and before the buttons.
   const order = [...dialog.querySelectorAll("input, select, button, textarea, a[href]")];
-  assert.ok(order.indexOf(dialog.querySelector('[name="title"]')) < order.indexOf(select));
-  assert.ok(order.indexOf(dialog.querySelector('input[name="colour"]')) < order.indexOf(select));
+  assert.ok(order.indexOf(select) < order.indexOf(dialog.querySelector('[name="title"]')));
+  assert.ok(order.indexOf(select) < order.indexOf(dialog.querySelector('input[name="colour"]')));
   assert.ok(order.indexOf(select) < order.indexOf(dialog.querySelector('button[type="submit"]')));
   assert.equal(dialog.querySelector("[tabindex]"), null, "no tabindex: the natural order stands");
   assert.equal(select.hasAttribute("disabled"), false);
@@ -2130,9 +2131,9 @@ test("a_keyboard_flow_binds_a_card_to_a_service_with_two_numbers_and_saves_the_p
   assert.equal("service" in t.saved[0].groups[0].cards[1], false);
 });
 
-test("at_four_numbers_the_other_boxes_are_disabled_with_a_hint_and_come_back_at_three", () => {
+test("there_is_no_cap_on_numbers_and_velg_alle_ticks_every_one", async () => {
   const t = setup({ services: SERVICES });
-  t.start();
+  const ed = t.start();
   click(act(item(t.root, "card", "c1"), "edit"));
   const dialog = sheet(t.document);
   chooseService(dialog, "2");
@@ -2142,18 +2143,127 @@ test("at_four_numbers_the_other_boxes_are_disabled_with_a_hint_and_come_back_at_
   assert.equal(hint.textContent, LABELS.help_metrics);
   for (const box of boxes(dialog)) assert.equal(box.getAttribute("aria-describedby"), hint.getAttribute("id"));
 
-  for (const box of boxes(dialog).slice(1, 4)) setBox(box, true);
-  assert.deepEqual(boxes(dialog).map(boxOn), [true, true, true, true, false]);
-  assert.equal(boxes(dialog)[4].hasAttribute("disabled"), true, "the fifth is disabled");
-  assert.equal(boxes(dialog)[0].hasAttribute("disabled"), false, "the ticked ones can be cleared");
-  assert.equal(hint.textContent, LABELS.metrics_full);
-
-  setBox(boxes(dialog)[0], false);
-  assert.equal(boxes(dialog)[4].hasAttribute("disabled"), false);
+  // Past four nothing is disabled and the hint does not change.
+  for (const box of boxes(dialog).slice(1, 5)) setBox(box, true);
+  assert.deepEqual(boxes(dialog).map(boxOn), [true, true, true, true, true]);
+  for (const box of boxes(dialog)) assert.equal(box.hasAttribute("disabled"), false);
   assert.equal(hint.textContent, LABELS.help_metrics);
+
+  // «Velg alle» ticks them all, a button that submits nothing.
+  for (const box of boxes(dialog)) setBox(box, false);
+  const all = [...metricsPicker(dialog).querySelectorAll("button")].find((b) => b.textContent === LABELS.metrics_all);
+  assert.ok(all, "the picker has «Velg alle»");
+  assert.equal(all.getAttribute("type"), "button");
+  click(all);
+  assert.deepEqual(boxes(dialog).map(boxOn), [true, true, true, true, true]);
+  submit(dialog);
+  await tick();
+  assert.deepEqual(ed.draft().groups[0].cards[0].service, { id: 2, metrics: ["a", "b", "c", "d", "e"] });
 });
 
-test("a_service_with_no_number_ticked_or_five_ticked_is_refused_in_the_form", async () => {
+const sizeRadios = (dialog) => [...dialog.querySelectorAll('input[name="size"]')];
+const sizeOn = (dialog) => sizeRadios(dialog).find(boxOn)?.value ?? null;
+function setSize(dialog, value) {
+  for (const radio of sizeRadios(dialog)) {
+    const on = radio.value === value;
+    radio.checked = on;
+    if (on) radio.setAttribute("checked", "");
+    else radio.removeAttribute("checked");
+    if (on) radio.dispatchEvent(new radio.ownerDocument.defaultView.Event("change", { bubbles: true }));
+  }
+}
+
+test("the_size_choice_has_the_kinds_default_preselected_and_follows_the_service_until_touched", () => {
+  const t = setup({ services: SERVICES });
+  t.start();
+  click(act(item(t.root, "card", "c1"), "edit"));
+  const dialog = sheet(t.document);
+  const group = dialog.querySelector('[data-field="size"]');
+  assert.ok(group.hasAttribute("hidden"), "no service, no size");
+  chooseService(dialog, "1");
+  assert.equal(group.hasAttribute("hidden"), false);
+  assert.equal(group.getAttribute("role"), "radiogroup");
+  assert.deepEqual(sizeRadios(dialog).map((r) => r.value), ["normal", "wide"]);
+  assert.deepEqual(
+    sizeRadios(dialog).map((r) => r.closest("label").textContent.trim()),
+    [LABELS.size_normal, LABELS.size_wide],
+  );
+  assert.equal(group.querySelector(".label").textContent, LABELS.field_size);
+  assert.equal(sizeOn(dialog), "normal", "Blog's cards are normal");
+  chooseService(dialog, "2");
+  assert.equal(sizeOn(dialog), "wide", "Big one's cards are wide");
+  // Once the person picks one, it stays when the service changes.
+  setSize(dialog, "normal");
+  chooseService(dialog, "1");
+  chooseService(dialog, "2");
+  assert.equal(sizeOn(dialog), "normal");
+  chooseService(dialog, "");
+  assert.ok(group.hasAttribute("hidden"));
+});
+
+test("a_size_is_saved_only_when_it_differs_from_the_kinds_and_none_clears_it", async () => {
+  // Normal service: Bred is a choice and is sent; Vanlig is the kind's own and is not.
+  let t = setup({ services: SERVICES });
+  let ed = t.start();
+  click(act(item(t.root, "card", "c1"), "edit"));
+  let dialog = sheet(t.document);
+  chooseService(dialog, "1");
+  setSize(dialog, "wide");
+  submit(dialog);
+  await tick();
+  assert.deepEqual(ed.draft().groups[0].cards[0].service, { id: 1, metrics: ["status"] });
+  assert.equal(ed.draft().groups[0].cards[0].size, "wide");
+
+  // The card is edited again: its own size is what the form shows; Vanlig takes the key off.
+  click(act(item(t.root, "card", "c1"), "edit"));
+  dialog = sheet(t.document);
+  assert.equal(sizeOn(dialog), "wide");
+  setSize(dialog, "normal");
+  submit(dialog);
+  await tick();
+  assert.equal(ed.draft().groups[0].cards[0].size ?? null, null);
+
+  // Wide service: Vanlig is a choice and is sent.
+  t = setup({ services: SERVICES });
+  ed = t.start();
+  click(act(item(t.root, "card", "c1"), "edit"));
+  dialog = sheet(t.document);
+  chooseService(dialog, "2");
+  submit(dialog);
+  await tick();
+  assert.equal("size" in ed.draft().groups[0].cards[0], false, "the kind's own size is not written");
+  click(act(item(t.root, "card", "c1"), "edit"));
+  dialog = sheet(t.document);
+  setSize(dialog, "normal");
+  submit(dialog);
+  await tick();
+  assert.equal(ed.draft().groups[0].cards[0].size, "normal");
+
+  // None takes the service and the size off together, and what is saved has no size.
+  click(act(item(t.root, "card", "c1"), "edit"));
+  dialog = sheet(t.document);
+  chooseService(dialog, "");
+  submit(dialog);
+  await tick();
+  assert.equal(ed.draft().groups[0].cards[0].service, null);
+  assert.equal(ed.draft().groups[0].cards[0].size, null);
+  click(act(bar(t.document), "done"));
+  await tick();
+  assert.equal(t.saved.length, 1);
+  assert.equal(t.saved[0].groups[0].cards[0].size, null);
+});
+
+test("a_cards_own_size_is_shown_again_and_kept_when_the_service_is_gone", async () => {
+  const t = setup({ services: [], layout: layoutWith(bound(7, ["status"], { size: "wide" })) });
+  const ed = t.start();
+  click(act(item(t.root, "card", "c1"), "edit"));
+  const dialog = sheet(t.document);
+  submit(dialog);
+  await tick();
+  assert.equal(ed.draft().groups[0].cards[0].size, "wide", "saving as it is keeps the size");
+});
+
+test("a_service_with_no_number_ticked_is_refused_in_the_form", async () => {
   const t = setup({ services: SERVICES });
   const ed = t.start();
   click(act(item(t.root, "card", "c1"), "edit"));
@@ -2170,15 +2280,12 @@ test("a_service_with_no_number_ticked_or_five_ticked_is_refused_in_the_form", as
   assert.equal(t.focus.last.getAttribute("name"), "service", "focus goes to the select");
   assert.equal(ed.isDirty(), false);
 
-  // Five at once cannot be ticked from the keyboard, but the rule is the same if it were.
-  for (const box of boxes(dialog)) {
-    box.removeAttribute("disabled");
-    box.checked = true;
-  }
+  // All five at once are fine (a card may show every number of its service).
+  for (const box of boxes(dialog)) setBox(box, true);
   submit(dialog);
   await tick();
-  assert.equal(message.textContent, LABELS.err_service_metrics);
-  assert.equal(ed.isDirty(), false);
+  assert.equal(sheet(t.document), null, "the form closed");
+  assert.equal(ed.draft().groups[0].cards[0].service.metrics.length, 5);
 });
 
 test("choosing_none_sends_null_and_a_card_that_never_had_a_service_sends_no_key", async () => {
@@ -2337,7 +2444,7 @@ test("leaving_edit_mode_draws_bound_cards_with_the_services_again", async () => 
 test("every_label_the_service_field_uses_is_listed_and_translated", () => {
   const source = readFileSync(new URL("../static/magpie/edit.js", import.meta.url), "utf8");
   const listed = source.match(/export const LABEL_KEYS = \[([\s\S]*?)\];/)[1];
-  for (const key of ["field_service", "service_none", "service_missing", "help_service", "field_metrics", "help_metrics", "metrics_full", "metrics_gone", "err_service_metrics", "err_bad_service", "err_bad_metric"]) {
+  for (const key of ["field_service", "service_none", "service_missing", "help_service", "field_metrics", "help_metrics", "metrics_all", "field_size", "size_normal", "size_wide", "help_size", "metrics_gone", "err_service_metrics", "err_bad_service", "err_bad_metric"]) {
     assert.ok(listed.includes(`"${key}"`), `LABEL_KEYS lacks ${key}`);
     assert.ok(source.includes(`L("${key}"`), `${key} is used`);
     assert.ok(LABELS[key] && NB[key] && LABELS[key] !== NB[key], `${key} in both languages`);
@@ -2400,6 +2507,83 @@ test("a_number_the_service_no_longer_has_is_named_in_the_form_and_dropped_on_sav
   t2.start();
   click(act(item(t2.root, "card", "c1"), "edit"));
   assert.equal(metricsPicker(sheet(t2.document)).querySelector('[role="status"]').hasAttribute("hidden"), true);
+});
+
+// ---- the link of a card with a service -----------------------------------------
+
+test("the_service_comes_first_in_the_card_form_above_the_title", () => {
+  const t = setup({ services: SERVICES });
+  t.start();
+  click(act(item(t.root, "card", "c1"), "edit"));
+  const dialog = sheet(t.document);
+  const fields = [...dialog.querySelectorAll("[data-field]")].map((f) => f.getAttribute("data-field"));
+  // The size is part of the service's field group, right under it.
+  assert.deepEqual(fields.slice(0, 4), ["service", "size", "title", "url"]);
+  // Also first in the document order, so first by Tab.
+  const order = [...dialog.querySelectorAll("input, select")].map((el) => el.getAttribute("name"));
+  assert.ok(order.indexOf("service") < order.indexOf("title"), order.join());
+  // The link says it is optional with a service.
+  const help = dialog.querySelector('[data-field="url"] .help').textContent;
+  assert.match(help, /^Optional when you choose a service/);
+  assert.match(NB.help_url, /^Valgfri når du velger en tjeneste/);
+});
+
+test("choosing_a_service_fills_an_empty_title_and_never_replaces_a_typed_one", () => {
+  const t = setup({ services: SERVICES });
+  t.start();
+  click(act(item(t.root, "card", "c1"), "edit"));
+  const dialog = sheet(t.document);
+  const title = dialog.querySelector('input[name="title"]');
+
+  // Empty: the service's name is offered, and a second choice replaces what it filled in.
+  title.value = "";
+  chooseService(dialog, "1");
+  assert.equal(title.value, "Blog");
+  chooseService(dialog, "2");
+  assert.equal(title.value, "Big one");
+  // None leaves the title alone.
+  chooseService(dialog, "");
+  assert.equal(title.value, "Big one");
+
+  // A title the person typed is never touched.
+  title.value = "My own name";
+  chooseService(dialog, "1");
+  assert.equal(title.value, "My own name");
+  // Not even after editing what was filled in.
+  title.value = "";
+  chooseService(dialog, "2");
+  assert.equal(title.value, "Big one");
+  title.value = "Big one, edited";
+  chooseService(dialog, "1");
+  assert.equal(title.value, "Big one, edited");
+});
+
+test("a_card_with_a_service_saves_without_a_link_and_a_plain_card_does_not", async () => {
+  const t = setup({ services: SERVICES });
+  const ed = t.start();
+  click(act(item(t.root, "card", "c1"), "edit"));
+  let dialog = sheet(t.document);
+  dialog.querySelector('input[name="url"]').value = "";
+  // Without a service the empty link is refused, at the field.
+  submit(dialog);
+  await tick();
+  assert.equal(dialog.querySelector('input[name="url"]').getAttribute("aria-invalid"), "true");
+  assert.equal(ed.isDirty(), false);
+
+  // With one it is saved empty.
+  chooseService(dialog, "1");
+  submit(dialog);
+  await tick();
+  assert.equal(ed.draft().groups[0].cards[0].url, "");
+  assert.equal(ed.draft().groups[0].cards[0].service.id, 1);
+
+  // A link that is typed is still checked.
+  click(act(item(t.root, "card", "c1"), "edit"));
+  dialog = sheet(t.document);
+  dialog.querySelector('input[name="url"]').value = "ftp://x/";
+  submit(dialog);
+  await tick();
+  assert.equal(dialog.querySelector('input[name="url"]').getAttribute("aria-invalid"), "true");
 });
 
 test("the_numbers_picker_has_room_above_its_legend", () => {

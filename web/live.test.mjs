@@ -935,3 +935,64 @@ test("a_renamed_service_that_no_card_uses_is_offered_under_its_new_name", () => 
     ["Blog", "Handbook"],
   );
 });
+
+test("mergeValues_keeps_the_curves_and_adds_the_points_of_a_delta", () => {
+  const NOW = 1_762_900_000;
+  const spark = (metric) => ({ kind: "spark", title_key: "x", metric, style: "line" });
+  const details = [spark("lat"), spark("load")];
+  const current = {
+    now: NOW,
+    services: {
+      7: {
+        name: "a",
+        details,
+        history: { lat: [[NOW - 90_000, 1], [NOW - 600, 10], [NOW - 300, 11]], load: [[NOW - 300, 0.5]], gone: [[NOW - 300, 1]] },
+        history_daily: { lat: [["2025-11-11", 1, 2, 1.5]] },
+      },
+    },
+  };
+  const frozen = JSON.stringify(current);
+  // A delta: a new point for lat, the slot of load rewritten, and the entry's values (no history).
+  const update = {
+    now: NOW + 300,
+    full: false,
+    services: { 7: { name: "a", details, values: { lat: { num: 12 } }, history_append: { lat: [NOW, 12], load: [NOW - 300, 0.7] } } },
+    removed: [],
+  };
+  const { values } = mergeValues(current, update);
+  const entry = values.services[7];
+  assert.deepEqual(entry.history.lat, [[NOW - 600, 10], [NOW - 300, 11], [NOW, 12]], "the point added, the day-old one gone");
+  assert.deepEqual(entry.history.load, [[NOW - 300, 0.7]], "the same time replaces the last point");
+  assert.equal(entry.history.gone, undefined, "a series no spark draws is dropped");
+  assert.deepEqual(entry.history_daily, { lat: [["2025-11-11", 1, 2, 1.5]] }, "the days stay");
+  assert.equal(entry.history_append, undefined);
+  assert.deepEqual(entry.values, { lat: { num: 12 } });
+  assert.equal(JSON.stringify(current), frozen, "the arguments are not changed");
+
+  // `history` and `history_daily` in a delta replace the series of the metrics they name.
+  const whole = mergeValues(values, {
+    now: NOW + 600,
+    services: { 7: { name: "a", details, history: { load: [[NOW + 300, 2]] }, history_daily: { lat: [["2025-11-12", 3, 4, 3.5]] } } },
+  }).values.services[7];
+  assert.deepEqual(whole.history.load, [[NOW + 300, 2]]);
+  assert.deepEqual(whole.history.lat, entry.history.lat);
+  assert.deepEqual(whole.history_daily.lat, [["2025-11-12", 3, 4, 3.5]]);
+
+  // A full event replaces everything, and keeps only the curves the blocks draw.
+  const full = mergeValues(values, {
+    now: NOW + 900,
+    full: true,
+    services: { 7: { name: "a", details: [spark("lat")], history: { lat: [[NOW + 900, 1]], load: [[NOW + 900, 1]] } } },
+  }).values.services[7];
+  assert.deepEqual(full.history, { lat: [[NOW + 900, 1]] });
+  assert.equal(full.history_daily, undefined);
+
+  // No spark left: no curves kept. Odd shapes do not throw.
+  const none = mergeValues(values, { now: NOW + 900, services: { 7: { name: "a" } } }).values.services[7];
+  assert.equal(none.history, undefined);
+  const odd = mergeValues(values, {
+    now: NOW + 900,
+    services: { 7: { name: "a", details, history: "junk", history_append: { lat: "x", load: [1] }, history_daily: [] } },
+  }).values.services[7];
+  assert.deepEqual(odd.history.lat, entry.history.lat);
+});

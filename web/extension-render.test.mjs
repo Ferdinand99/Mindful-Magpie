@@ -92,7 +92,8 @@ test("the new tab renders a layout through the vendored renderer, same as the we
     [...v.root.querySelectorAll("h2")].map((e) => e.textContent),
     ["Work", "Home"],
   );
-  assert.equal(v.root.querySelectorAll("a.mm-card").length, 2);
+  assert.equal(v.root.querySelectorAll(".mm-card").length, 3);
+  assert.equal(v.root.querySelectorAll("a.mm-card-link").length, 2, "the two valid links are the cards' titles");
   assert.equal(v.root.querySelectorAll(".mm-card-invalid").length, 1);
   assert.equal(v.root.querySelector("nav.mm-bookmarks a").textContent, "News");
   assert.equal(v.statusEl.textContent, "Oppdatert");
@@ -320,7 +321,7 @@ test("fetchBackground times out into null when the server never answers", async 
 test("labels: the keys are the ones render.js reads, and the texts the server's strings", () => {
   // The server's #mm-labels block also carries the editor's strings; the extension does not edit,
   // so it ships only what the renderer reads: the keys of its label(...) calls.
-  const used = [...new Set([...repo("static/magpie/render.js").matchAll(/label\((?:opts\.)?labels,\s*"(\w+)"\)/g)].map((m) => m[1]))];
+  const used = [...new Set([...repo("static/magpie/render.js").matchAll(/label\((?:opts\.|ctx\.)?labels,\s*"(\w+)"\)/g)].map((m) => m[1]))];
   assert.ok(used.length >= 4, `only ${used.length} keys found in render.js`);
   const rust = repo("src/pages.rs");
   const block = rust.slice(rust.indexOf("fn labels()"));
@@ -332,7 +333,11 @@ test("labels: the keys are the ones render.js reads, and the texts the server's 
   });
   for (const lang of ["en", "nb"]) {
     const toml = repo(`locales/${lang}.toml`);
-    assert.deepEqual(Object.keys(shipped[lang]).sort(), [...used].sort());
+    // The renderer's own strings; the detail titles (detail.<key>) are tested with the generated file.
+    assert.deepEqual(
+      Object.keys(shipped[lang]).filter((key) => !key.startsWith("detail.")).sort(),
+      [...used].sort(),
+    );
     for (const [, key, tomlKey] of keys) {
       const line = toml.match(new RegExp(`^${tomlKey} = "(.*)"$`, "m"));
       assert.ok(line, `${lang}.toml has start.${tomlKey}`);
@@ -420,4 +425,60 @@ test("the acknowledged toggle opens the list in the new tab", () => {
   click(again);
   assert.equal(again.getAttribute("aria-expanded"), "false");
   assert.ok(v.root.querySelector(".mm-needs-acked").hasAttribute("hidden"));
+});
+
+// ---- blocks and sizes ----
+
+test("the new tab draws blocks and sizes with the vendored renderer, in the browser's language", async () => {
+  const v = makeView({ language: "nb-NO" });
+  const services = [
+    { id: 1, name: "Plain", kind: "http", interval_s: 60, size: "normal", link: "https://p.example", metrics: [{ id: "a", label: "A", format: "number" }] },
+    { id: 2, name: "Rich", kind: "github", interval_s: 60, size: "wide", link: "https://r.example", metrics: [{ id: "a", label: "A", format: "number" }] },
+  ];
+  const lines = Array.from({ length: 5 }, (_, i) => ({ text: `line ${i}`, status: "warn", href: `https://x.example/${i}` }));
+  const entry = (n) => ({
+    name: "x",
+    kind: "http",
+    interval_s: 60,
+    status: "ok",
+    values: { a: { num: n } },
+    details: [
+      { kind: "list", title_key: "t", items: lines },
+      { kind: "bars", title_key: "t", bars: [{ label: "CPU", pct: 40, text: "40 %" }] },
+    ],
+    fetched_at: Math.floor(Date.now() / 1000),
+  });
+  const bound = (id, service) => ({ ...card(id, `Card ${id}`), url: "", service: { id: service, metrics: ["a"] } });
+  const data = layout({ groups: [{ id: "g", title: "G", cards: [bound("c1", 1), bound("c2", 2)] }] });
+  const values = { now: Math.floor(Date.now() / 1000), services: { 1: entry(1), 2: entry(2) } };
+  await v.draw({ status: "fresh", data, services, values }, CONN);
+  const [plain, rich] = v.root.querySelectorAll(".mm-card");
+  // Normal: the list cut at three lines with the Norwegian note, and the bars.
+  assert.equal(plain.querySelectorAll(".mm-li").length, 3);
+  assert.equal(plain.querySelector(".mm-block-more").textContent, "+ 2 til");
+  assert.equal(plain.querySelectorAll(".mm-bar").length, 1);
+  // Wide: its own class, every line.
+  assert.ok(/\bmm-card-wide\b/.test(rich.getAttribute("class")));
+  assert.equal(rich.querySelectorAll(".mm-li").length, 5);
+  assert.equal(rich.querySelector(".mm-block-more"), null);
+
+  // A refresh of the numbers keeps the card elements and a link inside a block.
+  const link = rich.querySelector("a.mm-li-text");
+  await v.draw.update({ status: "fresh", data, services, values: { ...values, services: { 1: entry(5), 2: entry(6) } } }, CONN);
+  assert.ok(v.root.querySelector(".mm-card-wide a.mm-li-text") === link, "the same link element");
+  assert.equal(rich.querySelector(".mm-metric-value").textContent, "6");
+});
+
+test("a server without details or sizes still draws its cards", async () => {
+  const v = makeView();
+  const services = [{ id: 1, name: "Old", kind: "http", interval_s: 60, link: "https://o.example", metrics: [{ id: "a", label: "A", format: "number" }] }];
+  const data = layout({
+    groups: [{ id: "g", title: "G", cards: [{ ...card("c1", "Old card"), url: "", service: { id: 1, metrics: ["a"] } }] }],
+  });
+  const values = { now: 1, services: { 1: { name: "Old", kind: "http", interval_s: 60, status: "ok", values: { a: { num: 3 } }, fetched_at: 1 } } };
+  await v.draw({ status: "fresh", data, services, values }, CONN);
+  const el = v.root.querySelector(".mm-card");
+  assert.equal(el.querySelector(".mm-metric-value").textContent, "3");
+  assert.equal(el.querySelector(".mm-blocks"), null);
+  assert.ok(!/mm-card-wide/.test(el.getAttribute("class")));
 });

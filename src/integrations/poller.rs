@@ -28,11 +28,14 @@
 //!
 //! **«Trenger deg».** A kind sees one fetch at a time, so "bad twice in a row"
 //! is the poller's: from the second bad reading in a row a service gets a
-//! need. It is [`DOWN_KEY`] («the site does not answer») for a kind that has
-//! the rule (see [`down_label`]), or [`CONFIG_KEY`] («set it up again») when
-//! the reading failed because the settings, the address or the stored secret
-//! can't be used (an address that is not allowed, a redirect to another
-//! scheme): that needs an admin, not the site. The count survives a restart, an update
+//! need. It is [`DOWN_KEY`] («not answering») when the fetch failed in a way
+//! that may pass by itself (no connection, a timeout, a server error, an odd
+//! answer: [`FetchError::is_unreachable`]), for every kind (see
+//! [`down_label`]); or [`CONFIG_KEY`] («set it up again») when it failed
+//! because the settings, the address, the stored secret or the key can't be
+//! used ([`FetchError::is_config`]): that needs an admin, not the site. A
+//! kind's own bad reading, one that is not a failed fetch (a monitor is down),
+//! gets neither: the kind has its own needs. The count survives a restart, an update
 //! and a resync: it is taken up again from the stored snapshot, so a need
 //! that is showing does not go and come back (an acknowledgement would
 //! reopen).
@@ -42,7 +45,8 @@
 //! an address or a secret: log lines carry the service id, the kind and a
 //! [`FetchError`] text, which is a fixed set.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -52,7 +56,8 @@ use tokio::task::{AbortHandle, JoinSet};
 use vole_kit::db;
 use vole_kit::state::Core;
 
-use super::{FetchError, Integration, Level, Need, Snapshot, Status};
+use super::{FetchError, Integration, Level, MetricDef, Need, Snapshot, Status};
+use crate::history::{self, History, Point, Tail};
 use crate::services::{Service, ServiceEvent, store};
 
 /// How long one fetch may take before the poller gives up on it. The HTTP
@@ -94,13 +99,16 @@ impl Default for Options {
     }
 }
 
-/// The translation key of the need «bad twice in a row» for `kind`, when the
-/// kind has the rule. Kinds that know better report their own needs from
-/// `fetch`; `http` has nothing but this.
-pub fn down_label(kind: &str) -> Option<&'static str> {
+/// The translation key of the need «failed twice in a row» of every kind
+/// that has no label of its own: «Not answering».
+pub const SERVICE_DOWN_LABEL: &str = "need.service_down";
+
+/// The translation key of the need «failed twice in a row» for `kind`: the
+/// short «down» of `http`, «Not answering» for every other kind.
+pub fn down_label(kind: &str) -> &'static str {
     match kind {
-        "http" => Some("need.http_down"),
-        _ => None,
+        "http" => "need.http_down",
+        _ => SERVICE_DOWN_LABEL,
     }
 }
 
@@ -117,6 +125,11 @@ struct State {
 
 struct Shared {
     state: RwLock<State>,
+    /// The series of every number the services report (see [`crate::history`]).
+    history: History,
+    /// Seconds added to the clock the pages read ([`PollerHandle::now`]); only
+    /// tests move it.
+    skew: AtomicI64,
     changes: broadcast::Sender<Change>,
 }
 
@@ -124,6 +137,8 @@ impl Shared {
     fn new() -> Arc<Self> {
         Arc::new(Shared {
             state: RwLock::new(State::default()),
+            history: History::default(),
+            skew: AtomicI64::new(0),
             changes: broadcast::channel(256).0,
         })
     }
@@ -140,19 +155,47 @@ impl Shared {
         let mut state = self.write();
         state.live.remove(&id);
         state.snapshots.remove(&id);
+        drop(state);
+        self.history.forget(id);
     }
 
-    /// Stores `snapshot` and announces `id`, unless `generation` is no longer
-    /// the service's.
-    fn publish(&self, id: i64, generation: u64, snapshot: Arc<Snapshot>) {
-        {
+    /// Stores `snapshot`, records its numbers in the history (before the
+    /// announcement, so whoever wakes for it sees the new point) and announces
+    /// `id`, unless `generation` is no longer the service's. Returns what the
+    /// history tables are to be given for a good reading.
+    fn publish(
+        &self,
+        id: i64,
+        generation: u64,
+        interval_s: i64,
+        metrics: &[MetricDef],
+        snapshot: Arc<Snapshot>,
+    ) -> Option<history::Write> {
+        let write = {
             let mut state = self.write();
             if state.live.get(&id) != Some(&generation) {
-                return;
+                return None;
             }
+            let numbers = history::numbers(&snapshot, metrics);
+            let peaks = metrics
+                .iter()
+                .filter(|m| m.peak)
+                .map(|m| m.id.to_string())
+                .collect();
+            let write = (!numbers.is_empty()).then(|| {
+                self.history.record_with_peaks(
+                    id,
+                    interval_s,
+                    snapshot.fetched_at.as_second(),
+                    numbers,
+                    &peaks,
+                )
+            });
             state.snapshots.insert(id, snapshot);
-        }
+            write
+        };
         let _ = self.changes.send(Change::Snapshot(id));
+        write
     }
 }
 
@@ -168,6 +211,7 @@ pub enum Change {
 enum Control {
     Reload(i64),
     Remove(i64),
+    Resync,
 }
 
 /// A running poller, as the pages see it. Cheap to clone; when the last clone
@@ -198,6 +242,15 @@ impl PollerHandle {
         }
     }
 
+    /// Looks at every stored service again: a service that is gone (a deleted
+    /// user's personal ones go with the user) loses its task and snapshot, a
+    /// changed or new one is fetched. For changes that make no service event.
+    pub fn resync(&self) {
+        if let Some(control) = &self.control {
+            let _ = control.send(Control::Resync);
+        }
+    }
+
     /// Forgets the service as if it were deleted: its task stops, its
     /// snapshot and its row go, and [`Change::Removed`] is announced.
     /// [`PollerHandle::snapshot`] answers `None` from the moment this returns.
@@ -222,11 +275,80 @@ impl PollerHandle {
         self.shared.read().snapshots.get(&service_id).cloned()
     }
 
+    /// The last 24 hours of the numbers `metrics` of the service, by metric,
+    /// oldest point first (see [`crate::history`]). Never waits on the database.
+    pub fn history(
+        &self,
+        service_id: i64,
+        metrics: &BTreeSet<String>,
+        now: i64,
+    ) -> BTreeMap<String, Vec<Point>> {
+        self.shared.history.series(service_id, metrics, now)
+    }
+
+    /// What changed in the series of `metrics` since the page had the point
+    /// `known` of each (see [`History::tail`]). Never copies a series.
+    pub fn history_tail(
+        &self,
+        service_id: i64,
+        known: &BTreeMap<String, Point>,
+        metrics: &BTreeSet<String>,
+        now: i64,
+    ) -> BTreeMap<String, Tail> {
+        self.shared.history.tail(service_id, known, metrics, now)
+    }
+
+    /// The clock the pages and the history read: Unix seconds. (Tests move it
+    /// with [`PollerHandle::advance_clock_for_tests`].)
+    pub fn now(&self) -> i64 {
+        jiff::Timestamp::now().as_second() + self.shared.skew.load(Ordering::Relaxed)
+    }
+
+    /// Moves [`PollerHandle::now`] on by `seconds`, for this poller only: a
+    /// stream that has been open for days, without waiting. **For tests only**
+    /// (hidden from the docs).
+    #[doc(hidden)]
+    pub fn advance_clock_for_tests(&self, seconds: i64) {
+        self.shared.skew.fetch_add(seconds, Ordering::Relaxed);
+    }
+
     /// A [`Change`] each time a service gets a new snapshot or is removed (also
     /// when its deletion arrives as a service event). A receiver that falls far
     /// behind gets `Lagged` and should read every snapshot again.
     pub fn subscribe(&self) -> broadcast::Receiver<Change> {
         self.shared.changes.subscribe()
+    }
+
+    /// Records the numbers of `snapshot` in the service's history as a fetch
+    /// of a service with this interval would, without storing them. Call it
+    /// before [`PollerHandle::set_snapshot_for_tests`], which announces the
+    /// snapshot. **For tests only** (hidden from the docs).
+    #[doc(hidden)]
+    pub fn record_history_for_tests(&self, service_id: i64, interval_s: i64, snapshot: &Snapshot) {
+        self.record_peaks_for_tests(service_id, interval_s, snapshot, &[]);
+    }
+
+    /// [`PollerHandle::record_history_for_tests`] where the metrics in `peaks`
+    /// keep the highest reading of a slot. **For tests only** (hidden from the
+    /// docs).
+    #[doc(hidden)]
+    pub fn record_peaks_for_tests(
+        &self,
+        service_id: i64,
+        interval_s: i64,
+        snapshot: &Snapshot,
+        peaks: &[&str],
+    ) {
+        let numbers = history::numbers(snapshot, &[]);
+        if !numbers.is_empty() {
+            self.shared.history.record_with_peaks(
+                service_id,
+                interval_s,
+                snapshot.fetched_at.as_second(),
+                numbers,
+                &peaks.iter().map(|p| p.to_string()).collect(),
+            );
+        }
     }
 
     /// Puts `snapshot` in as the service's latest, as a fetch would (and
@@ -316,6 +438,15 @@ struct Running {
     service: Service,
 }
 
+/// The address of a service as the kinds' memory keys it (see
+/// [`super::api::service_prefix`]); `None` when `url` is not an address.
+fn address_of(url: &str) -> Option<String> {
+    let url = url::Url::parse(url.trim()).ok()?;
+    url.origin()
+        .is_tuple()
+        .then(|| super::api::service_prefix(&url))
+}
+
 /// Whether a restart of the task would change nothing: the same kind, name,
 /// address, settings, interval and secret (a replaced secret changes
 /// `updated_at`).
@@ -335,7 +466,8 @@ impl Supervisor {
         mut commands: mpsc::UnboundedReceiver<Control>,
         events: broadcast::Receiver<ServiceEvent>,
     ) {
-        match store::list(&self.core).await {
+        self.load_stored().await;
+        match store::list_all(&self.core).await {
             Ok(services) => {
                 tracing::info!(services = services.len(), "poller started");
                 for service in services {
@@ -352,6 +484,7 @@ impl Supervisor {
                     None => break,
                     Some(Control::Reload(id)) => self.reload(id).await,
                     Some(Control::Remove(id)) => self.remove(id).await,
+                    Some(Control::Resync) => self.resync().await,
                 },
                 event = next_event(&mut events) => match event {
                     Ok(ServiceEvent::Created(id) | ServiceEvent::Updated(id)) => {
@@ -375,6 +508,11 @@ impl Supervisor {
 
     /// Puts the stored snapshots in memory, before the first fetch.
     async fn load_stored(&self) {
+        let now = jiff::Timestamp::now().as_second();
+        match db::interact(&self.core.db, move |c| history::load_rows(c, now)).await {
+            Ok(rows) => self.shared.history.load(rows),
+            Err(err) => tracing::warn!(%err, "poller can't read the stored history"),
+        }
         let rows = db::interact(&self.core.db, |c| {
             let mut stmt = c.prepare("SELECT service_id, json FROM service_snapshots")?;
             stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
@@ -439,20 +577,49 @@ impl Supervisor {
     }
 
     async fn reload(&mut self, id: i64) {
-        match store::get(&self.core, id).await {
-            Ok(Some(service)) => self.spawn(service, Duration::ZERO),
+        match store::get_any(&self.core, id).await {
+            Ok(Some(service)) => {
+                // Saved again, or announced: an app that was too old a few
+                // minutes ago may have been upgraded since.
+                if let Some(url) = &service.url {
+                    super::api::forget_all_for(url);
+                }
+                self.spawn(service, Duration::ZERO);
+            }
             Ok(None) => self.remove(id).await,
             Err(err) => tracing::warn!(service_id = id, %err, "poller can't read the service"),
         }
     }
 
     async fn remove(&mut self, id: i64) {
-        if let Some(task) = self.running.remove(&id) {
+        let removed = self.running.remove(&id);
+        if let Some(task) = &removed {
             task.abort.abort();
         }
         self.shared.forget(id);
+        // What the kinds remember of the address (a 404, the monitors that
+        // came back, a window of response times) goes with the last service
+        // there; while another one still polls the same address it is theirs.
+        if let Some(url) = removed
+            .as_ref()
+            .and_then(|task| task.service.url.as_deref())
+            && let Some(address) = address_of(url)
+            && !self.running.values().any(|other| {
+                other.service.url.as_deref().and_then(address_of) == Some(address.clone())
+            })
+        {
+            super::api::forget_all_for(url);
+        }
         // Normally the row went with the service already.
         let deleted = db::interact(&self.core.db, move |c| {
+            c.execute(
+                "DELETE FROM service_history WHERE service_id = ?1",
+                params![id],
+            )?;
+            c.execute(
+                "DELETE FROM service_history_daily WHERE service_id = ?1",
+                params![id],
+            )?;
             c.execute(
                 "DELETE FROM service_snapshots WHERE service_id = ?1",
                 params![id],
@@ -471,7 +638,7 @@ impl Supervisor {
     /// schedule, backoff and count of bad readings. A task of a service that is
     /// gone stops.
     async fn resync(&mut self) {
-        let services = match store::list(&self.core).await {
+        let services = match store::list_all(&self.core).await {
             Ok(services) => services,
             Err(err) => {
                 tracing::warn!(%err, "poller can't list the services");
@@ -560,10 +727,11 @@ impl Job {
             };
             if bad_in_a_row >= DOWN_AFTER
                 && snapshot.status == Status::Bad
-                && let Some(need) = bad_need(&self.service, &snapshot)
+                && let Some(need) = bad_need(&self.service, &snapshot, failed)
             {
                 snapshot.needs.push(need);
             }
+            snapshot.bound_details();
             let before = self.shared.read().snapshots.get(&self.service.id).cloned();
             date_needs(&mut snapshot, before.as_deref());
             self.clear_acks(&snapshot, before.as_deref()).await;
@@ -575,8 +743,18 @@ impl Job {
                 "poller fetched"
             );
             self.store(&snapshot).await;
-            self.shared
-                .publish(self.service.id, self.generation, Arc::new(snapshot));
+            let written = self.shared.publish(
+                self.service.id,
+                self.generation,
+                i64::try_from(interval.as_secs()).unwrap_or(i64::MAX),
+                self.kind.metrics(),
+                Arc::new(snapshot),
+            );
+            if let Some(written) = written
+                && let Err(err) = history::persist(&self.core, written).await
+            {
+                tracing::warn!(service_id = self.service.id, %err, "poller can't store the history");
+            }
             tokio::time::sleep(jitter(next_wait(interval, failures))).await;
         }
     }
@@ -627,7 +805,11 @@ impl Job {
                 return Some((Snapshot::failed(&err.fetch_error()), true));
             }
         };
-        ctx.http = self.http.clone();
+        // The client the poller was started with, unless the service is pinned:
+        // then it keeps its own, which accepts only its certificate.
+        if !matches!(super::pin::from_settings(&ctx.settings), Ok(Some(_))) {
+            ctx.http = self.http.clone();
+        }
         let kind = self.kind;
         let fetch = tokio::spawn(async move { kind.fetch(&ctx).await });
         let _stop = AbortOnDrop(fetch.abort_handle());
@@ -718,31 +900,32 @@ fn need_marks(snapshot: &Snapshot) -> Vec<(&str, Level, u64)> {
         .collect()
 }
 
-/// The failures that an admin has to fix, not the site: settings that can't
-/// be used, an address that is not allowed, a redirect that is not allowed
-/// and a secret that can't be opened.
-const CONFIG_ERRORS: [FetchError; 4] = [
-    FetchError::Config,
-    FetchError::Forbidden,
-    FetchError::RedirectScheme,
-    FetchError::SecretUnreadable,
-];
-
-/// Whether the reading failed because of one of [`CONFIG_ERRORS`].
-fn is_config_error(snapshot: &Snapshot) -> bool {
-    snapshot
-        .error
-        .as_deref()
-        .is_some_and(|text| CONFIG_ERRORS.iter().any(|e| e.to_string() == text))
+/// Why the reading failed, when it did (its error text is one of
+/// [`FetchError`]'s).
+fn failure(snapshot: &Snapshot) -> Option<FetchError> {
+    snapshot.error.as_deref().and_then(FetchError::from_text)
 }
 
-/// The need of a service that has had bad readings in a row, if its kind has
-/// one for this reading.
-fn bad_need(service: &Service, snapshot: &Snapshot) -> Option<Need> {
-    let (key, label_key) = if is_config_error(snapshot) {
+/// The need of a service that has had bad readings in a row, for this
+/// reading: «set it up again» for a failure only an admin can fix, «down» for
+/// a fetch that did not get an answer (`failed`: no reading was made, or the
+/// deadline passed, or the kind panicked), and none for anything else (a
+/// kind's own bad reading, even one that carries the error of a call that
+/// failed, a 4xx answer, a rate limit): the server answered, so it is not
+/// «down». `http` is the one kind whose every bad reading says the site is
+/// down, a wrong status included.
+fn bad_need(service: &Service, snapshot: &Snapshot, failed: bool) -> Option<Need> {
+    let reason = failure(snapshot);
+    let http = service.kind == "http";
+    let (key, label_key) = if reason.as_ref().is_some_and(FetchError::is_config) {
         (CONFIG_KEY, CONFIG_LABEL)
+    } else if (failed || http)
+        && ((http && snapshot.error.is_some())
+            || reason.as_ref().is_some_and(FetchError::is_unreachable))
+    {
+        (DOWN_KEY, down_label(&service.kind))
     } else {
-        (DOWN_KEY, down_label(&service.kind)?)
+        return None;
     };
     Some(Need {
         key: key.to_string(),

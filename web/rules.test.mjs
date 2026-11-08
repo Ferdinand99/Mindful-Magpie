@@ -4,6 +4,7 @@ import { test } from "node:test";
 
 import {
   LIMITS,
+  SIZES,
   checkBookmark,
   checkCard,
   checkGroup,
@@ -11,6 +12,7 @@ import {
   normalizeUrl,
   parsePath,
   serviceProblem,
+  sizeProblem,
   urlProblem,
 } from "../static/magpie/rules.js";
 
@@ -118,7 +120,11 @@ test("a_card_without_a_service_or_with_one_to_four_metrics_passes", () => {
 test("service_bindings_are_refused_by_the_same_codes_as_the_server", () => {
   const one = (service) => checkCard({ ...ok, service }).service;
   assert.equal(one({ id: 3, metrics: [] }), "required");
-  assert.equal(one({ id: 3, metrics: ["a", "b", "c", "d", "e"] }), "too_many");
+  // Any number from one up is fine, each once; a list longer than any kind has is refused by its length.
+  assert.equal(one({ id: 3, metrics: ["a", "b", "c", "d", "e", "f", "g", "h"] }), undefined);
+  const many = Array.from({ length: LIMITS.serviceMetrics + 1 }, (_, i) => `m${i}`);
+  assert.equal(one({ id: 3, metrics: many }), "too_many");
+  assert.equal(one({ id: 3, metrics: many.slice(0, LIMITS.serviceMetrics) }), undefined);
   assert.equal(one({ id: 3, metrics: ["a", "b", "a"] }), "duplicate_id");
   assert.equal(one({ id: 3, metrics: ["has space"] }), "bad_id");
   assert.equal(one({ id: 3, metrics: [""] }), "bad_id");
@@ -128,6 +134,31 @@ test("service_bindings_are_refused_by_the_same_codes_as_the_server", () => {
   assert.equal(one({ id: 1.5, metrics: ["a"] }), "bad_service");
   assert.equal(one({ id: "3", metrics: ["a"] }), "bad_service");
   assert.equal(one({ id: 3, metrics: "a" }), "required");
-  assert.equal(LIMITS.serviceMetrics, 4);
+  assert.equal(LIMITS.serviceMetrics, 32);
   assert.equal(serviceProblem(null), null);
+});
+
+test("a_card_link_may_be_empty_only_when_the_card_has_a_service", () => {
+  const base = { title: "T", description: "", emoji: "", colour: "teal" };
+  const service = { id: 1, metrics: ["status"] };
+  assert.deepEqual(checkCard({ ...base, url: "", service }), {});
+  assert.deepEqual(checkCard({ ...base, url: "", service: null }), { url: "required" });
+  assert.deepEqual(checkCard({ ...base, url: " ", service }), { url: "required" });
+  assert.deepEqual(checkCard({ ...base, url: "ftp://x/", service }), { url: "bad_scheme" });
+  assert.deepEqual(checkCard({ ...base, url: "https://ok.example/", service }), {});
+});
+
+test("a_size_is_normal_or_wide_and_only_with_a_service", () => {
+  const base = { title: "T", description: "", emoji: "", colour: "teal", url: "https://ok.example/" };
+  const service = { id: 1, metrics: ["status"] };
+  assert.deepEqual(SIZES, ["normal", "wide"]);
+  for (const size of ["normal", "wide", null, undefined]) {
+    assert.deepEqual(checkCard({ ...base, service, size }), {}, String(size));
+    assert.deepEqual(checkCard({ ...base, service: null, size: size ?? null }), size ? { size: "bad_size" } : {}, String(size));
+  }
+  for (const bad of ["huge", "WIDE", "", 2, {}]) {
+    assert.deepEqual(checkCard({ ...base, service, size: bad }), { size: "bad_size" }, String(bad));
+  }
+  assert.equal(sizeProblem("wide", service), null);
+  assert.equal(sizeProblem("wide", null), "bad_size");
 });

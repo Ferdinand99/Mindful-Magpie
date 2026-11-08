@@ -1,0 +1,1555 @@
+//! The `github` kind: a user's own GitHub numbers (reviews waiting for them,
+//! their open pull requests, red CI on default branches, open Dependabot
+//! alerts, releases of the last day), read with a fine-grained personal access
+//! token that has read access only.
+//!
+//! **Personal.** The address is fixed in the kind (`https://api.github.com`):
+//! a service has no address of its own, so there is no address to point at an
+//! internal host. The token is the user's own, and so is the service (see
+//! [`Integration::personal`]). One fine-grained token covers one owner or
+//! organisation, so a user adds a service for each. The optional `owners`
+//! setting narrows the repositories to the named users and organisations (the
+//! token's own account when empty).
+//!
+//! **Calls.** One GraphQL query a fetch asks for the repositories (default
+//! branch status, open Dependabot alerts, the newest releases) and, with the
+//! user's login (asked once, then remembered), the pull requests waiting for
+//! their review (the count and the newest few) and the number of their own
+//! open ones. The rollup also asks for its first ten checks (`contexts`) to
+//! name the failing one; that adds one more connection per repository and
+//! raises the query's point cost by about one point for a hundred repositories. A repository whose
+//! default branch has no status in the answer gets one REST call (the newest
+//! completed workflow runs on that branch), for at most [`CI_FALLBACK_MAX`]
+//! repositories a fetch. Repositories past the first 100 of an owner are not
+//! counted.
+//!
+//! **A missing permission gives fewer numbers, not an error.** A part of the
+//! query the token may not read (the answer's errors name its path) is left out
+//! of the next ones for an hour and the metrics that need it are absent. A
+//! refused token (401) is [`FetchError::Auth`].
+//!
+//! **Rate limit.** Every answer's `X-RateLimit-Remaining` and
+//! `X-RateLimit-Reset` (and `Retry-After`) are read. When none is left the
+//! service waits for the reset (at most [`MAX_WAIT`]) and fetches answer
+//! [`FetchError::RateLimited`] without a request until then. What is
+//! remembered (the wait, the login, the denied parts) is kept in memory, per
+//! service, for at most [`MEMORY_MAX`] services, and dropped when the token
+//! changes.
+//!
+//! **Details.** Next to the numbers the reading carries lists for the card:
+//! the pull requests waiting for the user's review (title, «repository ·
+//! author», age, link), the repositories with red CI (branch and failing
+//! check, link), the releases of the last day (tag, repository, age, link) and
+//! the repositories with Dependabot alerts (count, link). Titles, repository
+//! names and logins go into these blocks only, as text, never into the numbers,
+//! the needs or an error. A link is kept only when it is an `https` address on
+//! `github.com` ([`github_link`]). The pull requests asked for are the newest
+//! [`MAX_ITEMS`]; the number counts all of them.
+//!
+//! The token is sent as `Authorization: Bearer`, marked sensitive, and never
+//! reaches an error, a reading or a log line.
+
+use std::collections::{BTreeSet, VecDeque};
+use std::sync::Mutex;
+use std::time::Duration;
+
+use jiff::{SignedDuration, Timestamp};
+use reqwest::header::{ACCEPT, HeaderMap};
+use serde_json::{Value as Json, json};
+use sha2::{Digest, Sha256};
+use url::Url;
+
+use super::api;
+use super::block::{Block, ListItem, MAX_ITEMS, TEXT_CHARS};
+use super::{
+    BoxFuture, FetchCtx, FetchError, Field, FieldKind, Format, Integration, Level, MetricDef, Need,
+    SettingError, Snapshot, Status, Value, read_capped,
+};
+
+/// The address of the GitHub API.
+pub const API: &str = "https://api.github.com";
+
+/// The most users and organisations the `owners` setting may name.
+pub const MAX_OWNERS: usize = 5;
+/// The most repositories a fetch asks the workflow runs of (REST).
+pub const CI_FALLBACK_MAX: usize = 10;
+/// With this few requests left in the window the optional REST calls wait.
+const LOW_REMAINING: u64 = 25;
+/// How long a service waits after a secondary rate limit (no reset is given).
+const SECONDARY_WAIT: SignedDuration = SignedDuration::from_secs(60);
+/// The longest a service waits for a rate limit to reset.
+pub const MAX_WAIT: SignedDuration = SignedDuration::from_hours(2);
+/// How long a part of the query that the token may not read is left out.
+const DENIED_FOR: SignedDuration = SignedDuration::from_hours(1);
+/// Most services whose memory is kept; past that the oldest goes.
+pub const MEMORY_MAX: usize = 256;
+/// How many times one fetch asks again after leaving out a denied part.
+const ATTEMPTS: usize = 3;
+
+/// The only instance.
+pub static GITHUB: GithubKind = GithubKind { base: None };
+
+/// See the module.
+pub struct GithubKind {
+    /// Another API address, for tests; `None` is [`API`].
+    base: Option<String>,
+}
+
+impl GithubKind {
+    /// A kind that talks to `base` instead of GitHub (a stub in a test). No
+    /// service has a way to choose it.
+    pub fn with_base(base: impl Into<String>) -> Self {
+        GithubKind {
+            base: Some(base.into()),
+        }
+    }
+}
+
+static FIELDS: [Field; 2] = [
+    Field {
+        key: "owners",
+        label_key: "field.github_owners",
+        help_key: "field.github_owners_help",
+        placeholder: "my-org",
+        kind: FieldKind::Text,
+        required: false,
+        secret: false,
+    },
+    Field {
+        key: "secret",
+        label_key: "field.github_secret",
+        help_key: "field.github_secret_help",
+        placeholder: "github_pat_…",
+        kind: FieldKind::Text,
+        required: true,
+        secret: true,
+    },
+];
+
+static METRICS: [MetricDef; 5] = [
+    MetricDef {
+        id: "review_requests",
+        label_key: "metric.gh_review_requests",
+        format: Format::Number,
+        peak: false,
+    },
+    MetricDef {
+        id: "ci_red",
+        label_key: "metric.gh_ci_red",
+        format: Format::Number,
+        peak: false,
+    },
+    MetricDef {
+        id: "dependabot",
+        label_key: "metric.gh_dependabot",
+        format: Format::Number,
+        peak: false,
+    },
+    MetricDef {
+        id: "releases_24h",
+        label_key: "metric.gh_releases_24h",
+        format: Format::Number,
+        peak: false,
+    },
+    MetricDef {
+        id: "open_prs",
+        label_key: "metric.gh_open_prs",
+        format: Format::Number,
+        peak: false,
+    },
+];
+
+impl Integration for GithubKind {
+    fn kind(&self) -> &'static str {
+        "github"
+    }
+
+    fn label_key(&self) -> &'static str {
+        "kind.github"
+    }
+
+    /// The address a card opens: GitHub's site, not the API's.
+    fn default_link(&self) -> Option<&'static str> {
+        Some("https://github.com/")
+    }
+
+    fn fields(&self) -> &'static [Field] {
+        &FIELDS
+    }
+
+    fn metrics(&self) -> &'static [MetricDef] {
+        &METRICS
+    }
+
+    fn default_size(&self) -> crate::layout::Size {
+        crate::layout::Size::Wide
+    }
+    fn default_interval(&self) -> Duration {
+        Duration::from_secs(5 * 60)
+    }
+
+    fn min_interval(&self) -> Duration {
+        Duration::from_secs(2 * 60)
+    }
+
+    fn url_required(&self) -> bool {
+        false
+    }
+
+    fn personal(&self) -> bool {
+        true
+    }
+
+    fn check_settings(&self, settings: &serde_json::Map<String, Json>) -> Result<(), SettingError> {
+        match settings.get("owners") {
+            None => Ok(()),
+            Some(Json::String(text)) => parse_owners(text).map(|_| ()).ok_or(SettingError {
+                field: "owners",
+                message_key: "err.github_owners",
+            }),
+            Some(_) => Err(SettingError {
+                field: "owners",
+                message_key: "err.github_owners",
+            }),
+        }
+    }
+
+    fn fetch<'a>(&'a self, ctx: &'a FetchCtx) -> BoxFuture<'a, Result<Snapshot, FetchError>> {
+        Box::pin(async move {
+            let auth = api::Credential::bearer(ctx.secret.as_deref())?;
+            let owners = match ctx.settings.get("owners") {
+                None | Some(Json::Null) => Vec::new(),
+                Some(Json::String(text)) => parse_owners(text).ok_or(FetchError::Config)?,
+                Some(_) => return Err(FetchError::Config),
+            };
+            let base =
+                Url::parse(self.base.as_deref().unwrap_or(API)).map_err(|_| FetchError::Config)?;
+            let fingerprint = fingerprint(ctx.secret.as_deref().unwrap_or_default());
+            let session = Session {
+                http: &ctx.http,
+                base,
+                auth,
+                memory: ctx.service_id().map(|id| (id, fingerprint)),
+            };
+            session.run(&owners, Timestamp::now()).await
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The setting
+
+/// The users and organisations an `owners` setting names: separated by commas
+/// or spaces, each a GitHub login (letters, digits and single hyphens inside,
+/// at most 39 characters), at most [`MAX_OWNERS`], each once (case ignored).
+/// `None` for anything else.
+pub fn parse_owners(text: &str) -> Option<Vec<String>> {
+    let mut owners: Vec<String> = Vec::new();
+    for name in text
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|n| !n.is_empty())
+    {
+        if !is_login(name) {
+            return None;
+        }
+        if !owners.iter().any(|o| o.eq_ignore_ascii_case(name)) {
+            owners.push(name.to_string());
+        }
+    }
+    if owners.len() > MAX_OWNERS {
+        return None;
+    }
+    Some(owners)
+}
+
+fn is_login(name: &str) -> bool {
+    (1..=39).contains(&name.len())
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+}
+
+/// A repository name as it may go into a path: letters, digits, `.`, `_`, `-`.
+fn is_repo_name(name: &str) -> bool {
+    (1..=100).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && name != "."
+        && name != ".."
+}
+
+// ---------------------------------------------------------------------------
+// What is remembered per service
+
+/// A part of the query a token may not be allowed to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Part {
+    Rollup,
+    Alerts,
+    Releases,
+    Search,
+    /// The names of the failing checks inside the rollup: a token that may
+    /// read the rollup's state may not read these.
+    Contexts,
+}
+
+impl Part {
+    const ALL: [Part; 5] = [
+        Part::Rollup,
+        Part::Alerts,
+        Part::Releases,
+        Part::Search,
+        Part::Contexts,
+    ];
+
+    /// The field of the query that names this part in an error's path.
+    fn fields(self) -> &'static [&'static str] {
+        match self {
+            Part::Rollup => &["statusCheckRollup", "defaultBranchRef"],
+            Part::Alerts => &["vulnerabilityAlerts"],
+            Part::Releases => &["releases"],
+            Part::Search => &["reviews", "authored"],
+            Part::Contexts => &["contexts"],
+        }
+    }
+}
+
+/// Which parts are left out, until when.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Denied([Option<Timestamp>; 5]);
+
+impl Denied {
+    fn is(&self, part: Part, now: Timestamp) -> bool {
+        self.0[part as usize].is_some_and(|until| until > now)
+    }
+
+    fn deny(&mut self, part: Part, now: Timestamp) {
+        self.0[part as usize] = now.checked_add(DENIED_FOR).ok();
+    }
+}
+
+#[derive(Debug)]
+struct Entry {
+    id: i64,
+    /// Which token this is for: a new token starts afresh.
+    fingerprint: [u8; 8],
+    login: Option<String>,
+    blocked_until: Option<Timestamp>,
+    denied: Denied,
+}
+
+/// What the kind keeps between two fetches of a service. Bounded by
+/// [`MEMORY_MAX`], oldest first out. Nothing in it is a secret (the
+/// fingerprint is a few bytes of a hash).
+#[derive(Debug, Default)]
+struct Memory {
+    entries: VecDeque<Entry>,
+}
+
+impl Memory {
+    const fn new() -> Self {
+        Memory {
+            entries: VecDeque::new(),
+        }
+    }
+
+    /// The entry of service `id` for the token `fingerprint`: made when it is
+    /// new, and made afresh when the token is another.
+    fn entry(&mut self, id: i64, fingerprint: [u8; 8]) -> &mut Entry {
+        let at = self.entries.iter().position(|e| e.id == id);
+        let fresh = || Entry {
+            id,
+            fingerprint,
+            login: None,
+            blocked_until: None,
+            denied: Denied::default(),
+        };
+        match at {
+            Some(at) => {
+                if self.entries[at].fingerprint != fingerprint {
+                    self.entries[at] = fresh();
+                }
+                &mut self.entries[at]
+            }
+            None => {
+                while self.entries.len() >= MEMORY_MAX {
+                    self.entries.pop_front();
+                }
+                self.entries.push_back(fresh());
+                self.entries.back_mut().expect("just pushed")
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+fn memory() -> std::sync::MutexGuard<'static, Memory> {
+    static MEMORY: Mutex<Memory> = Mutex::new(Memory::new());
+    // A panic elsewhere cannot leave the list in a state that matters.
+    MEMORY.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn fingerprint(secret: &str) -> [u8; 8] {
+    let digest = Sha256::digest(secret.as_bytes());
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&digest[..8]);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// The rate limit
+
+/// What an answer says about the request limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Limits {
+    remaining: Option<u64>,
+    reset: Option<Timestamp>,
+    retry_after: Option<u64>,
+}
+
+impl Limits {
+    fn of(headers: &HeaderMap) -> Limits {
+        let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+        Limits {
+            remaining: text("x-ratelimit-remaining").and_then(|v| v.trim().parse().ok()),
+            reset: text("x-ratelimit-reset")
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .and_then(|s| Timestamp::from_second(s).ok()),
+            retry_after: text("retry-after").and_then(|v| v.trim().parse().ok()),
+        }
+    }
+
+    /// Nothing is left of the window (or GitHub asked to wait).
+    fn exhausted(&self) -> bool {
+        self.remaining == Some(0) || self.retry_after.is_some()
+    }
+
+    /// Until when to leave the service alone, if the limit is used up: the
+    /// reset (or the `Retry-After`), never more than [`MAX_WAIT`] from `now`
+    /// and at least a second.
+    fn wait_until(&self, now: Timestamp) -> Option<Timestamp> {
+        if !self.exhausted() {
+            return None;
+        }
+        let latest = now.checked_add(MAX_WAIT).unwrap_or(now);
+        let soonest = now.checked_add(SignedDuration::from_secs(1)).unwrap_or(now);
+        let target = match (self.retry_after, self.reset) {
+            (Some(secs), _) => i64::try_from(secs)
+                .ok()
+                .and_then(|s| now.checked_add(SignedDuration::from_secs(s)).ok()),
+            (None, Some(reset)) => Some(reset),
+            // No reset given: a minute.
+            (None, None) => now.checked_add(SignedDuration::from_secs(60)).ok(),
+        }
+        .unwrap_or(latest);
+        Some(target.clamp(soonest, latest))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// One fetch
+
+struct Session<'a> {
+    http: &'a reqwest::Client,
+    base: Url,
+    auth: api::Credential,
+    /// The service and its token, when the service is a stored one (what is
+    /// remembered is kept under them).
+    memory: Option<(i64, [u8; 8])>,
+}
+
+/// One repository as the answer gives it. Names only live for the fetch.
+#[derive(Debug, Default, Clone)]
+struct Repo {
+    name: String,
+    /// The repository's page, when it is a GitHub link.
+    url: Option<String>,
+    default_branch: Option<String>,
+    /// The state of the default branch's checks, when the answer has one.
+    rollup: Option<String>,
+    /// The name of a check of the rollup that failed, if the answer shows one.
+    failing_check: Option<String>,
+    alerts: Option<f64>,
+    /// Releases published in the last day; `None` when the answer had no
+    /// releases for the repository.
+    releases_24h: Option<f64>,
+    /// Those releases that have a tag and a link.
+    releases: Vec<Release>,
+}
+
+/// A release of the last day.
+#[derive(Debug, Clone)]
+struct Release {
+    tag: String,
+    url: String,
+    at: Timestamp,
+}
+
+/// A pull request waiting for the user's review.
+#[derive(Debug, Clone)]
+struct Review {
+    title: String,
+    repo: Option<String>,
+    author: Option<String>,
+    url: Option<String>,
+    created: Option<Timestamp>,
+}
+
+/// What is known of a repository's CI: red or not, the workflow (or check)
+/// that is red, and a link to the run when there is one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Ci {
+    red: bool,
+    workflow: Option<String>,
+    url: Option<String>,
+}
+
+impl Ci {
+    fn state(red: bool) -> Ci {
+        Ci {
+            red,
+            workflow: None,
+            url: None,
+        }
+    }
+}
+
+/// What the query's answer holds.
+#[derive(Debug, Default)]
+struct Answer {
+    /// Whether the answer had a `data` object at all.
+    had_data: bool,
+    reviews: Option<f64>,
+    /// The newest of those pull requests, for the list.
+    review_items: Vec<Review>,
+    authored: Option<f64>,
+    /// Whether any list of repositories came back (an empty one counts).
+    repos_seen: bool,
+    repos: Vec<Repo>,
+    /// The parts the answer's errors name, and whether the error says the
+    /// token may not read them (lasting) or is only a failure of this answer.
+    denied: Vec<(Part, bool)>,
+}
+
+impl Session<'_> {
+    fn with_entry<T>(&self, f: impl FnOnce(&mut Entry) -> T) -> Option<T> {
+        let (id, fp) = self.memory?;
+        Some(f(memory().entry(id, fp)))
+    }
+
+    fn blocked_until(&self, now: Timestamp) -> Option<Timestamp> {
+        self.with_entry(|e| e.blocked_until)
+            .flatten()
+            .filter(|until| *until > now)
+    }
+
+    /// Remembers what an answer said about the limit.
+    fn note(&self, limits: &Limits, now: Timestamp) {
+        if let Some(until) = limits.wait_until(now) {
+            self.with_entry(|e| e.blocked_until = Some(until));
+        }
+    }
+
+    async fn run(&self, owners: &[String], now: Timestamp) -> Result<Snapshot, FetchError> {
+        if self.blocked_until(now).is_some() {
+            return Err(FetchError::RateLimited);
+        }
+        let login = match self.with_entry(|e| e.login.clone()).flatten() {
+            Some(login) => Some(login),
+            None => {
+                let login = self.login().await?;
+                if let Some(login) = &login {
+                    self.with_entry(|e| e.login = Some(login.clone()));
+                }
+                login
+            }
+        };
+        // What is left out for good (an hour), and what is also left out of
+        // this fetch's later attempts (a part that failed for another reason).
+        let mut stored = self.with_entry(|e| e.denied).unwrap_or_default();
+        let mut denied = stored;
+        let mut remaining = None;
+        let mut answer = Answer::default();
+        for attempt in 1..=ATTEMPTS {
+            let (parsed, limits) = self.query(owners, login.as_deref(), &denied, now).await?;
+            remaining = limits.remaining;
+            let new: Vec<(Part, bool)> = parsed
+                .denied
+                .iter()
+                .copied()
+                .filter(|(p, _)| !denied.is(*p, now))
+                .collect();
+            answer = parsed;
+            if new.is_empty() || attempt == ATTEMPTS {
+                break;
+            }
+            for (part, lasting) in new {
+                denied.deny(part, now);
+                if lasting {
+                    stored.deny(part, now);
+                }
+            }
+        }
+        self.with_entry(|e| e.denied = stored);
+
+        if !answer.had_data {
+            return Err(FetchError::Invalid);
+        }
+        let ci = self.ci(&answer.repos, remaining, now).await;
+        let snapshot = reading(&answer, &ci, now);
+        if snapshot.values.is_empty() {
+            // Nothing in the answer could be a number.
+            return Err(FetchError::Invalid);
+        }
+        Ok(snapshot)
+    }
+
+    /// The user's login, asked once.
+    async fn login(&self) -> Result<Option<String>, FetchError> {
+        let body = json!({ "query": "query { viewer { login } }" });
+        let (root, _) = self.graphql(&body, Timestamp::now()).await?;
+        Ok(root
+            .pointer("/data/viewer/login")
+            .and_then(Json::as_str)
+            .filter(|login| is_login(login))
+            .map(str::to_string))
+    }
+
+    /// One GraphQL query: the numbers, and which parts were refused.
+    async fn query(
+        &self,
+        owners: &[String],
+        login: Option<&str>,
+        denied: &Denied,
+        now: Timestamp,
+    ) -> Result<(Answer, Limits), FetchError> {
+        let body = build_query(owners, login, denied, now);
+        let (root, limits) = self.graphql(&body, now).await?;
+        let data = root.get("data").filter(|d| d.is_object());
+        let mut answer = Answer {
+            denied: denied_parts(&root),
+            ..Answer::default()
+        };
+        let Some(data) = data else {
+            // No data at all: a refused part that takes the whole answer
+            // with it is left out next time; anything else is no reading.
+            if answer.denied.is_empty() {
+                return Err(FetchError::Invalid);
+            }
+            return Ok((answer, limits));
+        };
+        answer.had_data = true;
+        answer.reviews = api::count(data.pointer("/reviews/issueCount"));
+        answer.review_items = data
+            .pointer("/reviews/nodes")
+            .and_then(Json::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(review_of)
+            .take(MAX_ITEMS)
+            .collect();
+        answer.authored = api::count(data.pointer("/authored/issueCount"));
+        let mut keys: Vec<String> = vec!["viewer".to_string()];
+        keys.extend((0..owners.len()).map(|i| format!("o{i}")));
+        let mut names = BTreeSet::new();
+        for key in keys {
+            let Some(nodes) = data
+                .get(&key)
+                .and_then(|o| o.pointer("/repositories/nodes"))
+                .and_then(Json::as_array)
+            else {
+                continue;
+            };
+            answer.repos_seen = true;
+            for node in nodes {
+                if let Some(repo) = repo_of(node, now)
+                    && names.insert(repo.name.clone())
+                {
+                    answer.repos.push(repo);
+                }
+            }
+        }
+        Ok((answer, limits))
+    }
+
+    /// One POST to the GraphQL endpoint: the answer as JSON and its limits.
+    async fn graphql(&self, body: &Json, now: Timestamp) -> Result<(Json, Limits), FetchError> {
+        let url = api::endpoint(&self.base, &["graphql"], None)?;
+        let request = self.http.post(url).json(body);
+        let (bytes, limits) = self.send(request, now).await?;
+        let root: Json = serde_json::from_slice(&bytes).map_err(|_| FetchError::Invalid)?;
+        // A GraphQL answer can say "rate limited" with a 200.
+        let limited = root
+            .get("errors")
+            .and_then(Json::as_array)
+            .is_some_and(|errors| {
+                errors
+                    .iter()
+                    .any(|e| e.get("type").and_then(Json::as_str) == Some("RATE_LIMITED"))
+            });
+        if limited {
+            let exhausted = Limits {
+                remaining: Some(0),
+                ..limits
+            };
+            self.note(&exhausted, now);
+            return Err(FetchError::RateLimited);
+        }
+        Ok((root, limits))
+    }
+
+    /// One request with the token; the body and what the answer says about the
+    /// limit. 401 is [`FetchError::Auth`]; 403 and 429 are
+    /// [`FetchError::RateLimited`] when the limit is used up, else 403 is
+    /// [`FetchError::Auth`] and 429 a status.
+    async fn send(
+        &self,
+        request: reqwest::RequestBuilder,
+        now: Timestamp,
+    ) -> Result<(Vec<u8>, Limits), FetchError> {
+        // With the token on it: a redirect to another origin is refused.
+        let request = self
+            .auth
+            .apply(request)
+            .header(ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        let response = api::send_credentialed(request).await?;
+        let code = response.status().as_u16();
+        let limits = Limits::of(response.headers());
+        self.note(&limits, now);
+        if matches!(code, 403 | 429) && !limits.exhausted() {
+            // A secondary limit says so in the body and gives no window: wait
+            // a minute. Anything else is a refusal (403) or a status (429).
+            let body = read_capped(response).await.unwrap_or_default();
+            if is_secondary_limit(&body) {
+                let until = now.checked_add(SECONDARY_WAIT).unwrap_or(now);
+                self.with_entry(|e| e.blocked_until = Some(until));
+                return Err(FetchError::RateLimited);
+            }
+            return Err(if code == 403 {
+                FetchError::Auth
+            } else {
+                FetchError::Status(code)
+            });
+        }
+        match code {
+            401 => Err(FetchError::Auth),
+            403 | 429 => Err(FetchError::RateLimited),
+            code if !(200..300).contains(&code) => Err(FetchError::Status(code)),
+            _ => Ok((read_capped(response).await?, limits)),
+        }
+    }
+
+    /// Which repositories are red: those whose default branch's checks failed
+    /// in the answer, and, for those the answer says nothing about, those whose
+    /// newest workflow runs failed (one call each, at most
+    /// [`CI_FALLBACK_MAX`]). `None` for a repository nothing could be said
+    /// about.
+    async fn ci(&self, repos: &[Repo], remaining: Option<u64>, now: Timestamp) -> Vec<Option<Ci>> {
+        let mut out: Vec<Option<Ci>> = repos
+            .iter()
+            .map(|repo| match repo.rollup.as_deref() {
+                Some("FAILURE" | "ERROR") => Some(Ci {
+                    red: true,
+                    workflow: repo.failing_check.clone(),
+                    url: None,
+                }),
+                Some("SUCCESS" | "PENDING" | "EXPECTED") => Some(Ci::state(false)),
+                _ => None,
+            })
+            .collect();
+        let spare = remaining.is_none_or(|r| r > LOW_REMAINING);
+        if !spare || self.blocked_until(now).is_some() {
+            return out;
+        }
+        let wanted: Vec<usize> = repos
+            .iter()
+            .enumerate()
+            .filter(|(i, repo)| out[*i].is_none() && repo.default_branch.is_some())
+            .map(|(i, _)| i)
+            .take(CI_FALLBACK_MAX)
+            .collect();
+        let runs = futures_util::future::join_all(
+            wanted.iter().map(|i| self.workflow_state(&repos[*i], now)),
+        )
+        .await;
+        for (i, state) in wanted.into_iter().zip(runs) {
+            out[i] = state;
+        }
+        out
+    }
+
+    /// Whether the newest completed run of any workflow on the default branch
+    /// failed, and which one. `None` when it could not be read (no
+    /// permission, an error).
+    async fn workflow_state(&self, repo: &Repo, now: Timestamp) -> Option<Ci> {
+        let (owner, name) = repo.name.split_once('/')?;
+        let branch = repo.default_branch.as_deref()?;
+        if !is_login(owner) || !is_repo_name(name) {
+            return None;
+        }
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("branch", branch)
+            .append_pair("status", "completed")
+            .append_pair("per_page", "10")
+            .append_pair("exclude_pull_requests", "true")
+            .finish();
+        let url = api::endpoint(
+            &self.base,
+            &["repos", owner, name, "actions", "runs"],
+            Some(&query),
+        )
+        .ok()?;
+        let (bytes, _) = self.send(self.http.get(url), now).await.ok()?;
+        let root: Json = serde_json::from_slice(&bytes).ok()?;
+        let runs = root.get("workflow_runs")?.as_array()?;
+        // The newest red run is the one to show.
+        let newest = newest_runs(runs);
+        let worst = newest.iter().filter(|run| run.red).max_by_key(|run| run.id);
+        Some(Ci {
+            red: worst.is_some(),
+            workflow: worst.and_then(|run| run.name.clone()),
+            url: worst.and_then(|run| run.url.clone()),
+        })
+    }
+}
+
+/// The newest informative run of a workflow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Run {
+    workflow: i64,
+    id: i64,
+    red: bool,
+    name: Option<String>,
+    /// The run's page, when it is a GitHub link.
+    url: Option<String>,
+}
+
+/// The newest informative run of each workflow in `runs`. A run that was
+/// cancelled, skipped or neither passed nor failed says nothing about the
+/// workflow.
+fn newest_runs(runs: &[Json]) -> Vec<Run> {
+    let mut newest: Vec<Run> = Vec::new();
+    for run in runs {
+        let workflow = run.get("workflow_id").and_then(Json::as_i64).unwrap_or(0);
+        let id = run.get("id").and_then(Json::as_i64).unwrap_or(0);
+        let red = match run.get("conclusion").and_then(Json::as_str) {
+            Some("failure" | "timed_out") => true,
+            Some("success") => false,
+            _ => continue,
+        };
+        let this = Run {
+            workflow,
+            id,
+            red,
+            name: text_of(run, "name"),
+            url: run
+                .get("html_url")
+                .and_then(Json::as_str)
+                .and_then(github_link),
+        };
+        match newest.iter_mut().find(|known| known.workflow == workflow) {
+            Some(known) if known.id < id => *known = this,
+            Some(_) => {}
+            None => newest.push(this),
+        }
+    }
+    newest
+}
+
+/// Whether the newest informative run of any workflow in `runs` failed.
+#[cfg(test)]
+fn newest_runs_failed(runs: &[Json]) -> bool {
+    newest_runs(runs).iter().any(|run| run.red)
+}
+
+/// A line of text from outside: one line, cut; `None` when nothing is left.
+fn text_of(doc: &Json, field: &str) -> Option<String> {
+    doc.get(field)
+        .and_then(Json::as_str)
+        .map(|text| api::clean_text(text, TEXT_CHARS))
+        .filter(|text| !text.is_empty())
+}
+
+/// `text` when it is a plain `https` address on `github.com` (no port, no
+/// credentials), in the form a browser would follow; anything else is `None`.
+fn github_link(text: &str) -> Option<String> {
+    let url = Url::parse(text.trim()).ok()?;
+    (url.scheme() == "https"
+        && url.host_str() == Some("github.com")
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none())
+    .then(|| url.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// The query and its answer
+
+const REPOSITORY: &str = "fragment R on Repository {
+  nameWithOwner
+  url
+  defaultBranchRef { name target { ... on Commit { statusCheckRollup { state contexts(first: 10) { nodes { __typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } } } } } }
+  vulnerabilityAlerts(first: 1, states: OPEN) { totalCount }
+  releases(first: 3, orderBy: {field: CREATED_AT, direction: DESC}) { nodes { tagName url publishedAt isDraft } }
+}";
+
+/// The part of [`REPOSITORY`] that needs the permission to read check status,
+/// and what stands in its place when the token may not read it.
+const ROLLUP_PART: &str = "defaultBranchRef { name target { ... on Commit { statusCheckRollup { state contexts(first: 10) { nodes { __typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } } } } } }";
+
+/// The check names inside the rollup (a part of [`ROLLUP_PART`]), with the
+/// space before it.
+const CONTEXTS_PART: &str = " contexts(first: 10) { nodes { __typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } }";
+
+const REVIEWS: &str = "reviews: search(query: $reviewQ, type: ISSUE, first: 8) { issueCount nodes { ... on PullRequest { title url createdAt repository { nameWithOwner } author { login } } } }";
+
+/// The query and its variables. Owners and the login only ever travel as
+/// variables. A denied part is left out (its field stays, without the
+/// sub-selection that needs the permission).
+fn build_query(owners: &[String], login: Option<&str>, denied: &Denied, now: Timestamp) -> Json {
+    let repositories = "repositories(first: 100, ownerAffiliations: [OWNER], isArchived: false, \
+                        isFork: false, orderBy: {field: PUSHED_AT, direction: DESC}) \
+                        { nodes { ...R } }";
+    let mut declared: Vec<String> = Vec::new();
+    let mut variables = serde_json::Map::new();
+    let mut selections: Vec<String> = vec!["rateLimit { cost remaining resetAt }".to_string()];
+    if owners.is_empty() {
+        selections.push(
+            "viewer { repositories(first: 100, ownerAffiliations: [OWNER], isArchived: false, \
+             isFork: false, orderBy: {field: PUSHED_AT, direction: DESC}) { nodes { ...R } } }"
+                .to_string(),
+        );
+    }
+    for (i, owner) in owners.iter().enumerate() {
+        declared.push(format!("$o{i}: String!"));
+        variables.insert(format!("o{i}"), Json::String(owner.clone()));
+        selections.push(format!(
+            "o{i}: repositoryOwner(login: $o{i}) {{ {repositories} }}"
+        ));
+    }
+    if let Some(login) = login.filter(|_| !denied.is(Part::Search, now)) {
+        let scope: String = owners.iter().map(|o| format!(" user:{o}")).collect();
+        declared.push("$reviewQ: String!".to_string());
+        declared.push("$authoredQ: String!".to_string());
+        variables.insert(
+            "reviewQ".into(),
+            Json::String(format!(
+                "is:pr is:open review-requested:{login} archived:false{scope} sort:updated-desc"
+            )),
+        );
+        variables.insert(
+            "authoredQ".into(),
+            Json::String(format!(
+                "is:pr is:open author:{login} archived:false{scope}"
+            )),
+        );
+        selections.push(REVIEWS.into());
+        selections.push(
+            "authored: search(query: $authoredQ, type: ISSUE, first: 1) { issueCount }".into(),
+        );
+    }
+    let mut fragment = REPOSITORY.to_string();
+    // The whole rollup first; what is left of it without the check names
+    // keeps the state, so the number of red repositories stays complete.
+    if denied.is(Part::Rollup, now) {
+        fragment = fragment.replace(ROLLUP_PART, "defaultBranchRef { name }");
+    }
+    if denied.is(Part::Contexts, now) {
+        fragment = fragment.replace(CONTEXTS_PART, "");
+    }
+    if denied.is(Part::Alerts, now) {
+        fragment = fragment.replace(
+            "  vulnerabilityAlerts(first: 1, states: OPEN) { totalCount }\n",
+            "",
+        );
+    }
+    if denied.is(Part::Releases, now) {
+        fragment = fragment.replace(
+            "  releases(first: 3, orderBy: {field: CREATED_AT, direction: DESC}) { nodes { tagName url publishedAt isDraft } }\n",
+            "",
+        );
+    }
+    let declared = if declared.is_empty() {
+        String::new()
+    } else {
+        format!("({})", declared.join(", "))
+    };
+    json!({
+        "query": format!("query Magpie{declared} {{ {} }} {fragment}", selections.join(" ")),
+        "variables": variables,
+    })
+}
+
+/// Whether a refusal's body says GitHub's secondary rate limit was hit.
+fn is_secondary_limit(body: &[u8]) -> bool {
+    String::from_utf8_lossy(body)
+        .to_ascii_lowercase()
+        .contains("secondary rate limit")
+}
+
+/// The parts the errors of an answer name: the ones whose field is in an
+/// error's path. An error of type FORBIDDEN or INSUFFICIENT_SCOPES says the
+/// token may not read the part (`true`: lasting); any other error with a path
+/// is a failure of this answer only (`false`). An error inside the rollup's
+/// `contexts` names that part only: the rollup's state is still readable.
+fn denied_parts(root: &Json) -> Vec<(Part, bool)> {
+    let Some(errors) = root.get("errors").and_then(Json::as_array) else {
+        return Vec::new();
+    };
+    Part::ALL
+        .into_iter()
+        .filter_map(|part| {
+            let naming: Vec<&Json> = errors
+                .iter()
+                .filter(|error| {
+                    error
+                        .get("path")
+                        .and_then(Json::as_array)
+                        .is_some_and(|path| {
+                            let steps = path.iter().filter_map(Json::as_str);
+                            let in_contexts = steps.clone().any(|step| step == "contexts");
+                            let names = steps.clone().any(|step| part.fields().contains(&step));
+                            names && (part == Part::Contexts || !in_contexts)
+                        })
+                })
+                .collect();
+            let lasting = naming.iter().any(|error| {
+                matches!(
+                    error.get("type").and_then(Json::as_str),
+                    Some("FORBIDDEN" | "INSUFFICIENT_SCOPES")
+                )
+            });
+            (!naming.is_empty()).then_some((part, lasting))
+        })
+        .collect()
+}
+
+/// A repository from its node, if it is one; `None` for a null or odd node.
+fn repo_of(node: &Json, now: Timestamp) -> Option<Repo> {
+    let name = node.get("nameWithOwner")?.as_str()?;
+    let branch = node.get("defaultBranchRef").filter(|b| b.is_object());
+    let day_ago = now.checked_sub(SignedDuration::from_hours(24)).ok()?;
+    // The releases published in the last day (drafts are not published).
+    let recent: Option<Vec<(Timestamp, &Json)>> = node
+        .pointer("/releases/nodes")
+        .and_then(Json::as_array)
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter(|r| r.get("isDraft").and_then(Json::as_bool) == Some(false))
+                .filter_map(|r| {
+                    let at = r.get("publishedAt")?.as_str()?.parse::<Timestamp>().ok()?;
+                    (at >= day_ago && at <= now).then_some((at, r))
+                })
+                .collect()
+        });
+    let releases_24h = recent.as_ref().map(|list| list.len() as f64);
+    let releases = recent
+        .into_iter()
+        .flatten()
+        .filter_map(|(at, r)| {
+            Some(Release {
+                tag: text_of(r, "tagName")?,
+                url: github_link(r.get("url")?.as_str()?)?,
+                at,
+            })
+        })
+        .collect();
+    Some(Repo {
+        name: name.to_string(),
+        url: node.get("url").and_then(Json::as_str).and_then(github_link),
+        default_branch: branch
+            .and_then(|b| b.get("name"))
+            .and_then(Json::as_str)
+            .map(str::to_string),
+        rollup: branch
+            .and_then(|b| b.pointer("/target/statusCheckRollup/state"))
+            .and_then(Json::as_str)
+            .map(str::to_string),
+        failing_check: branch
+            .and_then(|b| b.pointer("/target/statusCheckRollup/contexts/nodes"))
+            .and_then(Json::as_array)
+            .and_then(|nodes| nodes.iter().find_map(failed_check)),
+        alerts: api::count(node.pointer("/vulnerabilityAlerts/totalCount")),
+        releases_24h,
+        releases,
+    })
+}
+
+/// The name of a check of the rollup when it failed: a check run that failed
+/// or timed out, or a status that failed or errored.
+fn failed_check(node: &Json) -> Option<String> {
+    match node.get("__typename").and_then(Json::as_str)? {
+        "CheckRun" => matches!(
+            node.get("conclusion").and_then(Json::as_str),
+            Some("FAILURE" | "TIMED_OUT" | "STARTUP_FAILURE")
+        )
+        .then(|| text_of(node, "name"))?,
+        "StatusContext" => matches!(
+            node.get("state").and_then(Json::as_str),
+            Some("FAILURE" | "ERROR")
+        )
+        .then(|| text_of(node, "context"))?,
+        _ => None,
+    }
+}
+
+/// A pull request of the review search; `None` for a node that is not one or
+/// has no title.
+fn review_of(node: &Json) -> Option<Review> {
+    Some(Review {
+        title: text_of(node, "title")?,
+        repo: node
+            .pointer("/repository")
+            .and_then(|r| text_of(r, "nameWithOwner")),
+        author: node.pointer("/author").and_then(|a| text_of(a, "login")),
+        url: node.get("url").and_then(Json::as_str).and_then(github_link),
+        created: node
+            .get("createdAt")
+            .and_then(Json::as_str)
+            .and_then(|at| at.parse().ok()),
+    })
+}
+
+/// How long ago `from` was, in one short unit: `5m`, `3h`, `2d`, `4mo`, `2y`
+/// (a time in the future counts as just now).
+fn age(from: Timestamp, now: Timestamp) -> String {
+    let minutes = (now.as_second().saturating_sub(from.as_second()).max(0) / 60).max(1);
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        return format!("{hours}h");
+    }
+    let days = hours / 24;
+    match days {
+        0..60 => format!("{days}d"),
+        60..730 => format!("{}mo", days / 30),
+        _ => format!("{}y", days / 365),
+    }
+}
+
+/// The lines of a second line, joined with a middle dot; `None` when empty.
+fn joined(parts: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+    let parts: Vec<String> = parts.into_iter().flatten().collect();
+    (!parts.is_empty()).then(|| parts.join(" \u{b7} "))
+}
+
+/// The page of a repository: what the answer says, else built from its name
+/// (when the name is shaped like `owner/repository`).
+fn repo_url(repo: &Repo) -> Option<String> {
+    repo.url.clone().or_else(|| {
+        let (owner, name) = repo.name.split_once('/')?;
+        (is_login(owner) && is_repo_name(name))
+            .then(|| github_link(&format!("https://github.com/{owner}/{name}")))?
+    })
+}
+
+/// The blocks of the card (see the module). Each is left out when there is
+/// nothing to put in it.
+fn details(answer: &Answer, ci: &[Option<Ci>], now: Timestamp) -> Vec<Block> {
+    let mut blocks = Vec::new();
+
+    let reviews: Vec<ListItem> = answer
+        .review_items
+        .iter()
+        .map(|review| ListItem {
+            text: review.title.clone(),
+            sub: joined([review.repo.clone(), review.author.clone()]),
+            status: None,
+            right: review.created.map(|at| age(at, now)),
+            href: review.url.clone(),
+            at: review.created.map(Timestamp::as_second),
+            ..Default::default()
+        })
+        .collect();
+    if !reviews.is_empty() {
+        blocks.push(Block::List {
+            title_key: "gh_review".to_string(),
+            items: reviews,
+        });
+    }
+
+    let red: Vec<ListItem> = answer
+        .repos
+        .iter()
+        .zip(ci)
+        .filter_map(|(repo, ci)| Some((repo, ci.as_ref().filter(|ci| ci.red)?)))
+        .map(|(repo, ci)| ListItem {
+            text: repo.name.clone(),
+            sub: joined([repo.default_branch.clone(), ci.workflow.clone()]),
+            status: Some(Status::Bad),
+            right: None,
+            href: ci.url.clone().or_else(|| {
+                repo_url(repo).map(|url| format!("{}/actions", url.trim_end_matches('/')))
+            }),
+            ..Default::default()
+        })
+        .collect();
+    if !red.is_empty() {
+        blocks.push(Block::List {
+            title_key: "gh_ci".to_string(),
+            items: red,
+        });
+    }
+
+    let mut released: Vec<(&Repo, &Release)> = answer
+        .repos
+        .iter()
+        .flat_map(|repo| repo.releases.iter().map(move |release| (repo, release)))
+        .collect();
+    released.sort_by_key(|(_, release)| std::cmp::Reverse(release.at));
+    let released: Vec<ListItem> = released
+        .into_iter()
+        .map(|(repo, release)| ListItem {
+            text: release.tag.clone(),
+            sub: Some(repo.name.clone()),
+            status: None,
+            right: Some(age(release.at, now)),
+            href: Some(release.url.clone()),
+            at: Some(release.at.as_second()),
+            ..Default::default()
+        })
+        .collect();
+    if !released.is_empty() {
+        blocks.push(Block::List {
+            title_key: "gh_releases".to_string(),
+            items: released,
+        });
+    }
+
+    let mut alerted: Vec<(&Repo, f64)> = answer
+        .repos
+        .iter()
+        .filter_map(|repo| Some((repo, repo.alerts.filter(|n| *n > 0.0)?)))
+        .collect();
+    alerted.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let alerted: Vec<ListItem> = alerted
+        .into_iter()
+        .map(|(repo, alerts)| ListItem {
+            text: repo.name.clone(),
+            sub: None,
+            status: Some(Status::Warn),
+            right: Some(format!("{alerts:.0}")),
+            href: repo_url(repo)
+                .map(|url| format!("{}/security/dependabot", url.trim_end_matches('/'))),
+            ..Default::default()
+        })
+        .collect();
+    if !alerted.is_empty() {
+        blocks.push(Block::List {
+            title_key: "gh_dependabot".to_string(),
+            items: alerted,
+        });
+    }
+    blocks
+}
+
+/// The reading from what was found.
+fn reading(answer: &Answer, ci: &[Option<Ci>], now: Timestamp) -> Snapshot {
+    let mut snapshot = Snapshot::new(Status::Ok);
+    let mut put = |id: &str, n: Option<f64>| {
+        if let Some(n) = n {
+            snapshot.values.insert(id.to_string(), Value::num(n));
+        }
+    };
+    put("review_requests", answer.reviews);
+    put("open_prs", answer.authored);
+
+    // A metric over the repositories is there when at least one repository
+    // could say something (or there are none to ask).
+    if answer.repos_seen {
+        let known = ci.iter().flatten().count();
+        if answer.repos.is_empty() || known > 0 {
+            put(
+                "ci_red",
+                Some(
+                    ci.iter()
+                        .filter(|ci| ci.as_ref().is_some_and(|ci| ci.red))
+                        .count() as f64,
+                ),
+            );
+        }
+        let alerts: Vec<f64> = answer.repos.iter().filter_map(|r| r.alerts).collect();
+        if answer.repos.is_empty() || !alerts.is_empty() {
+            put("dependabot", Some(alerts.iter().sum()));
+        }
+        let releases: Vec<f64> = answer.repos.iter().filter_map(|r| r.releases_24h).collect();
+        if answer.repos.is_empty() || !releases.is_empty() {
+            put("releases_24h", Some(releases.iter().sum()));
+        }
+    }
+
+    let number = |id: &str| {
+        snapshot
+            .values
+            .get(id)
+            .and_then(|v| v.num)
+            .unwrap_or_default() as usize
+    };
+    let (review, red) = (number("review_requests"), number("ci_red"));
+    let mut needs = Vec::new();
+    if red > 0 {
+        needs.push(need("gh:ci_red", Level::Bad, "need.gh_ci_red", red));
+    }
+    if review > 0 {
+        needs.push(need("gh:review", Level::Warn, "need.gh_review", review));
+    }
+    snapshot.status = if red > 0 {
+        Status::Bad
+    } else if review > 0 {
+        Status::Warn
+    } else {
+        Status::Ok
+    };
+    snapshot.needs = needs;
+    snapshot.details = details(answer, ci, now);
+    snapshot
+}
+
+/// A need whose only parameter is how many: no title and no repository name
+/// from GitHub goes in.
+fn need(key: &str, level: Level, label_key: &str, count: usize) -> Need {
+    Need {
+        key: key.to_string(),
+        level,
+        label_key: label_key.to_string(),
+        params: [("count".to_string(), count.to_string())].into(),
+        score: count as f64,
+        since: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use reqwest::header::HeaderValue;
+
+    use super::*;
+
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_second(secs).unwrap()
+    }
+
+    #[test]
+    fn an_age_is_one_short_unit_and_changes_at_the_boundaries() {
+        let now = at(10_000_000);
+        let ago = |secs: i64| age(at(10_000_000 - secs), now);
+        assert_eq!(ago(0), "1m");
+        assert_eq!(ago(59), "1m");
+        assert_eq!(ago(60), "1m");
+        assert_eq!(ago(59 * 60), "59m");
+        assert_eq!(ago(59 * 60 + 59), "59m");
+        assert_eq!(ago(60 * 60), "1h");
+        assert_eq!(ago(23 * 3600 + 59 * 60), "23h");
+        assert_eq!(ago(24 * 3600), "1d");
+        assert_eq!(ago(59 * 86_400), "59d");
+        assert_eq!(ago(60 * 86_400), "2mo");
+        assert_eq!(ago(729 * 86_400), "24mo");
+        assert_eq!(ago(730 * 86_400), "2y");
+        // A time in the future (a clock that is off) counts as just now.
+        assert_eq!(ago(-3600), "1m");
+    }
+
+    #[test]
+    fn an_error_inside_the_contexts_names_only_that_part() {
+        let root = json!({ "errors": [{
+            "type": "FORBIDDEN",
+            "path": ["viewer", "repositories", "nodes", 0, "defaultBranchRef", "target",
+                     "statusCheckRollup", "contexts", "nodes"],
+        }] });
+        assert_eq!(denied_parts(&root), vec![(Part::Contexts, true)]);
+        // An error at the rollup itself names the rollup, not the contexts.
+        let root = json!({ "errors": [{
+            "type": "FORBIDDEN",
+            "path": ["viewer", "repositories", "nodes", 0, "defaultBranchRef", "target",
+                     "statusCheckRollup"],
+        }] });
+        assert_eq!(denied_parts(&root), vec![(Part::Rollup, true)]);
+        // The query without the contexts keeps the rollup's state.
+        let now = at(1_000_000);
+        let mut denied = Denied::default();
+        denied.deny(Part::Contexts, now);
+        let query = build_query(&[], None, &denied, now);
+        let text = query["query"].as_str().unwrap();
+        assert!(text.contains("statusCheckRollup { state }"), "{text}");
+        assert!(!text.contains("contexts("), "{text}");
+    }
+
+    #[test]
+    fn owners_are_logins_split_by_commas_or_spaces() {
+        assert_eq!(parse_owners(""), Some(vec![]));
+        assert_eq!(parse_owners(" , "), Some(vec![]));
+        assert_eq!(
+            parse_owners("Ferdinand99, my-org  other"),
+            Some(vec!["Ferdinand99".into(), "my-org".into(), "other".into()])
+        );
+        // Each once, whatever the case.
+        assert_eq!(parse_owners("a,A,b"), Some(vec!["a".into(), "b".into()]));
+        for bad in [
+            "-a",
+            "a-",
+            "a--b",
+            "a/b",
+            "a b/c",
+            "a:b",
+            "a\"b",
+            "user:evil",
+            "é",
+            &"a".repeat(40),
+            "a,b,c,d,e,f",
+        ] {
+            assert_eq!(parse_owners(bad), None, "{bad:?}");
+        }
+        assert!(parse_owners(&"a".repeat(39)).is_some());
+    }
+
+    #[test]
+    fn repository_names_are_safe_in_a_path() {
+        for ok in ["repo", "my.repo_1-x", ".github"] {
+            assert!(is_repo_name(ok), "{ok}");
+        }
+        for bad in ["", ".", "..", "a/b", "a b", "a?b", "a#b", "é"] {
+            assert!(!is_repo_name(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn memory_is_bounded_and_a_new_token_starts_afresh() {
+        let mut memory = Memory::new();
+        let fp = [1u8; 8];
+        memory.entry(1, fp).login = Some("me".into());
+        assert_eq!(memory.entry(1, fp).login.as_deref(), Some("me"));
+        // Another token for the same service: nothing carries over.
+        assert_eq!(memory.entry(1, [2u8; 8]).login, None);
+        for id in 0..(MEMORY_MAX as i64 + 10) {
+            memory.entry(1000 + id, fp);
+        }
+        assert_eq!(memory.len(), MEMORY_MAX);
+        // The oldest went first.
+        assert!(memory.entries.iter().all(|e| e.id != 1));
+        assert!(
+            memory
+                .entries
+                .iter()
+                .any(|e| e.id == 1000 + MEMORY_MAX as i64 + 9)
+        );
+    }
+
+    #[test]
+    fn the_limit_is_read_from_the_headers_and_waits_for_the_reset() {
+        let now = at(1_000_000);
+        let headers = |pairs: &[(&'static str, &str)]| {
+            let mut map = HeaderMap::new();
+            for (name, value) in pairs {
+                map.insert(*name, HeaderValue::from_str(value).unwrap());
+            }
+            map
+        };
+        let limits = Limits::of(&headers(&[
+            ("x-ratelimit-remaining", "0"),
+            ("x-ratelimit-reset", "1000600"),
+        ]));
+        assert!(limits.exhausted());
+        assert_eq!(limits.wait_until(now), Some(at(1_000_600)));
+        // Some left: no wait.
+        let limits = Limits::of(&headers(&[
+            ("x-ratelimit-remaining", "4999"),
+            ("x-ratelimit-reset", "1000600"),
+        ]));
+        assert!(!limits.exhausted());
+        assert_eq!(limits.wait_until(now), None);
+        // A reset in the past, or far away, is brought into range.
+        let past = Limits::of(&headers(&[
+            ("x-ratelimit-remaining", "0"),
+            ("x-ratelimit-reset", "999000"),
+        ]));
+        assert_eq!(past.wait_until(now), Some(at(1_000_001)));
+        let far = Limits::of(&headers(&[
+            ("x-ratelimit-remaining", "0"),
+            ("x-ratelimit-reset", "99999999"),
+        ]));
+        assert_eq!(far.wait_until(now), Some(at(1_000_000 + 7200)));
+        // Retry-After wins, and odd values wait for nothing special.
+        let retry = Limits::of(&headers(&[("retry-after", "90")]));
+        assert_eq!(retry.wait_until(now), Some(at(1_000_090)));
+        let odd = Limits::of(&headers(&[("x-ratelimit-remaining", "lots")]));
+        assert_eq!(odd, Limits::default());
+        assert_eq!(odd.wait_until(now), None);
+    }
+
+    #[test]
+    fn a_denied_part_is_left_out_for_an_hour() {
+        let now = at(1_000_000);
+        let mut denied = Denied::default();
+        assert!(!denied.is(Part::Alerts, now));
+        denied.deny(Part::Alerts, now);
+        assert!(denied.is(Part::Alerts, now));
+        assert!(!denied.is(Part::Releases, now));
+        assert!(!denied.is(Part::Alerts, at(1_000_000 + 3600)));
+        let query = build_query(&[], Some("me"), &denied, now);
+        let text = query["query"].as_str().unwrap();
+        assert!(!text.contains("vulnerabilityAlerts"), "{text}");
+        assert!(text.contains("releases("), "{text}");
+        let full = build_query(&[], Some("me"), &Denied::default(), now);
+        assert!(
+            full["query"]
+                .as_str()
+                .unwrap()
+                .contains("vulnerabilityAlerts")
+        );
+    }
+
+    #[test]
+    fn owners_and_the_login_travel_as_variables_only() {
+        let now = at(1_000_000);
+        let owners = vec!["acme".to_string(), "me".to_string()];
+        let query = build_query(&owners, Some("me"), &Denied::default(), now);
+        let text = query["query"].as_str().unwrap();
+        assert!(!text.contains("acme"), "{text}");
+        assert!(!text.contains("review-requested"), "{text}");
+        assert_eq!(query["variables"]["o0"], "acme");
+        assert_eq!(query["variables"]["o1"], "me");
+        let review = query["variables"]["reviewQ"].as_str().unwrap();
+        assert_eq!(
+            review,
+            "is:pr is:open review-requested:me archived:false user:acme user:me sort:updated-desc"
+        );
+        // No login yet: no search.
+        let query = build_query(&owners, None, &Denied::default(), now);
+        assert!(!query["query"].as_str().unwrap().contains("search("));
+    }
+
+    #[test]
+    fn the_newest_run_of_each_workflow_decides() {
+        let run = |id: i64, workflow: i64, conclusion: &str| json!({ "id": id, "workflow_id": workflow, "conclusion": conclusion });
+        // The newest of workflow 1 passed, an older one failed.
+        assert!(!newest_runs_failed(&[
+            run(5, 1, "success"),
+            run(2, 1, "failure")
+        ]));
+        // Order in the list does not matter.
+        assert!(!newest_runs_failed(&[
+            run(2, 1, "failure"),
+            run(5, 1, "success")
+        ]));
+        // One red workflow is enough.
+        assert!(newest_runs_failed(&[
+            run(5, 1, "success"),
+            run(4, 2, "timed_out")
+        ]));
+        // A cancelled run says nothing: the failure before it still stands.
+        assert!(newest_runs_failed(&[
+            run(6, 1, "cancelled"),
+            run(2, 1, "failure")
+        ]));
+        assert!(!newest_runs_failed(&[]));
+    }
+}

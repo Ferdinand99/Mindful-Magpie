@@ -493,3 +493,25 @@ test("focus_outside_the_row_is_never_touched_by_an_update", () => {
   }
   assert.deepEqual(t.calls, []);
 });
+
+test("a_label_with_a_count_reads_service_text_age_in_both_languages", () => {
+  const nb = draw([need({ label: "Nede: 2", since: NOW - 60 })], { lang: NB });
+  assert.equal(chips(nb.root)[0].querySelector(".mm-need-chip").textContent, "Blog · Nede: 2 · for 1 min siden");
+  const en = draw([need({ label: "Down: 1", since: NOW - 60 })]);
+  assert.equal(chips(en.root)[0].querySelector(".mm-need-chip").textContent, "Blog · Down: 1 · 1 min. ago");
+});
+
+test("a_need_chip_links_to_the_service_link_when_the_bound_card_has_no_link", () => {
+  const services = [{ ...SERVICES[0], link: "https://blog.example:8080" }, SERVICES[1]];
+  const noLink = { ...blog, url: "" };
+  const { root } = draw([need()], { cards: [noLink], extra: { services } });
+  const chip = chips(root)[0].querySelector(".mm-need-chip");
+  assert.equal(chip.tagName, "A");
+  assert.equal(chip.getAttribute("href"), "https://blog.example:8080/");
+  // The card's own link wins, here too.
+  const own = draw([need()], { cards: [blog], extra: { services } });
+  assert.equal(chips(own.root)[0].querySelector(".mm-need-chip").getAttribute("href"), "https://blog.example/");
+  // No link anywhere: plain text.
+  const none = draw([need()], { cards: [noLink], extra: { services: [SERVICES[0]] } });
+  assert.notEqual(chips(none.root)[0].querySelector(".mm-need-chip").tagName, "A");
+});

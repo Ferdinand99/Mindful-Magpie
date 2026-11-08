@@ -119,7 +119,7 @@ macro_rules! label_map {
 /// `edit.js`; a test keeps the two lists in step). A `{name}` in a text is
 /// filled in by the script.
 fn labels() -> BTreeMap<&'static str, &'static str> {
-    label_map!(
+    let mut map = label_map!(
         "empty",
         "invalid_link",
         "group_label",
@@ -140,6 +140,10 @@ fn labels() -> BTreeMap<&'static str, &'static str> {
         "status_bad",
         "status_unknown",
         "updated",
+        "block_more",
+        "spark_line",
+        "spark_counter",
+        "spark_updown",
         "edit_toolbar",
         "edit_done",
         "edit_cancel",
@@ -230,7 +234,11 @@ fn labels() -> BTreeMap<&'static str, &'static str> {
         "help_service",
         "field_metrics",
         "help_metrics",
-        "metrics_full",
+        "metrics_all",
+        "field_size",
+        "size_normal",
+        "size_wide",
+        "help_size",
         "metrics_gone",
         "err_service_metrics",
         "err_bad_service",
@@ -248,7 +256,15 @@ fn labels() -> BTreeMap<&'static str, &'static str> {
         "colour_pink",
         "colour_brown",
         "colour_gray",
-    )
+    );
+    // The titles of detail blocks (`[detail]` in the locale files, written by
+    // the kinds): a block names one by key, and an unknown key shows nothing.
+    for key in i18n::catalog::keys_with_prefix(i18n::Lang::EN, "detail.") {
+        if let Some(text) = i18n::lookup(i18n::current(), key) {
+            map.insert(key, text);
+        }
+    }
+    map
 }
 
 /// The time zone, the clock and the date for the page: now, in the site's
@@ -540,7 +556,8 @@ async fn background_image(
 /// The kit deletes a user (and their `backgrounds` row, by `ON DELETE
 /// CASCADE`) at `POST /settings/users/{id}/delete` and has no hook for what
 /// else the product keeps of the user. After an admin's request to that path,
-/// sweep the files of users that have no picture any more.
+/// sweep the files of users that have no picture any more, and let the poller
+/// look at the services again (the user's personal ones went with them).
 pub async fn sweep_after_user_delete(
     Extension(magpie): Extension<Magpie>,
     request: Request,
@@ -563,6 +580,11 @@ pub async fn sweep_after_user_delete(
         && let Err(err) = magpie.backgrounds.reconcile(&magpie.core).await
     {
         tracing::warn!("can't sweep the background files: {err}");
+    }
+    if by_admin && deletes_user {
+        // The user's personal services went with them (by `ON DELETE
+        // CASCADE`), without a service event: the poller drops their tasks.
+        magpie.poller.resync();
     }
     response
 }

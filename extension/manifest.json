@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Mindful Magpie",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Your Mindful Magpie start page as the new tab page.",
   "icons": {
     "48": "icons/icon-48.png",

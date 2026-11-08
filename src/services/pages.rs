@@ -1,18 +1,28 @@
-//! The admin's Settings page for services.
+//! The Settings pages for services, in two areas that share every handler:
 //!
-//! - `GET  /settings/services`: the list
-//! - `GET  /settings/services/new[?kind=…]`, `POST /settings/services/new`
-//! - `GET  /settings/services/{id}`, `POST /settings/services/{id}`
-//! - `POST /settings/services/{id}/delete`
-//! - `POST /settings/services/test`: one fetch with the form's values, shown
-//!   as a fragment; it never saves.
+//! - **Services** (`/settings/services`, admins): the shared services, which
+//!   the people their visibility names see.
+//! - **My integrations** (`/settings/integrations`, every signed-in user): the
+//!   user's own personal services (kinds such as `github`, whose key is the
+//!   user's own). A user sees, changes, tests and deletes their own and no one
+//!   else's; an admin's page lists the shared services only and answers 404 for
+//!   a personal one, as a missing service.
 //!
-//! Every route is for admins. The forms never show a secret: the edit form
-//! has an empty password input whose placeholder says one is saved, and an
-//! empty input on save keeps the stored secret. A refused form is shown again
-//! with the secret field empty.
+//! Each area has
+//!
+//! - `GET  <base>`: the list
+//! - `GET  <base>/new[?kind=…]`, `POST <base>/new`
+//! - `GET  <base>/{id}`, `POST <base>/{id}`
+//! - `POST <base>/{id}/delete`
+//! - `POST <base>/test`: one fetch with the form's values, shown as a
+//!   fragment; it never saves.
+//!
+//! The forms never show a secret: the edit form has an empty password input
+//! whose placeholder says one is saved, and an empty input on save keeps the
+//! stored secret. A refused form is shown again with the secret field empty.
 
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 use askama::Template;
 use axum::Router;
@@ -26,6 +36,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value as Json};
 use vole_kit::auth::CurrentUser;
 use vole_kit::http::error::ApiError;
+use vole_kit::http::ratelimit::{Rate, retry_after, retry_after_secs};
 use vole_kit::http::{ApiResult, HtmlTemplate};
 use vole_kit::i18n::{self, Tr as _};
 use vole_kit::page::{PageCtx, flash};
@@ -33,26 +44,152 @@ use vole_kit::state::Core;
 
 use super::store::{self, StoreError};
 use super::{
-    FieldError, SecretChange, Service, ServiceEvent, ServiceInput, Visibility, same_origin,
-    without_userinfo,
+    CERT_FIELD, FieldError, LINK_KEY, Scope, SecretChange, Service, ServiceEvent, ServiceInput,
+    Visibility, same_origin, without_userinfo,
 };
 use crate::Magpie;
 use crate::integrations::{
-    self, FetchCtx, FetchError, FieldKind, Format, Integration, Snapshot, Status, Value,
+    self, FetchCtx, FetchError, FieldKind, Format, Integration, Snapshot, Status, Value, api, pin,
 };
+
+/// «Test» presses one user may make on their own integrations page.
+pub const PERSONAL_TEST_RATE: Rate = Rate::per_minute(6);
 
 /// The most a service form is allowed to send.
 const MAX_FORM: usize = 64 * 1024;
 
-/// The routes (the caller adds the sign-in guard).
+/// The routes of both areas (the caller adds the sign-in guard).
 pub fn router() -> Router<Core> {
+    area_routes("/settings/services", Area::Admin)
+        .merge(area_routes("/settings/integrations", Area::Personal))
+}
+
+fn area_routes(base: &'static str, area: Area) -> Router<Core> {
+    let at = |tail: &str| format!("{base}{tail}");
     Router::new()
-        .route("/settings/services", get(list))
-        .route("/settings/services/new", get(new_form).post(create))
-        .route("/settings/services/test", post(test))
-        .route("/settings/services/{id}", get(edit_form).post(update))
-        .route("/settings/services/{id}/delete", post(delete))
+        .route(&at(""), get(list))
+        .route(&at("/new"), get(new_form).post(create))
+        .route(&at("/test"), post(test))
+        .route(&at("/{id}"), get(edit_form).post(update))
+        .route(&at("/{id}/delete"), post(delete))
         .layer(DefaultBodyLimit::max(MAX_FORM))
+        .layer(Extension(area))
+}
+
+// ---------------------------------------------------------------------------
+// The two areas
+
+/// Which area a route belongs to (set as an extension on its routes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Area {
+    Admin,
+    Personal,
+}
+
+/// An area as one request sees it: the admin's, or the signed-in user's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Admin,
+    Personal(i64),
+}
+
+impl Area {
+    /// The mode for `user`: admins only in the admin area, anyone in their own.
+    fn enter(self, user: &CurrentUser) -> ApiResult<Mode> {
+        match self {
+            Area::Admin => {
+                user.require_admin()?;
+                Ok(Mode::Admin)
+            }
+            Area::Personal => Ok(Mode::Personal(user.id)),
+        }
+    }
+}
+
+impl Mode {
+    /// Which services the area works on.
+    fn scope(self) -> Scope {
+        match self {
+            Mode::Admin => Scope::Shared,
+            Mode::Personal(user) => Scope::Personal(user),
+        }
+    }
+
+    fn personal(self) -> bool {
+        matches!(self, Mode::Personal(_))
+    }
+
+    fn base(self) -> &'static str {
+        match self {
+            Mode::Admin => "/settings/services",
+            Mode::Personal(_) => "/settings/integrations",
+        }
+    }
+
+    /// The settings tab that is current on the area's pages.
+    fn subnav(self) -> &'static str {
+        match self {
+            Mode::Admin => "services",
+            Mode::Personal(_) => "integrations",
+        }
+    }
+
+    /// The kinds of service the area may make (personal kinds are for the
+    /// personal area only).
+    fn kinds(self) -> impl Iterator<Item = &'static dyn Integration> {
+        let personal = self.personal();
+        integrations::registry()
+            .iter()
+            .copied()
+            .filter(move |k| k.personal() == personal)
+    }
+
+    /// The kind called `name`, if the area may make it.
+    fn kind(self, name: &str) -> Option<&'static dyn Integration> {
+        self.kinds().find(|k| k.kind() == name)
+    }
+
+    /// The translation keys of the area's own texts.
+    fn texts(self) -> Texts {
+        match self {
+            Mode::Admin => Texts {
+                title: "nav.services",
+                sub: "service.sub",
+                new: "service.new",
+                edit: "service.edit",
+                none_title: "service.none_title",
+                none_text: "service.none_text",
+                created: "service.created",
+                saved: "service.saved",
+                deleted: "service.deleted",
+            },
+            Mode::Personal(_) => Texts {
+                title: "nav.my_integrations",
+                sub: "integration.sub",
+                new: "integration.new",
+                edit: "integration.edit",
+                none_title: "integration.none_title",
+                none_text: "integration.none_text",
+                created: "integration.created",
+                saved: "integration.saved",
+                deleted: "integration.deleted",
+            },
+        }
+    }
+}
+
+/// The translation keys of an area's texts.
+#[derive(Debug, Clone, Copy)]
+struct Texts {
+    title: &'static str,
+    sub: &'static str,
+    new: &'static str,
+    edit: &'static str,
+    none_title: &'static str,
+    none_text: &'static str,
+    created: &'static str,
+    saved: &'static str,
+    deleted: &'static str,
 }
 
 // ---------------------------------------------------------------------------
@@ -91,7 +228,7 @@ struct Parsed {
     errors: Vec<FieldError>,
 }
 
-fn parse(form: &Raw, kind: &'static dyn Integration) -> Parsed {
+fn parse(form: &Raw, kind: &'static dyn Integration, mode: Mode) -> Parsed {
     let mut errors = Vec::new();
     let mut settings = Map::new();
     let mut typed = BTreeMap::new();
@@ -116,6 +253,21 @@ fn parse(form: &Raw, kind: &'static dyn Integration) -> Parsed {
                 }),
             },
         }
+    }
+
+    // «Lenke på kort»: kept in the settings next to the kind's own, and checked
+    // with them (`ServiceInput::check_connection`).
+    let link = form.get(LINK_KEY).trim().to_string();
+    if !link.is_empty() {
+        settings.insert(LINK_KEY.to_string(), Json::String(link));
+    }
+
+    // The pinned certificate's fingerprint: a field every service has. It is
+    // checked (and stored in its usual spelling) with the rest of the input.
+    let pin_text = form.get(CERT_FIELD).trim().to_string();
+    typed.insert(CERT_FIELD, pin_text.clone());
+    if !pin_text.is_empty() {
+        settings.insert(CERT_FIELD.to_string(), Json::String(pin_text));
     }
 
     let secret = if !kind.fields().iter().any(|f| f.secret) {
@@ -143,7 +295,10 @@ fn parse(form: &Raw, kind: &'static dyn Integration) -> Parsed {
         })
     };
 
+    // A personal service is for its user alone: no visibility to choose, and
+    // no address (the kind has its own), whatever the form says.
     let visibility = match form.get("visibility") {
+        _ if mode.personal() => Visibility::Users,
         "" => Visibility::Admin,
         text => Visibility::parse(text).unwrap_or_else(|| {
             errors.push(FieldError {
@@ -154,7 +309,8 @@ fn parse(form: &Raw, kind: &'static dyn Integration) -> Parsed {
         }),
     };
 
-    let url = Some(form.get("url").trim().to_string()).filter(|u| !u.is_empty());
+    let url =
+        Some(form.get("url").trim().to_string()).filter(|u| !u.is_empty() && !mode.personal());
     Parsed {
         input: ServiceInput {
             kind: kind.kind().to_string(),
@@ -164,7 +320,11 @@ fn parse(form: &Raw, kind: &'static dyn Integration) -> Parsed {
             secret,
             interval_s,
             visibility,
-            users: form.all("users").filter_map(|u| u.parse().ok()).collect(),
+            users: if mode.personal() {
+                Vec::new()
+            } else {
+                form.all("users").filter_map(|u| u.parse().ok()).collect()
+            },
         },
         interval,
         settings: typed,
@@ -202,34 +362,51 @@ impl Row {
     }
 }
 
+/// What the list page needs to know about its area.
+struct ListView {
+    base: &'static str,
+    new_href: String,
+    personal: bool,
+    texts: Texts,
+}
+
 #[derive(Template)]
 #[template(path = "services.html")]
 struct ListPage {
     ctx: PageCtx,
     rows: Vec<Row>,
+    list: ListView,
 }
 
 async fn list(
     State(core): State<Core>,
+    Extension(area): Extension<Area>,
     user: CurrentUser,
     jar: SignedCookieJar,
 ) -> ApiResult<Response> {
-    user.require_admin()?;
-    let rows = store::list(&core)
+    let mode = area.enter(&user)?;
+    let rows = store::list_in(&core, mode.scope())
         .await?
         .into_iter()
         .map(Row::new)
         .collect();
+    let texts = mode.texts();
     let (ctx, jar) = PageCtx::build(
         &core,
         Some(&user),
         &jar,
-        i18n::t("nav.services"),
+        i18n::t(texts.title),
         "settings",
-        "services",
+        mode.subnav(),
     )
     .await;
-    Ok((jar, HtmlTemplate(ListPage { ctx, rows })).into_response())
+    let list = ListView {
+        base: mode.base(),
+        new_href: format!("{}/new", mode.base()),
+        personal: mode.personal(),
+        texts,
+    };
+    Ok((jar, HtmlTemplate(ListPage { ctx, rows, list })).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -262,6 +439,12 @@ struct KindChoice {
 }
 
 struct FormView {
+    /// The area's path (`/settings/services` or `/settings/integrations`).
+    base: &'static str,
+    /// A personal service: no address, no visibility.
+    personal: bool,
+    /// Translation key of the chooser's title.
+    new_key: &'static str,
     /// Where the form posts.
     action: String,
     id: Option<i64>,
@@ -272,11 +455,16 @@ struct FormView {
     name: String,
     url: String,
     url_required: bool,
+    /// «Lenke på kort».
+    link: String,
     interval: String,
     interval_default: u64,
     interval_min: u64,
     visibility: Visibility,
     settings: Vec<SettingView>,
+    /// The pinned certificate's fingerprint as typed, and what is wrong with it.
+    cert_value: String,
+    cert_error: String,
     secret: Option<SecretView>,
     has_secret: bool,
     /// The stored secret can't be opened any more.
@@ -284,6 +472,7 @@ struct FormView {
     users: Vec<UserChoice>,
     name_error: String,
     url_error: String,
+    link_error: String,
     interval_error: String,
     visibility_error: String,
     secret_error: String,
@@ -300,6 +489,7 @@ struct FormPage {
 struct Shown {
     name: String,
     url: String,
+    link: String,
     interval: String,
     settings: BTreeMap<&'static str, String>,
     visibility: Visibility,
@@ -312,6 +502,7 @@ impl Shown {
         Shown {
             name: String::new(),
             url: String::new(),
+            link: String::new(),
             interval: String::new(),
             settings: BTreeMap::new(),
             visibility: Visibility::Admin,
@@ -322,27 +513,36 @@ impl Shown {
 
     fn of(service: &Service) -> Shown {
         let settings = service.settings.as_object();
+        let mut shown: BTreeMap<&'static str, String> = service
+            .integration()
+            .map(|kind| {
+                kind.fields()
+                    .iter()
+                    .filter(|f| !f.secret)
+                    .map(|f| {
+                        let value = match settings.and_then(|s| s.get(f.key)) {
+                            Some(Json::String(text)) => text.clone(),
+                            Some(Json::Number(n)) => n.to_string(),
+                            _ => String::new(),
+                        };
+                        (f.key, value)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(Json::String(pin)) = settings.and_then(|s| s.get(CERT_FIELD)) {
+            shown.insert(CERT_FIELD, pin.clone());
+        }
         Shown {
             name: service.name.clone(),
             url: service.url.clone().unwrap_or_default(),
+            link: settings
+                .and_then(|s| s.get(LINK_KEY))
+                .and_then(Json::as_str)
+                .unwrap_or_default()
+                .to_string(),
             interval: service.interval_s.to_string(),
-            settings: service
-                .integration()
-                .map(|kind| {
-                    kind.fields()
-                        .iter()
-                        .filter(|f| !f.secret)
-                        .map(|f| {
-                            let value = match settings.and_then(|s| s.get(f.key)) {
-                                Some(Json::String(text)) => text.clone(),
-                                Some(Json::Number(n)) => n.to_string(),
-                                _ => String::new(),
-                            };
-                            (f.key, value)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
+            settings: shown,
             visibility: service.visibility,
             users: service.users.clone(),
             errors: Vec::new(),
@@ -354,6 +554,7 @@ impl Shown {
             name: parsed.input.name,
             // The address is shown again without a user name and password.
             url: without_userinfo(form.get("url").trim()),
+            link: form.get(LINK_KEY).trim().to_string(),
             interval: parsed.interval,
             settings: parsed.settings,
             visibility: parsed.input.visibility,
@@ -382,6 +583,7 @@ async fn user_choices(core: &Core, chosen: &[i64]) -> ApiResult<Vec<UserChoice>>
 
 async fn form_view(
     core: &Core,
+    mode: Mode,
     kind: &'static dyn Integration,
     id: Option<i64>,
     has_secret: bool,
@@ -414,9 +616,12 @@ async fn form_view(
         help: f.help_key,
     });
     Ok(FormView {
+        base: mode.base(),
+        personal: mode.personal(),
+        new_key: mode.texts().new,
         action: match id {
-            Some(id) => format!("/settings/services/{id}"),
-            None => "/settings/services/new".to_string(),
+            Some(id) => format!("{}/{id}", mode.base()),
+            None => format!("{}/new", mode.base()),
         },
         id,
         kind: kind.kind(),
@@ -425,14 +630,22 @@ async fn form_view(
         url_required: kind.url_required(),
         interval_default: kind.default_interval().as_secs(),
         interval_min: kind.min_interval().as_secs(),
-        users: user_choices(core, &shown.users).await?,
+        cert_value: shown.settings.get(CERT_FIELD).cloned().unwrap_or_default(),
+        cert_error: error(CERT_FIELD),
+        users: if mode.personal() {
+            Vec::new()
+        } else {
+            user_choices(core, &shown.users).await?
+        },
         name_error: error("name"),
         url_error: error("url"),
+        link_error: error("link"),
         interval_error: error("interval"),
         visibility_error: error("visibility"),
         secret_error: error("secret"),
         name: shown.name.clone(),
         url: shown.url.clone(),
+        link: shown.link.clone(),
         interval: shown.interval.clone(),
         visibility: shown.visibility,
         settings,
@@ -443,14 +656,17 @@ async fn form_view(
 }
 
 /// The kind chooser, as a form view that has no form.
-fn chooser() -> FormView {
+fn chooser(mode: Mode) -> FormView {
     FormView {
+        base: mode.base(),
+        personal: mode.personal(),
+        new_key: mode.texts().new,
         action: String::new(),
         id: None,
         kind: "",
         kind_label: "",
-        choose: integrations::registry()
-            .iter()
+        choose: mode
+            .kinds()
             .map(|k| KindChoice {
                 kind: k.kind(),
                 label_key: k.label_key(),
@@ -459,17 +675,21 @@ fn chooser() -> FormView {
         name: String::new(),
         url: String::new(),
         url_required: false,
+        link: String::new(),
         interval: String::new(),
         interval_default: 0,
         interval_min: 0,
         visibility: Visibility::Admin,
         settings: Vec::new(),
+        cert_value: String::new(),
+        cert_error: String::new(),
         secret: None,
         has_secret: false,
         secret_unreadable: false,
         users: Vec::new(),
         name_error: String::new(),
         url_error: String::new(),
+        link_error: String::new(),
         interval_error: String::new(),
         visibility_error: String::new(),
         secret_error: String::new(),
@@ -478,13 +698,14 @@ fn chooser() -> FormView {
 
 async fn render_form(
     core: &Core,
+    mode: Mode,
     user: &CurrentUser,
     jar: SignedCookieJar,
     status: StatusCode,
     form: FormView,
     title: &'static str,
 ) -> ApiResult<Response> {
-    let (ctx, jar) = PageCtx::build(core, Some(user), &jar, title, "settings", "services").await;
+    let (ctx, jar) = PageCtx::build(core, Some(user), &jar, title, "settings", mode.subnav()).await;
     Ok((status, jar, HtmlTemplate(FormPage { ctx, form })).into_response())
 }
 
@@ -495,61 +716,69 @@ struct NewQuery {
 
 async fn new_form(
     State(core): State<Core>,
+    Extension(area): Extension<Area>,
     user: CurrentUser,
     jar: SignedCookieJar,
     Query(query): Query<NewQuery>,
 ) -> ApiResult<Response> {
-    user.require_admin()?;
+    let mode = area.enter(&user)?;
     let kind = match query.kind.as_deref() {
-        Some(kind) => integrations::find(kind),
+        Some(kind) => mode.kind(kind),
         // One kind: no need to choose.
-        None if integrations::registry().len() == 1 => integrations::registry().first().copied(),
-        None => None,
+        None => {
+            let mut kinds = mode.kinds();
+            kinds.next().filter(|_| kinds.next().is_none())
+        }
     };
     let form = match kind {
-        Some(kind) => form_view(&core, kind, None, false, Shown::empty()).await?,
-        None => chooser(),
+        Some(kind) => form_view(&core, mode, kind, None, false, Shown::empty()).await?,
+        None => chooser(mode),
     };
     render_form(
         &core,
+        mode,
         &user,
         jar,
         StatusCode::OK,
         form,
-        i18n::t("service.new"),
+        i18n::t(mode.texts().new),
     )
     .await
 }
 
 /// Whether the service has a secret that can't be opened any more (the instance
 /// key changed): the form says so instead of "saved".
-async fn unreadable(core: &Core, service: &Service) -> bool {
+async fn unreadable(core: &Core, mode: Mode, service: &Service) -> bool {
     service.has_secret
         && matches!(
-            store::open_secret(core, service.id).await,
+            store::open_secret_in(core, Some(mode.scope()), service.id).await,
             Err(store::CtxError::SecretUnreadable(_))
         )
 }
 
 async fn edit_form(
     State(core): State<Core>,
+    Extension(area): Extension<Area>,
     user: CurrentUser,
     jar: SignedCookieJar,
     Path(id): Path<i64>,
 ) -> ApiResult<Response> {
-    user.require_admin()?;
-    let service = store::get(&core, id).await?.ok_or(ApiError::NotFound)?;
+    let mode = area.enter(&user)?;
+    let service = store::get_in(&core, mode.scope(), id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     let kind = service.integration().ok_or(ApiError::NotFound)?;
     let has_secret = service.has_secret;
-    let mut form = form_view(&core, kind, Some(id), has_secret, Shown::of(&service)).await?;
-    form.secret_unreadable = unreadable(&core, &service).await;
+    let mut form = form_view(&core, mode, kind, Some(id), has_secret, Shown::of(&service)).await?;
+    form.secret_unreadable = unreadable(&core, mode, &service).await;
     render_form(
         &core,
+        mode,
         &user,
         jar,
         StatusCode::OK,
         form,
-        i18n::t("service.edit"),
+        i18n::t(mode.texts().edit),
     )
     .await
 }
@@ -559,58 +788,68 @@ fn announce(magpie: &Magpie, event: ServiceEvent) {
     let _ = magpie.service_events.send(event);
 }
 
-fn done(jar: SignedCookieJar, message: &'static str) -> Response {
+fn done(jar: SignedCookieJar, mode: Mode, message: &'static str) -> Response {
     (
         flash(jar, "success", i18n::t(message)),
-        Redirect::to("/settings/services"),
+        Redirect::to(mode.base()),
     )
         .into_response()
 }
 
 async fn create(
     State(core): State<Core>,
+    Extension(area): Extension<Area>,
     Extension(magpie): Extension<Magpie>,
     user: CurrentUser,
     jar: SignedCookieJar,
     body: Bytes,
 ) -> ApiResult<Response> {
-    user.require_admin()?;
+    let mode = area.enter(&user)?;
     let raw = Raw::parse(&body);
-    let Some(kind) = integrations::find(raw.get("kind")) else {
+    let Some(kind) = mode.kind(raw.get("kind")) else {
         return render_form(
             &core,
+            mode,
             &user,
             jar,
             StatusCode::UNPROCESSABLE_ENTITY,
-            chooser(),
-            i18n::t("service.new"),
+            chooser(mode),
+            i18n::t(mode.texts().new),
         )
         .await;
     };
-    let parsed = parse(&raw, kind);
+    let parsed = parse(&raw, kind, mode);
     let mut errors = parsed.errors.clone();
     errors.extend(parsed.input.check());
     let result = if errors.is_empty() {
-        store::create(&core, &parsed.input).await
+        store::create_in(&core, mode.scope(), &parsed.input).await
     } else {
         Err(StoreError::Invalid(errors.clone()))
     };
     match result {
         Ok(id) => {
-            tracing::info!(admin = %user.username, service_id = id, kind = kind.kind(), "service created");
+            tracing::info!(user = %user.username, service_id = id, kind = kind.kind(), personal = mode.personal(), "service created");
             announce(&magpie, ServiceEvent::Created(id));
-            Ok(done(jar, "service.created"))
+            Ok(done(jar, mode, mode.texts().created))
         }
         Err(StoreError::Invalid(errors)) => {
-            let form =
-                form_view(&core, kind, None, false, Shown::typed(parsed, &raw, errors)).await?;
+            let form = form_view(
+                &core,
+                mode,
+                kind,
+                None,
+                false,
+                Shown::typed(parsed, &raw, errors),
+            )
+            .await?;
             render_form(
                 &core,
+                mode,
                 &user,
                 jar,
                 StatusCode::UNPROCESSABLE_ENTITY,
                 form,
-                i18n::t("service.new"),
+                i18n::t(mode.texts().new),
             )
             .await
         }
@@ -621,47 +860,59 @@ async fn create(
 
 async fn update(
     State(core): State<Core>,
+    Extension(area): Extension<Area>,
     Extension(magpie): Extension<Magpie>,
     user: CurrentUser,
     jar: SignedCookieJar,
     Path(id): Path<i64>,
     body: Bytes,
 ) -> ApiResult<Response> {
-    user.require_admin()?;
-    let service = store::get(&core, id).await?.ok_or(ApiError::NotFound)?;
+    let mode = area.enter(&user)?;
+    let service = store::get_in(&core, mode.scope(), id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     let kind = service.integration().ok_or(ApiError::NotFound)?;
     let raw = Raw::parse(&body);
-    let parsed = parse(&raw, kind);
+    let parsed = parse(&raw, kind, mode);
     let mut errors = parsed.errors.clone();
     errors.extend(parsed.input.check());
     let result = if errors.is_empty() {
-        store::update(&core, id, &parsed.input).await
+        store::update_in(&core, mode.scope(), id, &parsed.input).await
     } else {
         Err(StoreError::Invalid(errors.clone()))
     };
     match result {
         Ok(()) => {
-            tracing::info!(admin = %user.username, service_id = id, kind = kind.kind(), "service updated");
+            tracing::info!(user = %user.username, service_id = id, kind = kind.kind(), personal = mode.personal(), "service updated");
+            // An app that was too old a minute ago may not be now.
+            for url in [service.url.as_deref(), parsed.input.url.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                api::forget_all_for(url);
+            }
             announce(&magpie, ServiceEvent::Updated(id));
-            Ok(done(jar, "service.saved"))
+            Ok(done(jar, mode, mode.texts().saved))
         }
         Err(StoreError::Invalid(errors)) => {
             let mut form = form_view(
                 &core,
+                mode,
                 kind,
                 Some(id),
                 service.has_secret,
                 Shown::typed(parsed, &raw, errors),
             )
             .await?;
-            form.secret_unreadable = unreadable(&core, &service).await;
+            form.secret_unreadable = unreadable(&core, mode, &service).await;
             render_form(
                 &core,
+                mode,
                 &user,
                 jar,
                 StatusCode::UNPROCESSABLE_ENTITY,
                 form,
-                i18n::t("service.edit"),
+                i18n::t(mode.texts().edit),
             )
             .await
         }
@@ -672,18 +923,19 @@ async fn update(
 
 async fn delete(
     State(core): State<Core>,
+    Extension(area): Extension<Area>,
     Extension(magpie): Extension<Magpie>,
     user: CurrentUser,
     jar: SignedCookieJar,
     Path(id): Path<i64>,
 ) -> ApiResult<Response> {
-    user.require_admin()?;
-    if !store::delete(&core, id).await? {
+    let mode = area.enter(&user)?;
+    if !store::delete_in(&core, mode.scope(), id).await? {
         return Err(ApiError::NotFound);
     }
-    tracing::info!(admin = %user.username, service_id = id, "service deleted");
+    tracing::info!(user = %user.username, service_id = id, personal = mode.personal(), "service deleted");
     announce(&magpie, ServiceEvent::Deleted(id));
-    Ok(done(jar, "service.deleted"))
+    Ok(done(jar, mode, mode.texts().deleted))
 }
 
 // ---------------------------------------------------------------------------
@@ -703,6 +955,18 @@ struct TestResult {
     /// Why, in words that hold no secret, header or address.
     reason: Option<String>,
     rows: Vec<TestRow>,
+    /// The certificate the server presented, when TLS did not accept it.
+    presented: Option<Presented>,
+}
+
+/// A certificate fingerprint offered for pinning.
+struct Presented {
+    /// 64 lowercase hex characters, what the "use" button fills in.
+    plain: String,
+    /// As `openssl` writes it, for reading.
+    shown: String,
+    hint: &'static str,
+    button: &'static str,
 }
 
 fn headline(status: &str) -> &'static str {
@@ -739,7 +1003,7 @@ fn trim_number(n: f64) -> String {
 
 /// A value for the result list. (The start page draws its own from the
 /// snapshot; this is the plain version «Test» needs.)
-fn format_value(format: Format, value: &Value) -> String {
+fn format_value(format: Format, value: &Value, now: i64) -> String {
     let Some(n) = value.num else {
         return value.text.clone().unwrap_or_default();
     };
@@ -770,8 +1034,8 @@ fn format_value(format: Format, value: &Value) -> String {
             }
         }
         Format::Since => {
-            let age = (jiff::Timestamp::now().as_second() as f64 - n).max(0.0);
-            format_value(Format::Duration, &Value::num(age))
+            let age = (now as f64 - n).max(0.0);
+            format_value(Format::Duration, &Value::num(age), now)
         }
         Format::Text => value.text.clone().unwrap_or_else(|| trim_number(n)),
     }
@@ -783,20 +1047,27 @@ fn unknown(reason: String) -> TestResult {
         headline: headline("unknown"),
         reason: Some(reason),
         rows: Vec::new(),
+        presented: None,
     }
 }
 
-fn describe(kind: &'static dyn Integration, outcome: Result<Snapshot, FetchError>) -> TestResult {
+fn describe(
+    kind: &'static dyn Integration,
+    outcome: Result<Snapshot, FetchError>,
+    now: i64,
+) -> TestResult {
     match outcome {
         Ok(snapshot) => {
             let status = status_name(snapshot.status);
+            let mut values = snapshot.values.clone();
+            integrations::localize_texts(kind.kind(), &mut values);
             let rows = kind
                 .metrics()
                 .iter()
                 .filter_map(|metric| {
-                    snapshot.values.get(metric.id).map(|value| TestRow {
+                    values.get(metric.id).map(|value| TestRow {
                         label: i18n::t(metric.label_key),
-                        value: format_value(metric.format, value),
+                        value: format_value(metric.format, value, now),
                     })
                 })
                 .collect();
@@ -805,6 +1076,7 @@ fn describe(kind: &'static dyn Integration, outcome: Result<Snapshot, FetchError
                 headline: headline(status),
                 reason: snapshot.error.as_deref().map(reason_text),
                 rows,
+                presented: None,
             }
         }
         // The settings can't be used: nothing was tried.
@@ -814,17 +1086,46 @@ fn describe(kind: &'static dyn Integration, outcome: Result<Snapshot, FetchError
             headline: headline("bad"),
             reason: Some(reason_text(&err.to_string())),
             rows: Vec::new(),
+            presented: None,
         },
     }
 }
 
-async fn test(State(core): State<Core>, user: CurrentUser, body: Bytes) -> ApiResult<Response> {
-    user.require_admin()?;
+async fn test(
+    State(core): State<Core>,
+    Extension(area): Extension<Area>,
+    Extension(magpie): Extension<Magpie>,
+    user: CurrentUser,
+    body: Bytes,
+) -> ApiResult<Response> {
+    let mode = area.enter(&user)?;
+    // Any signed-in user may press «Test» on their own page: it sends a
+    // request with their key, so it has a budget per user.
+    if mode.personal()
+        && let Err(wait) = magpie.test_budget.take(
+            &format!("personal-test:{}", user.id),
+            PERSONAL_TEST_RATE,
+            Instant::now(),
+        )
+    {
+        tracing::warn!(user = %user.username, "personal «Test» over the budget");
+        // Answered with the fragment «Test» swaps in (htmx does not swap a 4xx
+        // answer), so the person sees why nothing was sent. `Retry-After` says
+        // how long, for anything that reads it.
+        let seconds = retry_after_secs(wait).to_string();
+        let mut res = HtmlTemplate(unknown(
+            i18n::t("service.test_throttled").replace("{seconds}", &seconds),
+        ))
+        .into_response();
+        let (name, value) = retry_after(wait);
+        res.headers_mut().insert(name, value);
+        return Ok(res);
+    }
     let raw = Raw::parse(&body);
-    let Some(kind) = integrations::find(raw.get("kind")) else {
+    let Some(kind) = mode.kind(raw.get("kind")) else {
         return Ok(HtmlTemplate(unknown(i18n::t("err.kind").to_string())).into_response());
     };
-    let parsed = parse(&raw, kind);
+    let parsed = parse(&raw, kind, mode);
     let mut errors = parsed.errors.clone();
     errors.extend(parsed.input.check_connection());
     if let Some(first) = errors.first() {
@@ -839,7 +1140,7 @@ async fn test(State(core): State<Core>, user: CurrentUser, body: Bytes) -> ApiRe
         SecretChange::Keep => match raw.get("id").parse::<i64>() {
             // One row: the origin is compared with the very row the secret is
             // opened from.
-            Ok(id) => match store::stored_secret(&core, id).await? {
+            Ok(id) => match store::stored_secret_in(&core, Some(mode.scope()), id).await? {
                 Some(stored) if stored.kind == input.kind && stored.has_secret() => {
                     // The stored secret only goes to the address it was saved for.
                     if !same_origin(stored.url.as_deref(), input.url.as_deref()) {
@@ -856,7 +1157,16 @@ async fn test(State(core): State<Core>, user: CurrentUser, body: Bytes) -> ApiRe
                             )))
                             .into_response());
                         }
-                        Err(err) => return Err(ApiError::internal(err)),
+                        Err(store::CtxError::Config) => {
+                            return Ok(HtmlTemplate(unknown(reason_text(
+                                &FetchError::Config.to_string(),
+                            )))
+                            .into_response());
+                        }
+                        Err(store::CtxError::Changed) => {
+                            return Err(ApiError::internal(store::CtxError::Changed));
+                        }
+                        Err(store::CtxError::Db(err)) => return Err(ApiError::internal(err)),
                     }
                 }
                 _ => None,
@@ -868,14 +1178,45 @@ async fn test(State(core): State<Core>, user: CurrentUser, body: Bytes) -> ApiRe
     if let Some(url) = &input.url {
         settings.insert("url".into(), Json::String(url.clone()));
     }
+    let settings = Json::Object(settings);
+    // Fetches the kind remembered as too old are asked again.
+    if let Some(url) = &input.url {
+        api::forget_all_for(url);
+    }
+    // The pin, if any, decides the client (it was checked above).
+    let Ok(http) = integrations::client_for(&settings) else {
+        let reason = reason_text(&FetchError::Config.to_string());
+        return Ok(HtmlTemplate(unknown(reason)).into_response());
+    };
     let ctx = FetchCtx {
-        http: integrations::client().clone(),
-        settings: Json::Object(settings),
+        http,
+        settings,
         secret,
     };
     let outcome = kind.fetch(&ctx).await;
-    let result = describe(kind, outcome);
+    // TLS refused the certificate: show the one the server presents, so the
+    // admin can pin it. A second, separate look that sends nothing at all.
+    let refused = match &outcome {
+        Err(FetchError::Cert) => true,
+        Ok(snapshot) => snapshot.error.as_deref() == Some(FetchError::Cert.to_string().as_str()),
+        Err(_) => false,
+    };
+    let presented = if refused {
+        match input.url.as_deref().map(|u| url::Url::parse(u.trim())) {
+            Some(Ok(url)) => pin::presented(&url).await,
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let mut result = describe(kind, outcome, magpie.poller.now());
+    result.presented = presented.map(|plain| Presented {
+        shown: pin::display(&plain),
+        plain,
+        hint: i18n::t("service.pin_presented"),
+        button: i18n::t("service.pin_use"),
+    });
     // Only what happened, never the address, the settings or the secret.
-    tracing::info!(admin = %user.username, kind = kind.kind(), status = result.status, "service tested");
+    tracing::info!(user = %user.username, kind = kind.kind(), personal = mode.personal(), status = result.status, "service tested");
     Ok(HtmlTemplate(result).into_response())
 }

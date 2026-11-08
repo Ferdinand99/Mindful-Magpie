@@ -28,6 +28,13 @@ body {
   margin: 0 auto;
   padding: 2.5rem 1.5rem 4rem;
 }
+/* The new tab uses the width of the screen, as the start page does: the card grid gets as many
+   columns as fit, and a wide card spans two of them. The cap only keeps the header near the cards
+   on a very wide screen. */
+.shell.newtab {
+  max-width: 2400px;
+  padding-inline: clamp(16px, 3vw, 48px);
+}
 
 .brand {
   display: flex;
