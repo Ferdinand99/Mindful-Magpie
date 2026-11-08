@@ -648,6 +648,9 @@ fn detail_keys(lang: &str) -> Vec<String> {
 /// The keys the kit has under `[detail]` itself.
 const KIT_DETAIL_KEYS: [&str; 2] = ["expires", "request"];
 
+/// The short names some kinds' detail keys start with instead of the kind's id.
+const KIND_ALIASES: [(&str, &str); 2] = [("proxmox", "pve"), ("github", "gh")];
+
 #[tokio::test]
 async fn every_detail_key_starts_with_the_id_of_a_kind() {
     let _app = App::new().await;
@@ -655,16 +658,26 @@ async fn every_detail_key_starts_with_the_id_of_a_kind() {
         .iter()
         .map(|k| k.kind())
         .collect();
+    // An alias belongs to a kind that exists, and is not itself the id of one.
+    for (kind, alias) in KIND_ALIASES {
+        assert!(kinds.contains(&kind), "{kind} is not a kind");
+        assert!(!kinds.contains(&alias), "{alias} is a kind of its own");
+    }
+    let prefixes: Vec<&str> = kinds
+        .iter()
+        .copied()
+        .chain(KIND_ALIASES.iter().map(|(_, alias)| *alias))
+        .collect();
     for key in detail_keys("en") {
         assert!(
             !KIT_DETAIL_KEYS.contains(&key.as_str()),
             "{key} is a key of the kit's"
         );
         assert!(
-            kinds
+            prefixes
                 .iter()
-                .any(|kind| key.starts_with(&format!("{kind}_"))),
-            "[detail] {key} must start with the id of a kind and an underscore ({kinds:?}), so that kinds and the kit do not collide"
+                .any(|prefix| key.starts_with(&format!("{prefix}_"))),
+            "[detail] {key} must start with the id of a kind or its alias and an underscore ({prefixes:?}), so that kinds and the kit do not collide"
         );
     }
 }

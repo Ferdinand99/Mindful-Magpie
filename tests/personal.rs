@@ -1247,7 +1247,9 @@ async fn nobody_else_gets_it_by_any_path_not_even_an_admin() {
         let body = page(&mut web).await;
         assert!(!body.contains("Alice GitHub"), "{name}: the page names it");
         assert!(!body.contains("gh:review"), "{name}");
-        assert!(!body.contains("Waiting for you"), "{name}");
+        // The need's text ("Waiting for you: 3"); the label map carries the GitHub card's
+        // block title "Waiting for you" for every page, which names nothing.
+        assert!(!body.contains("Waiting for you:"), "{name}");
         let values = block(&body, "mm-values");
         assert_eq!(ids_of(&values["services"]), vec![w.blog], "{name}");
         assert!(values["needs"].as_array().unwrap().is_empty(), "{name}");
