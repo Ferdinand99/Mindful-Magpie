@@ -258,6 +258,8 @@ struct Repo {
     alerts: Option<u64>,
     /// `(draft, hours ago)` of each release; `None` for no `releases` field.
     releases: Option<Vec<(bool, i64)>>,
+    /// The name of a failing check, when the rollup says FAILURE.
+    failed_check: Option<&'static str>,
 }
 
 fn repo(name: &str) -> Repo {
@@ -267,6 +269,7 @@ fn repo(name: &str) -> Repo {
         rollup: Some("SUCCESS"),
         alerts: Some(0),
         releases: Some(Vec::new()),
+        failed_check: None,
     }
 }
 
@@ -277,16 +280,34 @@ fn ago(hours: i64) -> String {
         .to_string()
 }
 
+/// The checks of a rollup: two that pass and, when asked, one that failed.
+fn contexts(failed: Option<&str>) -> Vec<Json> {
+    let mut nodes =
+        vec![json!({ "__typename": "CheckRun", "name": "lint", "conclusion": "SUCCESS" })];
+    if let Some(name) = failed {
+        nodes.push(json!({ "__typename": "CheckRun", "name": name, "conclusion": "FAILURE" }));
+    }
+    nodes
+        .push(json!({ "__typename": "StatusContext", "context": "ci/legacy", "state": "SUCCESS" }));
+    nodes
+}
+
 fn node(r: &Repo) -> Json {
     json!({
         "nameWithOwner": r.name,
+        "url": format!("https://github.com/{}", r.name),
         "defaultBranchRef": r.branch.map(|b| json!({
             "name": b,
-            "target": { "statusCheckRollup": r.rollup.map(|s| json!({ "state": s })) },
+            "target": { "statusCheckRollup": r.rollup.map(|s| json!({
+                "state": s,
+                "contexts": { "nodes": contexts(r.failed_check) },
+            })) },
         })),
         "vulnerabilityAlerts": r.alerts.map(|n| json!({ "totalCount": n })),
         "releases": r.releases.as_ref().map(|list| json!({
-            "nodes": list.iter().map(|(draft, hours)| json!({
+            "nodes": list.iter().enumerate().map(|(i, (draft, hours))| json!({
+                "tagName": format!("v1.{i}"),
+                "url": format!("https://github.com/{}/releases/tag/v1.{i}", r.name),
                 "publishedAt": ago(*hours),
                 "isDraft": draft,
             })).collect::<Vec<_>>(),
@@ -303,7 +324,12 @@ fn counts(data: &mut Json, reviews: Option<u64>, authored: Option<u64>) {
     if let Some(n) = reviews {
         // Pull request titles and repositories are in the answer, as in the
         // real one for a wide query: the kind must not keep them.
-        data["reviews"] = json!({ "issueCount": n, "nodes": [{ "title": "Secret PR title" }] });
+        let nodes = if n > 0 {
+            vec![json!({ "title": "Secret PR title" })]
+        } else {
+            Vec::new()
+        };
+        data["reviews"] = json!({ "issueCount": n, "nodes": nodes });
     }
     if let Some(n) = authored {
         data["authored"] = json!({ "issueCount": n });
@@ -495,8 +521,9 @@ async fn one_query_gives_every_number_and_the_needs() {
     assert_eq!(review.params["count"], "3");
     assert_eq!(review.score, 3.0);
 
-    // Nothing GitHub called something is kept.
-    let stored = serde_json::to_string(&snapshot).unwrap();
+    // Nothing GitHub called something is in the numbers or the needs (names
+    // and titles live in the details only).
+    let stored = serde_json::to_string(&(&snapshot.values, &snapshot.needs)).unwrap();
     for text in ["Secret PR title", "me/api", "me/web", "me/lib", "octocat"] {
         assert!(!stored.contains(text), "{text}: {stored}");
     }
@@ -574,7 +601,7 @@ async fn the_login_is_asked_once_and_used_in_the_searches() {
     let vars = &mains[0].body["variables"];
     assert_eq!(
         vars["reviewQ"],
-        "is:pr is:open review-requested:octocat archived:false"
+        "is:pr is:open review-requested:octocat archived:false sort:updated-desc"
     );
     assert_eq!(
         vars["authoredQ"],
@@ -598,7 +625,7 @@ async fn the_login_is_asked_once_and_used_in_the_searches() {
     let last = stub.mains().pop().unwrap();
     assert_eq!(
         last.body["variables"]["reviewQ"],
-        "is:pr is:open review-requested:someone-else archived:false"
+        "is:pr is:open review-requested:someone-else archived:false sort:updated-desc"
     );
 }
 
@@ -630,7 +657,7 @@ async fn the_owners_filter_goes_in_as_variables() {
     assert_eq!(seen.body["variables"]["o1"], "me");
     assert_eq!(
         seen.body["variables"]["reviewQ"],
-        "is:pr is:open review-requested:octocat archived:false user:acme user:me"
+        "is:pr is:open review-requested:octocat archived:false user:acme user:me sort:updated-desc"
     );
     // The same repository under two owners is counted once.
     assert_eq!(num(&snapshot, "dependabot"), Some(0.0));
@@ -1237,4 +1264,549 @@ fn the_rate_limit_has_a_fixed_text_with_a_translation() {
         FetchError::RateLimited.text_key(),
         Some("fetch_err.rate_limited")
     );
+}
+
+// ---------------------------------------------------------------------------
+// Details
+
+use mindful_magpie::integrations::Block;
+use mindful_magpie::integrations::block::{ListItem, MAX_ITEMS};
+
+/// The reading's details as the poller stores them: cut down to the limits.
+fn details(snapshot: &Snapshot) -> Vec<Block> {
+    let mut bounded = snapshot.clone();
+    bounded.bound_details();
+    bounded.details
+}
+
+fn list_of<'a>(blocks: &'a [Block], title: &str) -> Option<&'a Vec<ListItem>> {
+    blocks.iter().find_map(|b| match b {
+        Block::List { title_key, items } if title_key == title => Some(items),
+        _ => None,
+    })
+}
+
+/// A pull request node of the review search.
+fn pr(title: &str, repo: &str, author: Option<&str>, url: &str, hours: i64) -> Json {
+    json!({
+        "title": title,
+        "url": url,
+        "createdAt": ago(hours),
+        "repository": { "nameWithOwner": repo },
+        "author": author.map(|login| json!({ "login": login })),
+    })
+}
+
+/// An answer with these pull requests waiting for a review.
+fn answer_with_reviews(repos: &[Repo], prs: Vec<Json>) -> Json {
+    let mut a = answer(repos, Some(prs.len() as u64), Some(0));
+    a["data"]["reviews"]["nodes"] = Json::Array(prs);
+    a
+}
+
+#[tokio::test]
+async fn the_review_list_has_the_title_the_repository_and_author_the_age_and_a_link() {
+    let (base, stub) = serve().await;
+    stub.script(vec![Reply::ok(&answer_with_reviews(
+        &[repo("me/api")],
+        vec![
+            pr(
+                "Fix the parser",
+                "acme/parser",
+                Some("kari"),
+                "https://github.com/acme/parser/pull/12",
+                50,
+            ),
+            pr(
+                "Bump deps",
+                "me/api",
+                Some("dependabot[bot]"),
+                "https://github.com/me/api/pull/3",
+                5,
+            ),
+            pr(
+                "No author",
+                "me/api",
+                None,
+                "https://github.com/me/api/pull/4",
+                0,
+            ),
+        ],
+    ))]);
+    let snapshot = fetch(&base, next_id()).await;
+    assert_eq!(num(&snapshot, "review_requests"), Some(3.0));
+    let blocks = details(&snapshot);
+    let items = list_of(&blocks, "gh_review").expect("a review list");
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0].text, "Fix the parser");
+    assert_eq!(items[0].sub.as_deref(), Some("acme/parser \u{b7} kari"));
+    assert_eq!(items[0].right.as_deref(), Some("2d"));
+    assert_eq!(
+        items[0].href.as_deref(),
+        Some("https://github.com/acme/parser/pull/12")
+    );
+    assert_eq!(items[1].right.as_deref(), Some("5h"));
+    assert_eq!(items[2].sub.as_deref(), Some("me/api"));
+    assert_eq!(items[2].right.as_deref(), Some("1m"));
+    // The query asks for what the list shows.
+    let query = query_of(&stub.mains()[0]);
+    for field in ["title", "url", "createdAt", "nameWithOwner", "login"] {
+        assert!(query.contains(field), "{field}: {query}");
+    }
+    // The numbers and the needs are unchanged, and hold no title.
+    assert_eq!(snapshot.needs.len(), 1);
+    assert_eq!(snapshot.needs[0].key, "gh:review");
+    let outside = serde_json::to_string(&(&snapshot.needs, &snapshot.values)).unwrap();
+    assert!(
+        !outside.contains("parser") && !outside.contains("kari"),
+        "{outside}"
+    );
+}
+
+#[tokio::test]
+async fn only_https_github_links_stay_on_the_lists() {
+    let (base, stub) = serve().await;
+    let bad = [
+        "javascript:alert(1)",
+        "https://evil.example/acme/parser/pull/1",
+        "http://github.com/acme/parser/pull/1",
+        "https://github.com.evil.example/x",
+        "https://user:pw@github.com/x",
+        "https://github.com:8443/x",
+        "https://api.github.com/repos/acme/parser/pulls/1",
+        "https://gist.github.com/x",
+        "https://raw.githubusercontent.com/x",
+        "data:text/html,<b>x</b>",
+        "//github.com/x",
+    ];
+    // At most eight lines go in one reading: ask in rounds.
+    for round in bad.chunks(MAX_ITEMS) {
+        let prs: Vec<Json> = round
+            .iter()
+            .map(|url| pr("T", "acme/parser", Some("kari"), url, 1))
+            .collect();
+        stub.script(vec![Reply::ok(&answer_with_reviews(
+            &[repo("me/api")],
+            prs,
+        ))]);
+        let blocks = details(&fetch(&base, next_id()).await);
+        let items = list_of(&blocks, "gh_review").unwrap();
+        assert_eq!(items.len(), round.len());
+        for item in items {
+            assert_eq!(item.href, None, "{item:?}");
+            assert_eq!(item.text, "T", "the line stays when its link goes");
+        }
+    }
+    // A good one keeps its link.
+    stub.script(vec![Reply::ok(&answer_with_reviews(
+        &[repo("me/api")],
+        vec![pr(
+            "T",
+            "a/b",
+            None,
+            "https://github.com/acme/parser/pull/7",
+            1,
+        )],
+    ))]);
+    let blocks = details(&fetch(&base, next_id()).await);
+    assert_eq!(
+        list_of(&blocks, "gh_review").unwrap()[0].href.as_deref(),
+        Some("https://github.com/acme/parser/pull/7")
+    );
+}
+
+#[tokio::test]
+async fn hostile_titles_stay_text_and_every_list_is_cut_at_eight() {
+    let (base, stub) = serve().await;
+    let hostile = format!(
+        "<script>alert(1)</script>\u{202E}\u{0}\n{}",
+        "x".repeat(300)
+    );
+    let mut prs: Vec<Json> = (0..20)
+        .map(|i| {
+            pr(
+                &format!("PR {i}"),
+                "a/b",
+                Some("kari"),
+                "https://github.com/a/b/pull/1",
+                1,
+            )
+        })
+        .collect();
+    prs[0] = pr(
+        &hostile,
+        &hostile,
+        Some(&hostile),
+        "https://github.com/a/b/pull/1",
+        1,
+    );
+    let repos: Vec<Repo> = (0..20)
+        .map(|i| {
+            let mut r = repo(&format!("me/r{i}"));
+            r.rollup = Some("FAILURE");
+            r.alerts = Some(i + 1);
+            r.releases = Some(vec![(false, 1)]);
+            r
+        })
+        .collect();
+    stub.script(vec![Reply::ok(&answer_with_reviews(&repos, prs))]);
+    let snapshot = fetch(&base, next_id()).await;
+    let blocks = details(&snapshot);
+    assert!(blocks.len() <= 6);
+    for title in ["gh_review", "gh_ci", "gh_releases", "gh_dependabot"] {
+        assert_eq!(
+            list_of(&blocks, title).expect(title).len(),
+            MAX_ITEMS,
+            "{title}"
+        );
+    }
+    let first = &list_of(&blocks, "gh_review").unwrap()[0];
+    assert!(first.text.starts_with("<script>"));
+    for text in [Some(&first.text), first.sub.as_ref()] {
+        let text = text.unwrap();
+        assert!(text.chars().count() <= 80, "{text}");
+        assert!(!text.contains(['\u{202E}', '\u{0}', '\n']), "{text}");
+    }
+    // The numbers still count everything.
+    assert_eq!(num(&snapshot, "ci_red"), Some(20.0));
+    let outside = serde_json::to_string(&(&snapshot.needs, &snapshot.values)).unwrap();
+    assert!(
+        !outside.contains("script") && !outside.contains("me/r"),
+        "{outside}"
+    );
+}
+
+#[tokio::test]
+async fn the_red_ci_list_names_the_repository_the_branch_and_the_failing_check() {
+    let (base, stub) = serve().await;
+    let mut named = repo("me/api");
+    named.rollup = Some("FAILURE");
+    named.failed_check = Some("build");
+    let mut unnamed = repo("me/web");
+    unnamed.rollup = Some("ERROR");
+    unnamed.branch = Some("trunk");
+    let green = repo("me/green");
+    // The answer says nothing about this one; its newest run failed.
+    let mut silent = repo("me/lib");
+    silent.rollup = None;
+    stub.script(vec![Reply::ok(&answer(
+        &[named, green, unnamed, silent],
+        Some(0),
+        Some(0),
+    ))]);
+    stub.rest(
+        "/repos/me/lib/actions/runs",
+        Reply::ok(&json!({ "workflow_runs": [
+            { "id": 9, "workflow_id": 1, "name": "Release", "conclusion": "failure",
+              "html_url": "https://github.com/me/lib/actions/runs/9" },
+            { "id": 4, "workflow_id": 1, "name": "Release", "conclusion": "success",
+              "html_url": "https://github.com/me/lib/actions/runs/4" },
+        ] })),
+    );
+    let snapshot = fetch(&base, next_id()).await;
+    assert_eq!(num(&snapshot, "ci_red"), Some(3.0));
+    let blocks = details(&snapshot);
+    let items = list_of(&blocks, "gh_ci").expect("a red CI list");
+    let rows: Vec<_> = items
+        .iter()
+        .map(|i| {
+            (
+                i.text.as_str(),
+                i.sub.as_deref(),
+                i.status,
+                i.href.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (
+                "me/api",
+                Some("main \u{b7} build"),
+                Some(Status::Bad),
+                Some("https://github.com/me/api/actions")
+            ),
+            (
+                "me/web",
+                Some("trunk"),
+                Some(Status::Bad),
+                Some("https://github.com/me/web/actions")
+            ),
+            (
+                "me/lib",
+                Some("main \u{b7} Release"),
+                Some(Status::Bad),
+                Some("https://github.com/me/lib/actions/runs/9")
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_run_link_that_is_not_github_falls_back_to_the_repository() {
+    let (base, stub) = serve().await;
+    let mut silent = repo("me/lib");
+    silent.rollup = None;
+    stub.script(vec![Reply::ok(&answer(&[silent], Some(0), Some(0)))]);
+    stub.rest(
+        "/repos/me/lib/actions/runs",
+        Reply::ok(&json!({ "workflow_runs": [
+            { "id": 9, "workflow_id": 1, "name": "CI", "conclusion": "failure",
+              "html_url": "javascript:alert(1)" },
+        ] })),
+    );
+    let blocks = details(&fetch(&base, next_id()).await);
+    let items = list_of(&blocks, "gh_ci").unwrap();
+    assert_eq!(
+        items[0].href.as_deref(),
+        Some("https://github.com/me/lib/actions")
+    );
+}
+
+#[tokio::test]
+async fn the_releases_list_has_the_tag_the_repository_the_age_and_a_link() {
+    let (base, stub) = serve().await;
+    let mut api = repo("me/api");
+    // A draft and a two-day-old release do not count and do not show.
+    api.releases = Some(vec![(false, 2), (true, 1), (false, 50)]);
+    let mut web = repo("me/web");
+    web.releases = Some(vec![(false, 20)]);
+    stub.script(vec![Reply::ok(&answer(&[api, web], Some(0), Some(0)))]);
+    let snapshot = fetch(&base, next_id()).await;
+    assert_eq!(num(&snapshot, "releases_24h"), Some(2.0));
+    let blocks = details(&snapshot);
+    let items = list_of(&blocks, "gh_releases").expect("a releases list");
+    let rows: Vec<_> = items
+        .iter()
+        .map(|i| {
+            (
+                i.text.as_str(),
+                i.sub.as_deref(),
+                i.right.as_deref(),
+                i.href.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (
+                "v1.0",
+                Some("me/api"),
+                Some("2h"),
+                Some("https://github.com/me/api/releases/tag/v1.0")
+            ),
+            (
+                "v1.0",
+                Some("me/web"),
+                Some("20h"),
+                Some("https://github.com/me/web/releases/tag/v1.0")
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_dependabot_list_has_the_repositories_with_alerts_most_first() {
+    let (base, stub) = serve().await;
+    let (mut a, mut b, mut c) = (repo("me/a"), repo("me/b"), repo("me/c"));
+    a.alerts = Some(1);
+    b.alerts = Some(0);
+    c.alerts = Some(4);
+    stub.script(vec![Reply::ok(&answer(&[a, b, c], Some(0), Some(0)))]);
+    let snapshot = fetch(&base, next_id()).await;
+    assert_eq!(num(&snapshot, "dependabot"), Some(5.0));
+    let blocks = details(&snapshot);
+    let items = list_of(&blocks, "gh_dependabot").expect("a Dependabot list");
+    let rows: Vec<_> = items
+        .iter()
+        .map(|i| {
+            (
+                i.text.as_str(),
+                i.right.as_deref(),
+                i.status,
+                i.href.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (
+                "me/c",
+                Some("4"),
+                Some(Status::Warn),
+                Some("https://github.com/me/c/security/dependabot")
+            ),
+            (
+                "me/a",
+                Some("1"),
+                Some(Status::Warn),
+                Some("https://github.com/me/a/security/dependabot")
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_quiet_account_has_no_detail_blocks() {
+    let (base, stub) = serve().await;
+    stub.script(vec![Reply::ok(&answer(&[repo("me/a")], Some(0), Some(0)))]);
+    let snapshot = fetch(&base, next_id()).await;
+    assert!(details(&snapshot).is_empty(), "{:?}", snapshot.details);
+}
+
+#[tokio::test]
+async fn a_part_the_token_may_not_read_leaves_its_list_out() {
+    let (base, stub) = serve().await;
+    let mut no_alerts = repo("me/a");
+    no_alerts.alerts = None;
+    let mut first = answer(&[no_alerts.clone()], Some(0), Some(0));
+    first["errors"] = json!([forbidden(json!([
+        "viewer",
+        "repositories",
+        "nodes",
+        0,
+        "vulnerabilityAlerts"
+    ]))]);
+    stub.script(vec![
+        Reply::ok(&first),
+        Reply::ok(&answer(&[no_alerts], Some(0), Some(0))),
+    ]);
+    let snapshot = fetch(&base, next_id()).await;
+    assert_eq!(snapshot.error, None);
+    let blocks = details(&snapshot);
+    assert!(list_of(&blocks, "gh_dependabot").is_none());
+}
+
+#[tokio::test]
+async fn every_key_the_github_details_use_has_a_text_in_both_languages() {
+    let (base, stub) = serve().await;
+    let mut red = repo("me/api");
+    red.rollup = Some("FAILURE");
+    red.alerts = Some(2);
+    red.releases = Some(vec![(false, 1)]);
+    stub.script(vec![Reply::ok(&answer_with_reviews(
+        &[red],
+        vec![pr(
+            "T",
+            "a/b",
+            Some("k"),
+            "https://github.com/a/b/pull/1",
+            1,
+        )],
+    ))]);
+    let blocks = details(&fetch(&base, next_id()).await);
+    let mut keys: Vec<&str> = blocks.iter().flat_map(Block::keys).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["gh_ci", "gh_dependabot", "gh_releases", "gh_review"]);
+    for key in keys {
+        for (lang, file) in [
+            ("en", include_str!("../locales/en.toml")),
+            ("nb", include_str!("../locales/nb.toml")),
+        ] {
+            assert!(
+                section(file, "detail")
+                    .get(key)
+                    .is_some_and(|text| !text.is_empty()),
+                "{lang}: {key}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_token_that_cannot_read_the_check_names_keeps_the_red_count() {
+    let (base, stub) = serve().await;
+    let mut red = repo("me/api");
+    red.rollup = Some("FAILURE");
+    red.failed_check = Some("build");
+    let mut also = repo("me/web");
+    also.rollup = Some("ERROR");
+    let first = {
+        let mut a = answer(&[red.clone(), also.clone()], Some(0), Some(0));
+        a["errors"] = json!([forbidden(json!([
+            "viewer",
+            "repositories",
+            "nodes",
+            0,
+            "defaultBranchRef",
+            "target",
+            "statusCheckRollup",
+            "contexts",
+            "nodes"
+        ]))]);
+        a
+    };
+    // The second answer is what the query without the check names gets.
+    red.failed_check = None;
+    stub.script(vec![
+        Reply::ok(&first),
+        Reply::ok(&answer(&[red, also], Some(0), Some(0))),
+    ]);
+    let id = next_id();
+    let snapshot = fetch(&base, id).await;
+    assert_eq!(snapshot.error, None, "fewer details, not an error");
+    // Both repositories are still counted red, and nothing went to the REST
+    // fallback: only the check name is gone.
+    assert_eq!(num(&snapshot, "ci_red"), Some(2.0));
+    assert!(stub.rests().is_empty());
+    let blocks = details(&snapshot);
+    let items = list_of(&blocks, "gh_ci").expect("a red CI list");
+    let subs: Vec<_> = items.iter().map(|i| i.sub.as_deref()).collect();
+    assert_eq!(subs, [Some("main"), Some("main")]);
+    // The second query keeps the state and drops only the check names…
+    let mains = stub.mains();
+    assert_eq!(mains.len(), 2);
+    assert!(query_of(&mains[0]).contains("contexts("));
+    let second = query_of(&mains[1]);
+    assert!(second.contains("statusCheckRollup { state }"), "{second}");
+    assert!(!second.contains("contexts("), "{second}");
+    // …and so does the next fetch, at once.
+    fetch(&base, id).await;
+    let mains = stub.mains();
+    assert_eq!(mains.len(), 3);
+    assert!(!query_of(&mains[2]).contains("contexts("));
+}
+
+#[tokio::test]
+async fn the_cut_keeps_the_most_alerts_and_the_newest_releases() {
+    let (base, stub) = serve().await;
+    // Twelve repositories in an order that is neither by alerts nor by age:
+    // repository `i` has `i + 1` alerts and a release `12 - i` hours old, so
+    // the most alerts and the newest releases are the highest `i`.
+    let repos: Vec<Repo> = (0..12)
+        .map(|i| {
+            let mut r = repo(&format!("me/r{i}"));
+            r.alerts = Some(i + 1);
+            r.releases = Some(vec![(false, 12 - i as i64)]);
+            r
+        })
+        .rev()
+        .collect();
+    stub.script(vec![Reply::ok(&answer(&repos, Some(0), Some(0)))]);
+    let snapshot = fetch(&base, next_id()).await;
+    assert_eq!(num(&snapshot, "releases_24h"), Some(12.0));
+    let blocks = details(&snapshot);
+    let alerts: Vec<_> = list_of(&blocks, "gh_dependabot")
+        .unwrap()
+        .iter()
+        .map(|i| (i.text.clone(), i.right.clone().unwrap()))
+        .collect();
+    let expected: Vec<_> = (4..12)
+        .rev()
+        .map(|i| (format!("me/r{i}"), format!("{}", i + 1)))
+        .collect();
+    assert_eq!(alerts, expected);
+    let released: Vec<_> = list_of(&blocks, "gh_releases")
+        .unwrap()
+        .iter()
+        .map(|i| (i.sub.clone().unwrap(), i.right.clone().unwrap()))
+        .collect();
+    let expected: Vec<_> = (4..12)
+        .rev()
+        .map(|i| (format!("me/r{i}"), format!("{}h", 12 - i)))
+        .collect();
+    assert_eq!(released, expected);
 }

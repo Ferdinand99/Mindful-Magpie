@@ -27,13 +27,22 @@
 //! bad). One with files that fail to probe, titles that are not matched or
 //! files that were skipped, and nothing unavailable, is a library with issues
 //! (`tofa:library_warn`, warning): most libraries have some unmatched titles,
-//! so it is a nudge, not an alarm. Names are never kept.
+//! so it is a nudge, not an alarm.
+//!
+//! **Details.** The reading carries blocks for the card: what is playing (a
+//! list, one line per session: title, «user (profile) · client», and warning
+//! while paused), a bar block with each session's progress, the libraries
+//! (worst first, with the episode count) and facts (background tasks, server
+//! version). Titles, library names and user and profile names go into these
+//! blocks only, as text, never into the numbers, the needs or an error. They
+//! are shown to everyone who may see the service. The user is the session's
+//! `username`; the profile name is added in brackets when it is another word
+//! (it is often only a default label).
+//! The libraries' lines are carried between the slow refreshes with the rest.
 //!
 //! The key is sent as `Authorization: Bearer`, marked sensitive, and acts as
 //! an admin in Tofa: it is a password. A 403 on an admin endpoint means the
-//! key is known but is no admin key ([`FetchError::NotAdmin`]). Titles,
-//! library names and user names from Tofa are never kept: the reading holds
-//! numbers and the server's version only.
+//! key is known but is no admin key ([`FetchError::NotAdmin`]).
 //!
 //! What the kind remembers between fetches lives in memory, per address, in a
 //! bounded list ([`MEMORY_MAX`]): a fetch counter and the last slow values.
@@ -46,6 +55,7 @@ use serde_json::Value as Json;
 use url::Url;
 
 use super::api::{self, Credential, OldAddresses, Reply};
+use super::block::{Bar, Block, Fact, ListItem, MAX_ITEMS, TEXT_CHARS};
 use super::{
     BoxFuture, FetchCtx, FetchError, Field, FieldKind, Format, Integration, Level, MetricDef, Need,
     Snapshot, Status, Value,
@@ -172,12 +182,14 @@ async fn read(ctx: &FetchCtx) -> Result<Snapshot, FetchError> {
     let version = text_of(&health, "version");
 
     let mut error = None;
-    let sessions = call(ctx, &base, &key, SESSIONS)
-        .await
-        .and_then(|doc| doc.as_ref().map(read_sessions).transpose());
-    let sessions = match got(sessions, &mut error)? {
-        Got::Value(counts) => Some(counts),
-        Got::Absent | Got::Failed => None,
+    let sessions = call(ctx, &base, &key, SESSIONS).await.and_then(|doc| {
+        doc.as_ref()
+            .map(|doc| Ok((read_sessions(doc)?, read_plays(doc))))
+            .transpose()
+    });
+    let (sessions, plays) = match got(sessions, &mut error)? {
+        Got::Value((counts, plays)) => (Some(counts), plays),
+        Got::Absent | Got::Failed => (None, Vec::new()),
     };
 
     let mut slow = before.slow;
@@ -205,7 +217,8 @@ async fn read(ctx: &FetchCtx) -> Result<Snapshot, FetchError> {
         remember(&address, |m| m.slow = slow.clone());
     }
 
-    Ok(reading(version, sessions, &slow, error.or(slow.error)))
+    let details = details(version.as_deref(), &plays, &slow);
+    Ok(reading(version, sessions, &slow, error.or(slow.error)).with_details(details))
 }
 
 // ---------------------------------------------------------------------------
@@ -229,11 +242,33 @@ struct Slow {
     error: Option<FetchError>,
 }
 
-/// How many libraries have errors and how many only have issues.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// How many libraries have errors and how many only have issues, and the
+/// lines of the libraries list (the worst first, at most [`MAX_ITEMS`]).
+#[derive(Debug, Clone, Default, PartialEq)]
 struct Libraries {
     errors: f64,
     issues: f64,
+    rows: Vec<LibraryRow>,
+}
+
+/// One library of the list.
+#[derive(Debug, Clone, PartialEq)]
+struct LibraryRow {
+    name: String,
+    episodes: Option<u64>,
+    status: Status,
+}
+
+/// One session of the now-playing list.
+#[derive(Debug, Clone, PartialEq)]
+struct Play {
+    title: String,
+    /// «user (profile) · client», and «transcode» for a transcode.
+    sub: Option<String>,
+    /// Whole percent played, when the session says where it is and how long
+    /// the media is.
+    progress: Option<u32>,
+    paused: bool,
 }
 
 /// Runs `f` on the memory of `key` (made if it is not there), which then
@@ -376,17 +411,100 @@ fn positive(library: &Json, field: &str) -> bool {
 /// files).
 fn read_libraries(doc: &Json) -> Result<Libraries, FetchError> {
     let (mut errors, mut issues) = (0.0, 0.0);
+    let mut rows = Vec::new();
     for library in array(doc)? {
-        if positive(library, "unavailable_titles") {
+        let status = if positive(library, "unavailable_titles") {
             errors += 1.0;
+            Status::Bad
         } else if ["probe_failed_files", "unmatched_titles", "skipped_files"]
             .iter()
             .any(|field| positive(library, field))
         {
             issues += 1.0;
+            Status::Warn
+        } else {
+            Status::Ok
+        };
+        if let Some(name) = line_of(library, "name") {
+            rows.push(LibraryRow {
+                name,
+                episodes: api::count(library.get("episodes_total"))
+                    .filter(|n| *n > 0.0)
+                    .map(|n| n as u64),
+                status,
+            });
         }
     }
-    Ok(Libraries { errors, issues })
+    // The worst first; the order the server gave otherwise.
+    rows.sort_by_key(|row| match row.status {
+        Status::Bad => 0,
+        Status::Warn => 1,
+        _ => 2,
+    });
+    rows.truncate(MAX_ITEMS);
+    Ok(Libraries {
+        errors,
+        issues,
+        rows,
+    })
+}
+
+/// A line of text of a session or library from outside: one line, cut.
+fn line_of(doc: &Json, field: &str) -> Option<String> {
+    doc.get(field)
+        .and_then(Json::as_str)
+        .map(|text| api::clean_text(text, TEXT_CHARS))
+        .filter(|text| !text.is_empty())
+}
+
+/// Who plays: the user, with the profile in brackets when it is another word
+/// than the user's name; the profile alone when there is no user name.
+fn who(user: Option<String>, profile: Option<String>) -> Option<String> {
+    match (user, profile) {
+        (Some(user), Some(profile)) if !profile.eq_ignore_ascii_case(&user) => {
+            Some(format!("{user} ({profile})"))
+        }
+        (Some(user), _) => Some(user),
+        (None, profile) => profile,
+    }
+}
+
+/// The sessions of the now-playing list: those with a title, at most
+/// [`MAX_ITEMS`]. Anything else in the answer is not looked at.
+fn read_plays(doc: &Json) -> Vec<Play> {
+    doc.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|session| {
+            let title = line_of(session, "media_title")?;
+            let transcode = session
+                .get("decision_mode")
+                .and_then(Json::as_str)
+                .is_some_and(|mode| mode.to_ascii_lowercase().contains("transcode"));
+            let parts: Vec<String> = [
+                who(
+                    line_of(session, "username"),
+                    line_of(session, "profile_name"),
+                ),
+                line_of(session, "client_name"),
+                transcode.then(|| "transcode".to_string()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let position = api::count(session.get("position_ms"));
+            let duration = api::count(session.get("duration_ms")).filter(|d| *d > 0.0);
+            Some(Play {
+                title,
+                sub: (!parts.is_empty()).then(|| parts.join(" \u{b7} ")),
+                progress: position
+                    .zip(duration)
+                    .map(|(at, of)| (at / of * 100.0).round().clamp(0.0, 100.0) as u32),
+                paused: session.get("is_paused").and_then(Json::as_bool) == Some(true),
+            })
+        })
+        .take(MAX_ITEMS)
+        .collect()
 }
 
 /// How many background tasks the server lists; every one is running.
@@ -426,17 +544,20 @@ fn reading(
     put("streams", sessions.map(|(streams, _)| streams));
     put("transcodes", sessions.map(|(_, transcodes)| transcodes));
     put("tasks_running", slow.tasks);
-    put("libraries_unhealthy", slow.libraries.map(|l| l.errors));
+    put(
+        "libraries_unhealthy",
+        slow.libraries.as_ref().map(|l| l.errors),
+    );
     if let Some(version) = version {
         snapshot
             .values
             .insert("version".to_string(), Value::text(version));
     }
 
-    let Libraries { errors, issues } = slow.libraries.unwrap_or(Libraries {
-        errors: 0.0,
-        issues: 0.0,
-    });
+    let (errors, issues) = slow
+        .libraries
+        .as_ref()
+        .map_or((0.0, 0.0), |l| (l.errors, l.issues));
     if errors > 0.0 {
         snapshot.needs.push(counted_need(
             LIBRARY_NEED,
@@ -462,6 +583,106 @@ fn reading(
     }
     snapshot.error = error.map(|e| e.to_string());
     snapshot
+}
+
+/// An integer with a space between its thousands («6 576»).
+fn spaced(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(' ');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// The blocks of the card: what is playing, the libraries, and the facts of
+/// the server. Each is left out when there is nothing to put in it.
+fn details(version: Option<&str>, plays: &[Play], slow: &Slow) -> Vec<Block> {
+    let mut blocks = Vec::new();
+    if !plays.is_empty() {
+        blocks.push(Block::List {
+            title_key: "tofa_playing".to_string(),
+            items: plays
+                .iter()
+                .map(|play| ListItem {
+                    text: play.title.clone(),
+                    sub: play.sub.clone(),
+                    status: Some(if play.paused {
+                        Status::Warn
+                    } else {
+                        Status::Ok
+                    }),
+                    right: None,
+                    href: None,
+                    ..Default::default()
+                })
+                .collect(),
+        });
+        // The progress is drawn as bars, in the order of the list (so the
+        // list has no progress text of its own).
+        let bars: Vec<Bar> = plays
+            .iter()
+            .filter_map(|play| {
+                let pct = play.progress?;
+                Some(Bar {
+                    label: play.title.clone(),
+                    pct: f64::from(pct),
+                    text: format!("{pct} %"),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        if !bars.is_empty() {
+            blocks.push(Block::Bars {
+                title_key: "tofa_progress".to_string(),
+                bars,
+            });
+        }
+    }
+    if let Some(libraries) = slow.libraries.as_ref().filter(|l| !l.rows.is_empty()) {
+        blocks.push(Block::List {
+            title_key: "tofa_libraries".to_string(),
+            items: libraries
+                .rows
+                .iter()
+                .map(|row| ListItem {
+                    text: row.name.clone(),
+                    sub: row.episodes.map(|n| format!("{} ep.", spaced(n))),
+                    status: Some(row.status),
+                    right: None,
+                    href: None,
+                    ..Default::default()
+                })
+                .collect(),
+        });
+    }
+    let mut rows = Vec::new();
+    if let Some(tasks) = slow.tasks {
+        rows.push(Fact {
+            label_key: Some("tofa_tasks".to_string()),
+            label: None,
+            value: format!("{tasks:.0}"),
+            ..Default::default()
+        });
+    }
+    if let Some(version) = version {
+        rows.push(Fact {
+            label_key: Some("tofa_version".to_string()),
+            label: None,
+            value: version.to_string(),
+            ..Default::default()
+        });
+    }
+    if !rows.is_empty() {
+        blocks.push(Block::Facts {
+            title_key: "tofa_server".to_string(),
+            rows,
+        });
+    }
+    blocks
 }
 
 // ---------------------------------------------------------------------------
@@ -535,14 +756,59 @@ mod tests {
             {},
             "odd",
         ]);
-        assert_eq!(
-            read_libraries(&doc).unwrap(),
-            Libraries {
-                errors: 1.0,
-                issues: 3.0
-            }
-        );
+        let libraries = read_libraries(&doc).unwrap();
+        assert_eq!((libraries.errors, libraries.issues), (1.0, 3.0));
         assert_eq!(read_libraries(&json!(5)), Err(FetchError::Invalid));
+    }
+
+    #[test]
+    fn thousands_are_spaced() {
+        for (n, text) in [
+            (0, "0"),
+            (12, "12"),
+            (999, "999"),
+            (1000, "1 000"),
+            (6576, "6 576"),
+            (1_234_567, "1 234 567"),
+        ] {
+            assert_eq!(spaced(n), text);
+        }
+    }
+
+    #[test]
+    fn the_user_is_shown_with_the_profile_only_when_it_is_another_word() {
+        let word = |s: &str| Some(s.to_string());
+        assert_eq!(
+            who(word("kari"), word("Main")).as_deref(),
+            Some("kari (Main)")
+        );
+        assert_eq!(who(word("kari"), word("KARI")).as_deref(), Some("kari"));
+        assert_eq!(who(word("kari"), None).as_deref(), Some("kari"));
+        assert_eq!(who(None, word("Main")).as_deref(), Some("Main"));
+        assert_eq!(who(None, None), None);
+        let doc = json!([{ "media_title": "A", "username": "ola", "profile_name": "Ola" }]);
+        assert_eq!(read_plays(&doc)[0].sub.as_deref(), Some("ola"));
+    }
+
+    #[test]
+    fn a_session_without_a_title_is_not_listed_and_the_list_is_cut() {
+        let doc = json!([
+            { "media_title": "A", "profile_name": "p" },
+            { "profile_name": "no title" },
+            { "media_title": "  " },
+            "odd",
+        ]);
+        let plays = read_plays(&doc);
+        assert_eq!(plays.len(), 1);
+        assert_eq!(plays[0].sub.as_deref(), Some("p"));
+        assert_eq!(plays[0].progress, None);
+        let many = json!(
+            (0..30)
+                .map(|i| json!({ "media_title": format!("t{i}") }))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(read_plays(&many).len(), MAX_ITEMS);
+        assert!(read_plays(&json!({})).is_empty());
     }
 
     #[test]
@@ -556,10 +822,7 @@ mod tests {
     #[test]
     fn the_reading_carries_the_slow_error_with_the_slow_values() {
         let slow = Slow {
-            libraries: Some(Libraries {
-                errors: 0.0,
-                issues: 0.0,
-            }),
+            libraries: Some(Libraries::default()),
             tasks: Some(1.0),
             error: None,
         };

@@ -13,8 +13,11 @@
 //!
 //! **Calls.** One GraphQL query a fetch asks for the repositories (default
 //! branch status, open Dependabot alerts, the newest releases) and, with the
-//! user's login (asked once, then remembered), the number of pull requests
-//! waiting for their review and of their own open ones. A repository whose
+//! user's login (asked once, then remembered), the pull requests waiting for
+//! their review (the count and the newest few) and the number of their own
+//! open ones. The rollup also asks for its first ten checks (`contexts`) to
+//! name the failing one; that adds one more connection per repository and
+//! raises the query's point cost by about one point for a hundred repositories. A repository whose
 //! default branch has no status in the answer gets one REST call (the newest
 //! completed workflow runs on that branch), for at most [`CI_FALLBACK_MAX`]
 //! repositories a fetch. Repositories past the first 100 of an owner are not
@@ -33,9 +36,18 @@
 //! service, for at most [`MEMORY_MAX`] services, and dropped when the token
 //! changes.
 //!
-//! Pull request titles and repository names are never kept: the reading holds
-//! numbers only. The token is sent as `Authorization: Bearer`, marked
-//! sensitive, and never reaches an error, a reading or a log line.
+//! **Details.** Next to the numbers the reading carries lists for the card:
+//! the pull requests waiting for the user's review (title, «repository ·
+//! author», age, link), the repositories with red CI (branch and failing
+//! check, link), the releases of the last day (tag, repository, age, link) and
+//! the repositories with Dependabot alerts (count, link). Titles, repository
+//! names and logins go into these blocks only, as text, never into the numbers,
+//! the needs or an error. A link is kept only when it is an `https` address on
+//! `github.com` ([`github_link`]). The pull requests asked for are the newest
+//! [`MAX_ITEMS`]; the number counts all of them.
+//!
+//! The token is sent as `Authorization: Bearer`, marked sensitive, and never
+//! reaches an error, a reading or a log line.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Mutex;
@@ -48,6 +60,7 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use super::api;
+use super::block::{Block, ListItem, MAX_ITEMS, TEXT_CHARS};
 use super::{
     BoxFuture, FetchCtx, FetchError, Field, FieldKind, Format, Integration, Level, MetricDef, Need,
     SettingError, Snapshot, Status, Value, read_capped,
@@ -272,10 +285,19 @@ enum Part {
     Alerts,
     Releases,
     Search,
+    /// The names of the failing checks inside the rollup: a token that may
+    /// read the rollup's state may not read these.
+    Contexts,
 }
 
 impl Part {
-    const ALL: [Part; 4] = [Part::Rollup, Part::Alerts, Part::Releases, Part::Search];
+    const ALL: [Part; 5] = [
+        Part::Rollup,
+        Part::Alerts,
+        Part::Releases,
+        Part::Search,
+        Part::Contexts,
+    ];
 
     /// The field of the query that names this part in an error's path.
     fn fields(self) -> &'static [&'static str] {
@@ -284,13 +306,14 @@ impl Part {
             Part::Alerts => &["vulnerabilityAlerts"],
             Part::Releases => &["releases"],
             Part::Search => &["reviews", "authored"],
+            Part::Contexts => &["contexts"],
         }
     }
 }
 
 /// Which parts are left out, until when.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Denied([Option<Timestamp>; 4]);
+struct Denied([Option<Timestamp>; 5]);
 
 impl Denied {
     fn is(&self, part: Part, now: Timestamp) -> bool {
@@ -440,13 +463,56 @@ struct Session<'a> {
 #[derive(Debug, Default, Clone)]
 struct Repo {
     name: String,
+    /// The repository's page, when it is a GitHub link.
+    url: Option<String>,
     default_branch: Option<String>,
     /// The state of the default branch's checks, when the answer has one.
     rollup: Option<String>,
+    /// The name of a check of the rollup that failed, if the answer shows one.
+    failing_check: Option<String>,
     alerts: Option<f64>,
     /// Releases published in the last day; `None` when the answer had no
     /// releases for the repository.
     releases_24h: Option<f64>,
+    /// Those releases that have a tag and a link.
+    releases: Vec<Release>,
+}
+
+/// A release of the last day.
+#[derive(Debug, Clone)]
+struct Release {
+    tag: String,
+    url: String,
+    at: Timestamp,
+}
+
+/// A pull request waiting for the user's review.
+#[derive(Debug, Clone)]
+struct Review {
+    title: String,
+    repo: Option<String>,
+    author: Option<String>,
+    url: Option<String>,
+    created: Option<Timestamp>,
+}
+
+/// What is known of a repository's CI: red or not, the workflow (or check)
+/// that is red, and a link to the run when there is one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Ci {
+    red: bool,
+    workflow: Option<String>,
+    url: Option<String>,
+}
+
+impl Ci {
+    fn state(red: bool) -> Ci {
+        Ci {
+            red,
+            workflow: None,
+            url: None,
+        }
+    }
 }
 
 /// What the query's answer holds.
@@ -455,6 +521,8 @@ struct Answer {
     /// Whether the answer had a `data` object at all.
     had_data: bool,
     reviews: Option<f64>,
+    /// The newest of those pull requests, for the list.
+    review_items: Vec<Review>,
     authored: Option<f64>,
     /// Whether any list of repositories came back (an empty one counts).
     repos_seen: bool,
@@ -529,7 +597,7 @@ impl Session<'_> {
             return Err(FetchError::Invalid);
         }
         let ci = self.ci(&answer.repos, remaining, now).await;
-        let snapshot = reading(&answer, &ci);
+        let snapshot = reading(&answer, &ci, now);
         if snapshot.values.is_empty() {
             // Nothing in the answer could be a number.
             return Err(FetchError::Invalid);
@@ -573,6 +641,14 @@ impl Session<'_> {
         };
         answer.had_data = true;
         answer.reviews = api::count(data.pointer("/reviews/issueCount"));
+        answer.review_items = data
+            .pointer("/reviews/nodes")
+            .and_then(Json::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(review_of)
+            .take(MAX_ITEMS)
+            .collect();
         answer.authored = api::count(data.pointer("/authored/issueCount"));
         let mut keys: Vec<String> = vec!["viewer".to_string()];
         keys.extend((0..owners.len()).map(|i| format!("o{i}")));
@@ -670,17 +746,16 @@ impl Session<'_> {
     /// newest workflow runs failed (one call each, at most
     /// [`CI_FALLBACK_MAX`]). `None` for a repository nothing could be said
     /// about.
-    async fn ci(
-        &self,
-        repos: &[Repo],
-        remaining: Option<u64>,
-        now: Timestamp,
-    ) -> Vec<Option<bool>> {
-        let mut out: Vec<Option<bool>> = repos
+    async fn ci(&self, repos: &[Repo], remaining: Option<u64>, now: Timestamp) -> Vec<Option<Ci>> {
+        let mut out: Vec<Option<Ci>> = repos
             .iter()
             .map(|repo| match repo.rollup.as_deref() {
-                Some("FAILURE" | "ERROR") => Some(true),
-                Some("SUCCESS" | "PENDING" | "EXPECTED") => Some(false),
+                Some("FAILURE" | "ERROR") => Some(Ci {
+                    red: true,
+                    workflow: repo.failing_check.clone(),
+                    url: None,
+                }),
+                Some("SUCCESS" | "PENDING" | "EXPECTED") => Some(Ci::state(false)),
                 _ => None,
             })
             .collect();
@@ -696,18 +771,19 @@ impl Session<'_> {
             .take(CI_FALLBACK_MAX)
             .collect();
         let runs = futures_util::future::join_all(
-            wanted.iter().map(|i| self.workflow_red(&repos[*i], now)),
+            wanted.iter().map(|i| self.workflow_state(&repos[*i], now)),
         )
         .await;
-        for (i, red) in wanted.into_iter().zip(runs) {
-            out[i] = red;
+        for (i, state) in wanted.into_iter().zip(runs) {
+            out[i] = state;
         }
         out
     }
 
     /// Whether the newest completed run of any workflow on the default branch
-    /// failed. `None` when it could not be read (no permission, an error).
-    async fn workflow_red(&self, repo: &Repo, now: Timestamp) -> Option<bool> {
+    /// failed, and which one. `None` when it could not be read (no
+    /// permission, an error).
+    async fn workflow_state(&self, repo: &Repo, now: Timestamp) -> Option<Ci> {
         let (owner, name) = repo.name.split_once('/')?;
         let branch = repo.default_branch.as_deref()?;
         if !is_login(owner) || !is_repo_name(name) {
@@ -728,15 +804,33 @@ impl Session<'_> {
         let (bytes, _) = self.send(self.http.get(url), now).await.ok()?;
         let root: Json = serde_json::from_slice(&bytes).ok()?;
         let runs = root.get("workflow_runs")?.as_array()?;
-        Some(newest_runs_failed(runs))
+        // The newest red run is the one to show.
+        let newest = newest_runs(runs);
+        let worst = newest.iter().filter(|run| run.red).max_by_key(|run| run.id);
+        Some(Ci {
+            red: worst.is_some(),
+            workflow: worst.and_then(|run| run.name.clone()),
+            url: worst.and_then(|run| run.url.clone()),
+        })
     }
 }
 
-/// Whether the newest informative run of any workflow in `runs` failed. A
-/// run that was cancelled, skipped or neither passed nor failed says nothing
-/// about the workflow.
-fn newest_runs_failed(runs: &[Json]) -> bool {
-    let mut newest: Vec<(i64, i64, bool)> = Vec::new();
+/// The newest informative run of a workflow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Run {
+    workflow: i64,
+    id: i64,
+    red: bool,
+    name: Option<String>,
+    /// The run's page, when it is a GitHub link.
+    url: Option<String>,
+}
+
+/// The newest informative run of each workflow in `runs`. A run that was
+/// cancelled, skipped or neither passed nor failed says nothing about the
+/// workflow.
+fn newest_runs(runs: &[Json]) -> Vec<Run> {
+    let mut newest: Vec<Run> = Vec::new();
     for run in runs {
         let workflow = run.get("workflow_id").and_then(Json::as_i64).unwrap_or(0);
         let id = run.get("id").and_then(Json::as_i64).unwrap_or(0);
@@ -745,13 +839,49 @@ fn newest_runs_failed(runs: &[Json]) -> bool {
             Some("success") => false,
             _ => continue,
         };
-        match newest.iter_mut().find(|(w, _, _)| *w == workflow) {
-            Some(known) if known.1 < id => *known = (workflow, id, red),
+        let this = Run {
+            workflow,
+            id,
+            red,
+            name: text_of(run, "name"),
+            url: run
+                .get("html_url")
+                .and_then(Json::as_str)
+                .and_then(github_link),
+        };
+        match newest.iter_mut().find(|known| known.workflow == workflow) {
+            Some(known) if known.id < id => *known = this,
             Some(_) => {}
-            None => newest.push((workflow, id, red)),
+            None => newest.push(this),
         }
     }
-    newest.iter().any(|(_, _, red)| *red)
+    newest
+}
+
+/// Whether the newest informative run of any workflow in `runs` failed.
+#[cfg(test)]
+fn newest_runs_failed(runs: &[Json]) -> bool {
+    newest_runs(runs).iter().any(|run| run.red)
+}
+
+/// A line of text from outside: one line, cut; `None` when nothing is left.
+fn text_of(doc: &Json, field: &str) -> Option<String> {
+    doc.get(field)
+        .and_then(Json::as_str)
+        .map(|text| api::clean_text(text, TEXT_CHARS))
+        .filter(|text| !text.is_empty())
+}
+
+/// `text` when it is a plain `https` address on `github.com` (no port, no
+/// credentials), in the form a browser would follow; anything else is `None`.
+fn github_link(text: &str) -> Option<String> {
+    let url = Url::parse(text.trim()).ok()?;
+    (url.scheme() == "https"
+        && url.host_str() == Some("github.com")
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none())
+    .then(|| url.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -759,10 +889,21 @@ fn newest_runs_failed(runs: &[Json]) -> bool {
 
 const REPOSITORY: &str = "fragment R on Repository {
   nameWithOwner
-  defaultBranchRef { name target { ... on Commit { statusCheckRollup { state } } } }
+  url
+  defaultBranchRef { name target { ... on Commit { statusCheckRollup { state contexts(first: 10) { nodes { __typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } } } } } }
   vulnerabilityAlerts(first: 1, states: OPEN) { totalCount }
-  releases(first: 3, orderBy: {field: CREATED_AT, direction: DESC}) { nodes { publishedAt isDraft } }
+  releases(first: 3, orderBy: {field: CREATED_AT, direction: DESC}) { nodes { tagName url publishedAt isDraft } }
 }";
+
+/// The part of [`REPOSITORY`] that needs the permission to read check status,
+/// and what stands in its place when the token may not read it.
+const ROLLUP_PART: &str = "defaultBranchRef { name target { ... on Commit { statusCheckRollup { state contexts(first: 10) { nodes { __typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } } } } } }";
+
+/// The check names inside the rollup (a part of [`ROLLUP_PART`]), with the
+/// space before it.
+const CONTEXTS_PART: &str = " contexts(first: 10) { nodes { __typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } }";
+
+const REVIEWS: &str = "reviews: search(query: $reviewQ, type: ISSUE, first: 8) { issueCount nodes { ... on PullRequest { title url createdAt repository { nameWithOwner } author { login } } } }";
 
 /// The query and its variables. Owners and the login only ever travel as
 /// variables. A denied part is left out (its field stays, without the
@@ -795,7 +936,7 @@ fn build_query(owners: &[String], login: Option<&str>, denied: &Denied, now: Tim
         variables.insert(
             "reviewQ".into(),
             Json::String(format!(
-                "is:pr is:open review-requested:{login} archived:false{scope}"
+                "is:pr is:open review-requested:{login} archived:false{scope} sort:updated-desc"
             )),
         );
         variables.insert(
@@ -804,18 +945,19 @@ fn build_query(owners: &[String], login: Option<&str>, denied: &Denied, now: Tim
                 "is:pr is:open author:{login} archived:false{scope}"
             )),
         );
-        selections
-            .push("reviews: search(query: $reviewQ, type: ISSUE, first: 1) { issueCount }".into());
+        selections.push(REVIEWS.into());
         selections.push(
             "authored: search(query: $authoredQ, type: ISSUE, first: 1) { issueCount }".into(),
         );
     }
     let mut fragment = REPOSITORY.to_string();
+    // The whole rollup first; what is left of it without the check names
+    // keeps the state, so the number of red repositories stays complete.
     if denied.is(Part::Rollup, now) {
-        fragment = fragment.replace(
-            "defaultBranchRef { name target { ... on Commit { statusCheckRollup { state } } } }",
-            "defaultBranchRef { name }",
-        );
+        fragment = fragment.replace(ROLLUP_PART, "defaultBranchRef { name }");
+    }
+    if denied.is(Part::Contexts, now) {
+        fragment = fragment.replace(CONTEXTS_PART, "");
     }
     if denied.is(Part::Alerts, now) {
         fragment = fragment.replace(
@@ -825,7 +967,7 @@ fn build_query(owners: &[String], login: Option<&str>, denied: &Denied, now: Tim
     }
     if denied.is(Part::Releases, now) {
         fragment = fragment.replace(
-            "  releases(first: 3, orderBy: {field: CREATED_AT, direction: DESC}) { nodes { publishedAt isDraft } }\n",
+            "  releases(first: 3, orderBy: {field: CREATED_AT, direction: DESC}) { nodes { tagName url publishedAt isDraft } }\n",
             "",
         );
     }
@@ -850,7 +992,8 @@ fn is_secondary_limit(body: &[u8]) -> bool {
 /// The parts the errors of an answer name: the ones whose field is in an
 /// error's path. An error of type FORBIDDEN or INSUFFICIENT_SCOPES says the
 /// token may not read the part (`true`: lasting); any other error with a path
-/// is a failure of this answer only (`false`).
+/// is a failure of this answer only (`false`). An error inside the rollup's
+/// `contexts` names that part only: the rollup's state is still readable.
 fn denied_parts(root: &Json) -> Vec<(Part, bool)> {
     let Some(errors) = root.get("errors").and_then(Json::as_array) else {
         return Vec::new();
@@ -865,9 +1008,10 @@ fn denied_parts(root: &Json) -> Vec<(Part, bool)> {
                         .get("path")
                         .and_then(Json::as_array)
                         .is_some_and(|path| {
-                            path.iter()
-                                .filter_map(Json::as_str)
-                                .any(|step| part.fields().contains(&step))
+                            let steps = path.iter().filter_map(Json::as_str);
+                            let in_contexts = steps.clone().any(|step| step == "contexts");
+                            let names = steps.clone().any(|step| part.fields().contains(&step));
+                            names && (part == Part::Contexts || !in_contexts)
                         })
                 })
                 .collect();
@@ -887,19 +1031,35 @@ fn repo_of(node: &Json, now: Timestamp) -> Option<Repo> {
     let name = node.get("nameWithOwner")?.as_str()?;
     let branch = node.get("defaultBranchRef").filter(|b| b.is_object());
     let day_ago = now.checked_sub(SignedDuration::from_hours(24)).ok()?;
-    let releases_24h = node
+    // The releases published in the last day (drafts are not published).
+    let recent: Option<Vec<(Timestamp, &Json)>> = node
         .pointer("/releases/nodes")
         .and_then(Json::as_array)
         .map(|nodes| {
             nodes
                 .iter()
                 .filter(|r| r.get("isDraft").and_then(Json::as_bool) == Some(false))
-                .filter_map(|r| r.get("publishedAt")?.as_str()?.parse::<Timestamp>().ok())
-                .filter(|at| *at >= day_ago && *at <= now)
-                .count() as f64
+                .filter_map(|r| {
+                    let at = r.get("publishedAt")?.as_str()?.parse::<Timestamp>().ok()?;
+                    (at >= day_ago && at <= now).then_some((at, r))
+                })
+                .collect()
         });
+    let releases_24h = recent.as_ref().map(|list| list.len() as f64);
+    let releases = recent
+        .into_iter()
+        .flatten()
+        .filter_map(|(at, r)| {
+            Some(Release {
+                tag: text_of(r, "tagName")?,
+                url: github_link(r.get("url")?.as_str()?)?,
+                at,
+            })
+        })
+        .collect();
     Some(Repo {
         name: name.to_string(),
+        url: node.get("url").and_then(Json::as_str).and_then(github_link),
         default_branch: branch
             .and_then(|b| b.get("name"))
             .and_then(Json::as_str)
@@ -908,13 +1068,186 @@ fn repo_of(node: &Json, now: Timestamp) -> Option<Repo> {
             .and_then(|b| b.pointer("/target/statusCheckRollup/state"))
             .and_then(Json::as_str)
             .map(str::to_string),
+        failing_check: branch
+            .and_then(|b| b.pointer("/target/statusCheckRollup/contexts/nodes"))
+            .and_then(Json::as_array)
+            .and_then(|nodes| nodes.iter().find_map(failed_check)),
         alerts: api::count(node.pointer("/vulnerabilityAlerts/totalCount")),
         releases_24h,
+        releases,
     })
 }
 
+/// The name of a check of the rollup when it failed: a check run that failed
+/// or timed out, or a status that failed or errored.
+fn failed_check(node: &Json) -> Option<String> {
+    match node.get("__typename").and_then(Json::as_str)? {
+        "CheckRun" => matches!(
+            node.get("conclusion").and_then(Json::as_str),
+            Some("FAILURE" | "TIMED_OUT" | "STARTUP_FAILURE")
+        )
+        .then(|| text_of(node, "name"))?,
+        "StatusContext" => matches!(
+            node.get("state").and_then(Json::as_str),
+            Some("FAILURE" | "ERROR")
+        )
+        .then(|| text_of(node, "context"))?,
+        _ => None,
+    }
+}
+
+/// A pull request of the review search; `None` for a node that is not one or
+/// has no title.
+fn review_of(node: &Json) -> Option<Review> {
+    Some(Review {
+        title: text_of(node, "title")?,
+        repo: node
+            .pointer("/repository")
+            .and_then(|r| text_of(r, "nameWithOwner")),
+        author: node.pointer("/author").and_then(|a| text_of(a, "login")),
+        url: node.get("url").and_then(Json::as_str).and_then(github_link),
+        created: node
+            .get("createdAt")
+            .and_then(Json::as_str)
+            .and_then(|at| at.parse().ok()),
+    })
+}
+
+/// How long ago `from` was, in one short unit: `5m`, `3h`, `2d`, `4mo`, `2y`
+/// (a time in the future counts as just now).
+fn age(from: Timestamp, now: Timestamp) -> String {
+    let minutes = (now.as_second().saturating_sub(from.as_second()).max(0) / 60).max(1);
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        return format!("{hours}h");
+    }
+    let days = hours / 24;
+    match days {
+        0..60 => format!("{days}d"),
+        60..730 => format!("{}mo", days / 30),
+        _ => format!("{}y", days / 365),
+    }
+}
+
+/// The lines of a second line, joined with a middle dot; `None` when empty.
+fn joined(parts: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+    let parts: Vec<String> = parts.into_iter().flatten().collect();
+    (!parts.is_empty()).then(|| parts.join(" \u{b7} "))
+}
+
+/// The page of a repository: what the answer says, else built from its name
+/// (when the name is shaped like `owner/repository`).
+fn repo_url(repo: &Repo) -> Option<String> {
+    repo.url.clone().or_else(|| {
+        let (owner, name) = repo.name.split_once('/')?;
+        (is_login(owner) && is_repo_name(name))
+            .then(|| github_link(&format!("https://github.com/{owner}/{name}")))?
+    })
+}
+
+/// The blocks of the card (see the module). Each is left out when there is
+/// nothing to put in it.
+fn details(answer: &Answer, ci: &[Option<Ci>], now: Timestamp) -> Vec<Block> {
+    let mut blocks = Vec::new();
+
+    let reviews: Vec<ListItem> = answer
+        .review_items
+        .iter()
+        .map(|review| ListItem {
+            text: review.title.clone(),
+            sub: joined([review.repo.clone(), review.author.clone()]),
+            status: None,
+            right: review.created.map(|at| age(at, now)),
+            href: review.url.clone(),
+            ..Default::default()
+        })
+        .collect();
+    if !reviews.is_empty() {
+        blocks.push(Block::List {
+            title_key: "gh_review".to_string(),
+            items: reviews,
+        });
+    }
+
+    let red: Vec<ListItem> = answer
+        .repos
+        .iter()
+        .zip(ci)
+        .filter_map(|(repo, ci)| Some((repo, ci.as_ref().filter(|ci| ci.red)?)))
+        .map(|(repo, ci)| ListItem {
+            text: repo.name.clone(),
+            sub: joined([repo.default_branch.clone(), ci.workflow.clone()]),
+            status: Some(Status::Bad),
+            right: None,
+            href: ci.url.clone().or_else(|| {
+                repo_url(repo).map(|url| format!("{}/actions", url.trim_end_matches('/')))
+            }),
+            ..Default::default()
+        })
+        .collect();
+    if !red.is_empty() {
+        blocks.push(Block::List {
+            title_key: "gh_ci".to_string(),
+            items: red,
+        });
+    }
+
+    let mut released: Vec<(&Repo, &Release)> = answer
+        .repos
+        .iter()
+        .flat_map(|repo| repo.releases.iter().map(move |release| (repo, release)))
+        .collect();
+    released.sort_by_key(|(_, release)| std::cmp::Reverse(release.at));
+    let released: Vec<ListItem> = released
+        .into_iter()
+        .map(|(repo, release)| ListItem {
+            text: release.tag.clone(),
+            sub: Some(repo.name.clone()),
+            status: None,
+            right: Some(age(release.at, now)),
+            href: Some(release.url.clone()),
+            ..Default::default()
+        })
+        .collect();
+    if !released.is_empty() {
+        blocks.push(Block::List {
+            title_key: "gh_releases".to_string(),
+            items: released,
+        });
+    }
+
+    let mut alerted: Vec<(&Repo, f64)> = answer
+        .repos
+        .iter()
+        .filter_map(|repo| Some((repo, repo.alerts.filter(|n| *n > 0.0)?)))
+        .collect();
+    alerted.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let alerted: Vec<ListItem> = alerted
+        .into_iter()
+        .map(|(repo, alerts)| ListItem {
+            text: repo.name.clone(),
+            sub: None,
+            status: Some(Status::Warn),
+            right: Some(format!("{alerts:.0}")),
+            href: repo_url(repo)
+                .map(|url| format!("{}/security/dependabot", url.trim_end_matches('/'))),
+            ..Default::default()
+        })
+        .collect();
+    if !alerted.is_empty() {
+        blocks.push(Block::List {
+            title_key: "gh_dependabot".to_string(),
+            items: alerted,
+        });
+    }
+    blocks
+}
+
 /// The reading from what was found.
-fn reading(answer: &Answer, ci: &[Option<bool>]) -> Snapshot {
+fn reading(answer: &Answer, ci: &[Option<Ci>], now: Timestamp) -> Snapshot {
     let mut snapshot = Snapshot::new(Status::Ok);
     let mut put = |id: &str, n: Option<f64>| {
         if let Some(n) = n {
@@ -931,7 +1264,11 @@ fn reading(answer: &Answer, ci: &[Option<bool>]) -> Snapshot {
         if answer.repos.is_empty() || known > 0 {
             put(
                 "ci_red",
-                Some(ci.iter().filter(|red| **red == Some(true)).count() as f64),
+                Some(
+                    ci.iter()
+                        .filter(|ci| ci.as_ref().is_some_and(|ci| ci.red))
+                        .count() as f64,
+                ),
             );
         }
         let alerts: Vec<f64> = answer.repos.iter().filter_map(|r| r.alerts).collect();
@@ -967,6 +1304,7 @@ fn reading(answer: &Answer, ci: &[Option<bool>]) -> Snapshot {
         Status::Ok
     };
     snapshot.needs = needs;
+    snapshot.details = details(answer, ci, now);
     snapshot
 }
 
@@ -991,6 +1329,51 @@ mod tests {
 
     fn at(secs: i64) -> Timestamp {
         Timestamp::from_second(secs).unwrap()
+    }
+
+    #[test]
+    fn an_age_is_one_short_unit_and_changes_at_the_boundaries() {
+        let now = at(10_000_000);
+        let ago = |secs: i64| age(at(10_000_000 - secs), now);
+        assert_eq!(ago(0), "1m");
+        assert_eq!(ago(59), "1m");
+        assert_eq!(ago(60), "1m");
+        assert_eq!(ago(59 * 60), "59m");
+        assert_eq!(ago(59 * 60 + 59), "59m");
+        assert_eq!(ago(60 * 60), "1h");
+        assert_eq!(ago(23 * 3600 + 59 * 60), "23h");
+        assert_eq!(ago(24 * 3600), "1d");
+        assert_eq!(ago(59 * 86_400), "59d");
+        assert_eq!(ago(60 * 86_400), "2mo");
+        assert_eq!(ago(729 * 86_400), "24mo");
+        assert_eq!(ago(730 * 86_400), "2y");
+        // A time in the future (a clock that is off) counts as just now.
+        assert_eq!(ago(-3600), "1m");
+    }
+
+    #[test]
+    fn an_error_inside_the_contexts_names_only_that_part() {
+        let root = json!({ "errors": [{
+            "type": "FORBIDDEN",
+            "path": ["viewer", "repositories", "nodes", 0, "defaultBranchRef", "target",
+                     "statusCheckRollup", "contexts", "nodes"],
+        }] });
+        assert_eq!(denied_parts(&root), vec![(Part::Contexts, true)]);
+        // An error at the rollup itself names the rollup, not the contexts.
+        let root = json!({ "errors": [{
+            "type": "FORBIDDEN",
+            "path": ["viewer", "repositories", "nodes", 0, "defaultBranchRef", "target",
+                     "statusCheckRollup"],
+        }] });
+        assert_eq!(denied_parts(&root), vec![(Part::Rollup, true)]);
+        // The query without the contexts keeps the rollup's state.
+        let now = at(1_000_000);
+        let mut denied = Denied::default();
+        denied.deny(Part::Contexts, now);
+        let query = build_query(&[], None, &denied, now);
+        let text = query["query"].as_str().unwrap();
+        assert!(text.contains("statusCheckRollup { state }"), "{text}");
+        assert!(!text.contains("contexts("), "{text}");
     }
 
     #[test]
@@ -1130,7 +1513,7 @@ mod tests {
         let review = query["variables"]["reviewQ"].as_str().unwrap();
         assert_eq!(
             review,
-            "is:pr is:open review-requested:me archived:false user:acme user:me"
+            "is:pr is:open review-requested:me archived:false user:acme user:me sort:updated-desc"
         );
         // No login yet: no search.
         let query = build_query(&owners, None, &Denied::default(), now);

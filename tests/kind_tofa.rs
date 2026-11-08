@@ -716,10 +716,23 @@ async fn names_and_titles_from_tofa_never_reach_a_need_or_the_error() {
         &sessions(&[("Transcode", "HlsFullTranscode", false)]),
     );
     let s = fetch(&base).await;
-    let all = format!("{s:?}{}", serde_json::to_string(&s).unwrap());
+    // Names and titles are for the details only: never in a need, a number,
+    // the error or the status.
+    let outside = serde_json::to_string(&(&s.needs, &s.values, &s.error, s.status)).unwrap();
     for hidden in ["Hemmelig", "Film 0", "user0", "Tofa Web"] {
-        assert!(!all.contains(hidden), "{hidden} reached the reading");
+        assert!(!outside.contains(hidden), "{hidden} reached the reading");
     }
+    // The user, the title and the client are in the playing list, as text.
+    let blocks = details(&s);
+    let items = list_of(&blocks, "tofa_playing").unwrap();
+    assert_eq!(items[0].text, "Film 0");
+    assert_eq!(
+        items[0].sub.as_deref(),
+        Some("user0 \u{b7} Tofa Web \u{b7} transcode")
+    );
+    // The library name too, and nowhere else but the details.
+    let libraries = list_of(&blocks, "tofa_libraries").unwrap();
+    assert!(libraries[0].text.starts_with("Hemmelig"));
 }
 
 #[tokio::test]
@@ -818,4 +831,319 @@ async fn saving_or_testing_the_service_makes_the_slow_calls_run_again() {
     assert_eq!(stub.count(slow), 2);
     fetch(&base).await;
     assert_eq!(stub.count(slow), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Details
+
+use mindful_magpie::integrations::Block;
+use mindful_magpie::integrations::block::{ListItem, MAX_ITEMS};
+
+/// The reading's details as the poller stores them: cut down to the limits.
+fn details(snapshot: &Snapshot) -> Vec<Block> {
+    let mut bounded = snapshot.clone();
+    bounded.bound_details();
+    bounded.details
+}
+
+fn list_of<'a>(blocks: &'a [Block], title: &str) -> Option<&'a Vec<ListItem>> {
+    blocks.iter().find_map(|b| match b {
+        Block::List { title_key, items } if title_key == title => Some(items),
+        _ => None,
+    })
+}
+
+/// The bars of the progress block: label, percentage, text.
+fn bars_of(blocks: &[Block]) -> Option<Vec<(String, f64, String)>> {
+    blocks.iter().find_map(|b| match b {
+        Block::Bars { title_key, bars } if title_key == "tofa_progress" => Some(
+            bars.iter()
+                .map(|bar| (bar.label.clone(), bar.pct, bar.text.clone()))
+                .collect(),
+        ),
+        _ => None,
+    })
+}
+
+fn facts_of(blocks: &[Block]) -> Vec<(String, String)> {
+    blocks
+        .iter()
+        .find_map(|b| match b {
+            Block::Facts { title_key, rows } if title_key == "tofa_server" => Some(
+                rows.iter()
+                    .map(|r| (r.label_key.clone().unwrap_or_default(), r.value.clone()))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// A session as a real server lists it, with the fields the card shows (the
+/// profile is the default label «Main»).
+fn play(
+    title: &str,
+    user: &str,
+    client: &str,
+    mode: &str,
+    paused: bool,
+    progress: (i64, i64),
+) -> Json {
+    json!({
+        "session_id": "00000000-0000-4000-8000-000000000001",
+        "media_title": title,
+        "username": user,
+        "profile_name": "Main",
+        "client_name": client,
+        "is_paused": paused,
+        "play_method": "DirectStream",
+        "decision_mode": mode,
+        "position_ms": progress.0,
+        "duration_ms": progress.1,
+    })
+}
+
+#[tokio::test]
+async fn every_session_is_a_line_of_the_now_playing_list() {
+    let (base, stub) = stub::serve().await;
+    quiet(&stub);
+    stub.ok(
+        SESSIONS,
+        &json!([
+            play(
+                "Dune",
+                "Kari",
+                "Tofa Web",
+                "DirectFile",
+                false,
+                (4_200_000, 5_000_000)
+            ),
+            play(
+                "Alien",
+                "Ola",
+                "Living room TV",
+                "HlsCopyVideoTranscodeAudio",
+                true,
+                (100, 0)
+            ),
+        ]),
+    );
+    let s = fetch(&base).await;
+    let blocks = details(&s);
+    let items = list_of(&blocks, "tofa_playing").expect("a now-playing list");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].text, "Dune");
+    assert_eq!(items[0].sub.as_deref(), Some("Kari (Main) \u{b7} Tofa Web"));
+    assert_eq!(items[0].right, None, "the progress is in the bars");
+    assert_eq!(items[0].status, Some(Status::Ok));
+    assert_eq!(items[0].href, None);
+    // Paused: a warning. A transcode says so in the second line. No duration:
+    // no progress.
+    assert_eq!(items[1].text, "Alien");
+    assert_eq!(
+        items[1].sub.as_deref(),
+        Some("Ola (Main) \u{b7} Living room TV \u{b7} transcode")
+    );
+    assert_eq!(items[1].status, Some(Status::Warn));
+    // Progress: one bar for the session that has one, with its title.
+    let bars = bars_of(&blocks).expect("a progress block");
+    assert_eq!(
+        bars,
+        [("Dune".to_string(), 84.0, "84 %".to_string())],
+        "the one without a duration has no bar"
+    );
+    // The numbers and the needs are as before.
+    assert_eq!(num(&s, "streams"), Some(1.0));
+    assert_eq!(num(&s, "transcodes"), Some(1.0));
+    assert_eq!(s.status, Status::Ok);
+    assert!(s.needs.is_empty());
+}
+
+#[tokio::test]
+async fn progress_is_a_whole_percentage_from_zero_to_a_hundred() {
+    let (base, stub) = stub::serve().await;
+    quiet(&stub);
+    stub.ok(
+        SESSIONS,
+        &json!([
+            play("A", "p", "c", "DirectFile", false, (0, 1000)),
+            play("B", "p", "c", "DirectFile", false, (5000, 1000)),
+            play("C", "p", "c", "DirectFile", false, (1, 3)),
+            play("D", "p", "c", "DirectFile", false, (1, -1)),
+        ]),
+    );
+    let blocks = details(&fetch(&base).await);
+    // The list keeps all four lines; the bars only the three with progress,
+    // in the same order.
+    assert_eq!(list_of(&blocks, "tofa_playing").unwrap().len(), 4);
+    assert_eq!(
+        bars_of(&blocks).unwrap(),
+        [
+            ("A".to_string(), 0.0, "0 %".to_string()),
+            ("B".to_string(), 100.0, "100 %".to_string()),
+            ("C".to_string(), 33.0, "33 %".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_now_playing_list_holds_at_most_eight_and_hostile_titles_stay_text() {
+    let (base, stub) = stub::serve().await;
+    quiet(&stub);
+    let hostile = format!(
+        "<img src=x onerror=alert(1)>\u{202E}\u{0}{}",
+        "x".repeat(300)
+    );
+    let mut list: Vec<Json> = (0..20)
+        .map(|i| play(&format!("Film {i}"), "p", "c", "DirectFile", false, (1, 2)))
+        .collect();
+    list[0] = play(&hostile, &hostile, &hostile, "DirectFile", false, (1, 2));
+    stub.ok(SESSIONS, &json!(list));
+    let s = fetch(&base).await;
+    let blocks = details(&s);
+    let items = list_of(&blocks, "tofa_playing").unwrap();
+    assert_eq!(items.len(), MAX_ITEMS);
+    assert!(items[0].text.starts_with("<img src=x"));
+    let bars = bars_of(&blocks).unwrap();
+    assert_eq!(bars.len(), MAX_ITEMS);
+    assert!(bars[0].0.starts_with("<img src=x") && bars[0].0.chars().count() <= 80);
+    for text in [Some(&items[0].text), items[0].sub.as_ref()] {
+        let text = text.unwrap();
+        assert!(text.chars().count() <= 80, "{text}");
+        assert!(!text.contains(['\u{202E}', '\u{0}']), "{text}");
+    }
+    // Nothing from outside reaches the needs, the values or the error.
+    let outside = serde_json::to_string(&(&s.needs, &s.values, &s.error)).unwrap();
+    assert!(!outside.contains("onerror"), "{outside}");
+    assert!(!outside.contains("Film"), "{outside}");
+}
+
+#[tokio::test]
+async fn no_session_means_no_now_playing_list() {
+    let (base, stub) = stub::serve().await;
+    quiet(&stub);
+    stub.ok(SESSIONS, &json!([]));
+    let blocks = details(&fetch(&base).await);
+    assert!(list_of(&blocks, "tofa_playing").is_none());
+}
+
+#[tokio::test]
+async fn the_libraries_list_shows_episodes_and_marks_issues() {
+    let (base, stub) = stub::serve().await;
+    quiet(&stub);
+    let with_episodes = |mut lib: Json, episodes: i64| {
+        lib["episodes_total"] = json!(episodes);
+        lib
+    };
+    stub.ok(
+        LIBRARIES,
+        &json!([
+            with_episodes(library("Serier", 0, 0, 0, 0), 6576),
+            library("Filmer", 0, 2, 0, 0),
+            with_episodes(library("Gammelt", 4, 0, 0, 0), 12),
+            library("Tomt", 0, 0, 0, 0),
+        ]),
+    );
+    let s = fetch(&base).await;
+    let blocks = details(&s);
+    let items = list_of(&blocks, "tofa_libraries").expect("a libraries list");
+    // The worst first; the others as listed.
+    let rows: Vec<_> = items
+        .iter()
+        .map(|i| (i.text.as_str(), i.sub.as_deref(), i.status))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("Gammelt", Some("12 ep."), Some(Status::Bad)),
+            ("Filmer", None, Some(Status::Warn)),
+            ("Serier", Some("6 576 ep."), Some(Status::Ok)),
+            ("Tomt", None, Some(Status::Ok)),
+        ]
+    );
+    // The needs still carry counts only.
+    let outside = serde_json::to_string(&s.needs).unwrap();
+    assert!(
+        !outside.contains("Gammelt") && !outside.contains("Serier"),
+        "{outside}"
+    );
+}
+
+#[tokio::test]
+async fn the_libraries_list_is_carried_between_the_slow_refreshes() {
+    let (base, stub) = stub::serve().await;
+    quiet(&stub);
+    fetch(&base).await;
+    let s = fetch(&base).await;
+    assert_eq!(stub.count(LIBRARIES), 1);
+    let blocks = details(&s);
+    assert!(list_of(&blocks, "tofa_libraries").is_some());
+}
+
+#[tokio::test]
+async fn the_facts_hold_the_background_tasks_and_the_server_version() {
+    let (base, stub) = stub::serve().await;
+    quiet(&stub);
+    stub.ok(TASKS, &tasks(3));
+    let blocks = details(&fetch(&base).await);
+    assert_eq!(
+        facts_of(&blocks),
+        [
+            ("tofa_tasks".to_string(), "3".to_string()),
+            ("tofa_version".to_string(), "0.13.1".to_string()),
+        ]
+    );
+    // A server without the tasks endpoint leaves that row out.
+    let (base, stub) = stub::serve().await;
+    quiet(&stub);
+    stub.route(TASKS, Answer::Status(404));
+    let blocks = details(&fetch(&base).await);
+    assert_eq!(
+        facts_of(&blocks),
+        [("tofa_version".to_string(), "0.13.1".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn every_key_the_tofa_details_use_has_a_text_in_both_languages() {
+    let (base, stub) = stub::serve().await;
+    quiet(&stub);
+    stub.ok(
+        SESSIONS,
+        &json!([play("Dune", "Kari", "Web", "DirectFile", false, (1, 2))]),
+    );
+    let blocks = details(&fetch(&base).await);
+    let mut keys: Vec<&str> = blocks.iter().flat_map(Block::keys).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    assert_eq!(
+        keys,
+        [
+            "tofa_libraries",
+            "tofa_playing",
+            "tofa_progress",
+            "tofa_server",
+            "tofa_tasks",
+            "tofa_version"
+        ]
+    );
+    for key in keys {
+        locale::in_both(&format!("detail.{key}")).unwrap();
+    }
+}
+
+#[test]
+fn the_form_help_says_who_sees_what_is_playing() {
+    let (en, nb) = (locale::LOCALES[0].1, locale::LOCALES[1].1);
+    let help = |file| locale::text(file, "field", "tofa_secret_help").unwrap();
+    assert!(
+        help(en).ends_with("Everyone who can see the service sees what is playing."),
+        "{}",
+        help(en)
+    );
+    assert!(
+        help(nb).ends_with("Alle som kan se tjenesten, ser hva som spilles."),
+        "{}",
+        help(nb)
+    );
 }
