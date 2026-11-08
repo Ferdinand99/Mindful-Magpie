@@ -16,7 +16,7 @@ use axum::extract::ConnectInfo;
 use axum::http::{HeaderValue, Request, StatusCode, header};
 use common::{App, HOST, Res, Web, bearer_get, make_token, user_id};
 use futures_util::{Stream, StreamExt as _};
-use mindful_magpie::integrations::block::ListItem;
+use mindful_magpie::integrations::block::{ListItem, SparkStyle};
 use mindful_magpie::integrations::{Block, Snapshot, Status, Value as Reading};
 use mindful_magpie::services::{SecretChange, ServiceEvent, ServiceInput, Visibility, store};
 use serde_json::{Value, json};
@@ -1502,23 +1502,48 @@ async fn a_change_of_the_details_alone_is_an_event() {
 }
 
 // ---------------------------------------------------------------------------
-// History: the curve of every bound number
+// History: the curves the cards draw
 
 fn now_s() -> i64 {
     jiff::Timestamp::now().as_second()
 }
 
-/// A good reading of `latency` at `at`.
-fn reading(at: i64, latency: f64) -> Snapshot {
+/// Spark blocks for `curves`: a metric, and whether it asks for the days.
+fn sparks(curves: &[(&str, bool)]) -> Vec<Block> {
+    curves
+        .iter()
+        .map(|(metric, daily)| Block::Spark {
+            title_key: "http_latency_24h".into(),
+            metric: (*metric).into(),
+            style: SparkStyle::Line,
+            daily: *daily,
+        })
+        .collect()
+}
+
+/// A good reading of `latency` at `at`, whose blocks draw `curves`.
+fn reading_with(at: i64, latency: f64, curves: &[(&str, bool)]) -> Snapshot {
     let mut s = snap(Status::Ok, latency);
     s.fetched_at = jiff::Timestamp::from_second(at).unwrap();
+    s.details = sparks(curves);
     s
+}
+
+/// A good reading of `latency` at `at`, with a curve of the latency and its
+/// days.
+fn reading(at: i64, latency: f64) -> Snapshot {
+    reading_with(at, latency, &[("latency_ms", true)])
 }
 
 /// What the poller does with a reading: its numbers go to the history (a
 /// point per reading: interval 300 s) and the snapshot is published.
 fn feed(app: &App, id: i64, at: i64, latency: f64) {
-    let s = reading(at, latency);
+    feed_with(app, id, at, latency, &[("latency_ms", true)]);
+}
+
+/// [`feed`] with a reading whose blocks draw `curves`.
+fn feed_with(app: &App, id: i64, at: i64, latency: f64, curves: &[(&str, bool)]) {
+    let s = reading_with(at, latency, curves);
     app.magpie.poller.record_history_for_tests(id, 300, &s);
     app.magpie.poller.set_snapshot_for_tests(id, s);
 }
@@ -1537,7 +1562,7 @@ async fn store_daily(app: &App, id: i64, at: i64, latency: f64) {
 }
 
 #[tokio::test]
-async fn the_embed_and_the_token_api_carry_the_history_of_bound_metrics_only() {
+async fn the_embed_and_the_token_api_carry_the_history_of_curve_metrics_only() {
     let w = world().await;
     let mut bob = Web::new(&w.app, "bob", "viewer").await;
     let bob_id = user_id(&w.app, "bob").await;
@@ -1569,7 +1594,7 @@ async fn the_embed_and_the_token_api_carry_the_history_of_bound_metrics_only() {
     let page = embed(&mut bob).await;
     assert_eq!(ids(&page), vec![w.a.to_string()]);
     let a = &page["services"][w.a.to_string()];
-    // Only the bound metric (not `status`), the last three points, oldest first.
+    // Only the curve metric (not `status`), the last three points, oldest first.
     assert_eq!(
         a["history"],
         json!({ "latency_ms": [[now - 600, 12], [now - 300, 13], [now, 14]] })
@@ -1606,7 +1631,7 @@ async fn the_embed_and_the_token_api_carry_the_history_of_bound_metrics_only() {
 }
 
 #[tokio::test]
-async fn a_bound_metric_with_no_history_yet_has_no_history_field() {
+async fn a_curve_metric_with_no_history_yet_has_no_history_field() {
     let w = world().await;
     let mut bob = Web::new(&w.app, "bob", "viewer").await;
     save(
@@ -1618,7 +1643,7 @@ async fn a_bound_metric_with_no_history_yet_has_no_history_field() {
     w.app
         .magpie
         .poller
-        .set_snapshot_for_tests(w.a, snap(Status::Ok, 12.0));
+        .set_snapshot_for_tests(w.a, reading(now_s(), 12.0));
     let page = embed(&mut bob).await;
     let a = &page["services"][w.a.to_string()];
     assert_eq!(a["status"], "ok");
@@ -1642,10 +1667,10 @@ async fn the_first_event_has_the_history_and_a_later_one_only_the_new_point() {
     )
     .await;
     let now = now_s();
-    for id in [w.a, w.b] {
-        feed(&w.app, id, now - 600, 10.0);
-        feed(&w.app, id, now - 300, 11.0);
-    }
+    feed(&w.app, w.a, now - 600, 10.0);
+    feed(&w.app, w.a, now - 300, 11.0);
+    feed_with(&w.app, w.b, now - 600, 10.0, &[("status", false)]);
+    feed_with(&w.app, w.b, now - 300, 11.0, &[("status", false)]);
     // Printer is not bound: its readings and history stay out of the stream.
     feed(&w.app, w.c, now - 300, 4242.5);
     store_daily(&w.app, w.a, now - 300, 10.0).await;
@@ -1663,10 +1688,15 @@ async fn the_first_event_has_the_history_and_a_later_one_only_the_new_point() {
         1
     );
     assert!(a.get("history_append").is_none());
-    // B is bound on `status`: its history is the status's.
+    // B's curve is the status: its history is the status's, without days.
     assert_eq!(
         first["services"][w.b.to_string()]["history"],
         json!({ "status": [[now - 600, 200], [now - 300, 200]] })
+    );
+    assert!(
+        first["services"][w.b.to_string()]
+            .get("history_daily")
+            .is_none()
     );
     assert!(!first.to_string().contains("4242.5"));
     tokio::time::pause();
@@ -1755,17 +1785,10 @@ async fn a_receiver_that_fell_behind_gets_the_history_again() {
     live.nothing().await;
 }
 
-#[tokio::test]
-async fn one_service_with_eight_metrics_stays_near_40_kib_of_history() {
-    use mindful_magpie::layout::Layout;
-    use mindful_magpie::services::Viewer;
-    use mindful_magpie::values::values_for;
-
-    let w = world().await;
-    let now = now_s();
-    let names: Vec<String> = (1..=8).map(|k| format!("m{k}")).collect();
-    // A full day at 5 minutes: 288 points of every metric, with numbers of
-    // the length a latency or a load has (four significant digits).
+/// A full day at 5 minutes of `names` for the service: 288 points of every
+/// metric, with numbers of the length a latency or a load has (four
+/// significant digits), and the last reading, with `details`, published.
+fn a_full_day(app: &App, id: i64, now: i64, names: &[String], details: Vec<Block>) {
     for i in 0..288i64 {
         let mut s = Snapshot::new(Status::Ok);
         s.fetched_at = jiff::Timestamp::from_second(now - (287 - i) * 300).unwrap();
@@ -1773,8 +1796,38 @@ async fn one_service_with_eight_metrics_stays_near_40_kib_of_history() {
             let v = ((i * 37 + k as i64 * 101) % 9000) as f64 / 10.0;
             s.values.insert(name.clone(), Reading::num(v));
         }
-        w.app.magpie.poller.record_history_for_tests(w.a, 300, &s);
+        app.magpie.poller.record_history_for_tests(id, 300, &s);
+        if i == 287 {
+            s.details = details.clone();
+            app.magpie.poller.set_snapshot_for_tests(id, s);
+        }
     }
+}
+
+#[tokio::test]
+async fn eight_numbers_on_a_card_and_one_curve_send_the_history_of_that_one() {
+    use mindful_magpie::layout::Layout;
+    use mindful_magpie::services::Viewer;
+    use mindful_magpie::values::values_for;
+
+    let w = world().await;
+    let now = now_s();
+    let names: Vec<String> = (1..=8).map(|k| format!("m{k}")).collect();
+    // The curve is of a ninth number, which no card shows.
+    let mut all = names.clone();
+    all.push("m9".into());
+    a_full_day(
+        &w.app,
+        w.a,
+        now,
+        &all,
+        vec![Block::Spark {
+            title_key: "http_latency_24h".into(),
+            metric: "m9".into(),
+            style: SparkStyle::Line,
+            daily: false,
+        }],
+    );
     let layout: Layout = serde_json::from_value(doc(
         0,
         vec![card("c1", Some(json!({ "id": w.a, "metrics": names })))],
@@ -1788,13 +1841,70 @@ async fn one_service_with_eight_metrics_stays_near_40_kib_of_history() {
     )
     .await
     .unwrap();
-    let history = &doc.services[&w.a.to_string()].history;
-    assert_eq!(history.len(), 8);
-    assert!(history.values().all(|points| points.len() == 288));
-    let size = serde_json::to_string(history).unwrap().len();
+    let entry = &doc.services[&w.a.to_string()];
+    assert_eq!(entry.history.keys().collect::<Vec<_>>(), vec!["m9"]);
+    assert_eq!(entry.history["m9"].len(), 288);
+    // No block asks for the days.
+    assert!(entry.history_daily.is_empty());
+    // The values of the card are all there, as before.
+    assert_eq!(entry.values.len(), 9);
+}
+
+#[tokio::test]
+async fn the_document_of_twenty_services_with_eight_numbers_each_stays_small() {
+    use mindful_magpie::layout::Layout;
+    use mindful_magpie::services::Viewer;
+    use mindful_magpie::values::values_for;
+
+    let w = world().await;
+    let now = now_s();
+    let names: Vec<String> = (1..=8).map(|k| format!("m{k}")).collect();
+    let mut cards = Vec::new();
+    for n in 0..20 {
+        let id = service(&w.app, &format!("Site {n}"), Visibility::All, &[]).await;
+        // Every card shows all eight numbers; the service's blocks draw one
+        // curve, and every other service asks for its days too.
+        a_full_day(
+            &w.app,
+            id,
+            now,
+            &names,
+            vec![Block::Spark {
+                title_key: "http_latency_24h".into(),
+                metric: "m1".into(),
+                style: SparkStyle::Line,
+                daily: n % 2 == 0,
+            }],
+        );
+        cards.push(card(
+            &format!("c{n}"),
+            Some(json!({ "id": id, "metrics": names })),
+        ));
+    }
+    let layout: Layout = serde_json::from_value(doc(0, cards)).unwrap();
+    let values = values_for(
+        &w.app.magpie.core,
+        &w.app.magpie.poller,
+        Viewer::new(1, true),
+        &layout,
+    )
+    .await
+    .unwrap();
+    // What the embed, the token API and a full stream event carry.
+    let page = serde_json::to_value(&values).unwrap();
+    let services = page["services"].as_object().unwrap();
+    assert_eq!(services.len(), 20);
+    for (id, entry) in services {
+        let history = entry["history"].as_object().unwrap();
+        assert_eq!(history.keys().collect::<Vec<_>>(), vec!["m1"], "{id}");
+        assert_eq!(history["m1"].as_array().unwrap().len(), 288, "{id}");
+    }
+    // One curve of a day per service, about 5.5 KiB each: with every number
+    // of every card it would be eight times that.
+    let size = page.to_string().len();
     assert!(
-        size < 44 * 1024,
-        "{size} bytes of history for one service with 8 metrics"
+        size < 20 * 8 * 1024,
+        "{size} bytes in the document of 20 services with one curve each"
     );
 }
 
@@ -1965,7 +2075,7 @@ async fn a_rewritten_slot_and_a_new_slot_between_two_events_send_the_series() {
 }
 
 #[tokio::test]
-async fn a_metric_bound_while_the_stream_is_open_arrives_as_a_whole_series() {
+async fn a_metric_that_becomes_a_curve_while_the_stream_is_open_arrives_as_a_whole_series() {
     let w = world().await;
     let mut bob = Web::new(&w.app, "bob", "viewer").await;
     save(
@@ -1976,6 +2086,7 @@ async fn a_metric_bound_while_the_stream_is_open_arrives_as_a_whole_series() {
     let now = now_s();
     feed(&w.app, w.a, now - 600, 10.0);
     feed(&w.app, w.a, now - 300, 11.0);
+    store_daily(&w.app, w.a, now - 300, 10.0).await;
     let mut live = open_live(&bob, "en").await;
     let first = live.event().await;
     let a = &first["services"][w.a.to_string()];
@@ -1983,17 +2094,16 @@ async fn a_metric_bound_while_the_stream_is_open_arrives_as_a_whole_series() {
     tokio::task::yield_now().await;
     tokio::time::pause();
 
-    // The card gets a second number (a save from another tab); the next
-    // wake has its whole series, and the first one's new point only.
-    save(
-        &mut bob,
-        &doc(
-            1,
-            vec![card("c1", Some(bind(w.a, &["latency_ms", "status"])))],
-        ),
-    )
-    .await;
-    feed(&w.app, w.a, now, 12.0);
+    // The service's blocks start drawing the status too (a number no card
+    // shows), with its days: the next wake has its whole series and its
+    // days, and the latency's new point only.
+    feed_with(
+        &w.app,
+        w.a,
+        now,
+        12.0,
+        &[("latency_ms", true), ("status", true)],
+    );
     let update = live.event().await;
     let a = &update["services"][w.a.to_string()];
     assert_eq!(
@@ -2006,22 +2116,29 @@ async fn a_metric_bound_while_the_stream_is_open_arrives_as_a_whole_series() {
         json!({ "latency_ms": [now, 12] }),
         "{a}"
     );
+    assert_eq!(
+        a["history_daily"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["status"],
+        "{a}"
+    );
 }
 
 #[tokio::test]
-async fn a_metric_unbound_while_the_stream_is_open_gets_no_more_points() {
+async fn a_metric_that_stops_being_a_curve_while_the_stream_is_open_gets_no_more_points() {
     let w = world().await;
     let mut bob = Web::new(&w.app, "bob", "viewer").await;
     save(
         &mut bob,
-        &doc(
-            0,
-            vec![card("c1", Some(bind(w.a, &["latency_ms", "status"])))],
-        ),
+        &doc(0, vec![card("c1", Some(bind(w.a, &["latency_ms"])))]),
     )
     .await;
+    let both = [("latency_ms", false), ("status", false)];
     let now = now_s();
-    feed(&w.app, w.a, now - 600, 10.0);
+    feed_with(&w.app, w.a, now - 600, 10.0, &both);
     let mut live = open_live(&bob, "en").await;
     let first = live.event().await;
     assert_eq!(
@@ -2034,12 +2151,8 @@ async fn a_metric_unbound_while_the_stream_is_open_gets_no_more_points() {
     tokio::task::yield_now().await;
     tokio::time::pause();
 
-    save(
-        &mut bob,
-        &doc(1, vec![card("c1", Some(bind(w.a, &["latency_ms"])))]),
-    )
-    .await;
-    feed(&w.app, w.a, now - 300, 11.0);
+    // The blocks no longer draw the status.
+    feed_with(&w.app, w.a, now - 300, 11.0, &[("latency_ms", false)]);
     let update = live.event().await;
     let a = &update["services"][w.a.to_string()];
     assert_eq!(
@@ -2049,16 +2162,8 @@ async fn a_metric_unbound_while_the_stream_is_open_gets_no_more_points() {
     );
     assert!(a.get("history").is_none(), "{a}");
 
-    // Bound again: the whole series of it comes back, with what it gained.
-    save(
-        &mut bob,
-        &doc(
-            2,
-            vec![card("c1", Some(bind(w.a, &["latency_ms", "status"])))],
-        ),
-    )
-    .await;
-    feed(&w.app, w.a, now, 12.0);
+    // A curve again: the whole series of it comes back, with what it gained.
+    feed_with(&w.app, w.a, now, 12.0, &both);
     let update = live.event().await;
     let a = &update["services"][w.a.to_string()];
     assert_eq!(

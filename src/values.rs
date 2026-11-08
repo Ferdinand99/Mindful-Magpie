@@ -24,16 +24,18 @@
 //! Unix seconds.
 //!
 //! **History.** An entry also carries the service's own history of its
-//! numbers (see [`crate::history`]), for the metrics bound on the user's cards
-//! for that service (the `metrics` of every card bound to it) and no others:
+//! numbers (see [`crate::history`]), for its *curve metrics* and no others: the
+//! metrics named by a [`Block::Spark`] in the `details` of the service's
+//! current reading (any metric of the service, shown on a card or not). A
+//! service without such a block gets no history, so the document stays small
+//! however many numbers its cards show:
 //!
 //! * `history`: `{ "<metric>": [[unix_s, value], …] }`, the last 24 hours,
 //!   oldest first, at most 288 points per metric, values rounded to 4
 //!   significant digits (a whole number has no decimal point);
 //! * `history_daily`: `{ "<metric>": [["YYYY-MM-DD", min, max, avg], …] }`, the
-//!   last 30 UTC days, oldest first. It is sent for every bound metric, not
-//!   only where a card asks for it: 30 short rows per metric (about 1 KiB) cost
-//!   less than a second round trip to ask for them;
+//!   last 30 UTC days, oldest first, only for a metric whose spark block asks
+//!   for it (`daily: true`);
 //! * `history_append`: `{ "<metric>": [unix_s, value] }`, in stream events only
 //!   (below).
 //!
@@ -80,7 +82,8 @@
 //! every 5 minutes rewrites the point of the current slot). It also drops
 //! points older than 24 hours. An entry of a delta does not replace the page's
 //! entry as a whole: its history fields are merged as just said. A metric that
-//! becomes bound while the stream is open, or one that gained several points
+//! becomes a curve metric while the stream is open (a card bound to the
+//! service, or a spark block that names it), or one that gained several points
 //! between two events, arrives as `history` (and `history_daily`) for that
 //! metric alone in a delta: replace that metric's series. So does a point that
 //! was rewritten while a newer slot started between two events (an append of
@@ -88,9 +91,9 @@
 //!
 //! A stream that stays open is kept right across days: when the UTC day
 //! changes, the next event sends `history` and `history_daily` again for every
-//! bound metric, as a full event does (without `full: true`); and every 15
+//! curve metric, as a full event does (without `full: true`); and every 15
 //! minutes ([`DAILY_REFRESH_S`]) an event also carries `history_daily` for the
-//! bound metrics, because today's row keeps changing. A page replaces the
+//! curve metrics that ask for it, because today's row keeps changing. A page replaces the
 //! daily rows of a metric whenever it has some. The visibility and the layout are read
 //! again at every wake, the account too: a signed-out, disabled or demoted
 //! user loses the stream or the services.
@@ -188,10 +191,11 @@ pub struct ServiceValues {
     /// Why the reading failed, translated; absent when it did not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_label: Option<String>,
-    /// The last 24 hours of each bound metric (see the module).
+    /// The last 24 hours of each curve metric (see the module).
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub history: BTreeMap<String, Vec<Point>>,
-    /// The last 30 days of each bound metric (see the module).
+    /// The last 30 days of each curve metric that asks for them (see the
+    /// module).
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub history_daily: BTreeMap<String, Vec<Day>>,
     /// In a stream event: the point to add to each metric's series.
@@ -211,22 +215,29 @@ pub struct ValuesDoc {
     pub needs: Vec<NeedView>,
 }
 
-/// The services the layout's cards are bound to, each with the metrics its
-/// cards show (all cards of a service together).
-fn bound_metrics(layout: &Layout) -> BTreeMap<i64, BTreeSet<String>> {
-    let mut bound: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
-    for service in layout
+/// The services the layout's cards are bound to.
+fn bound_ids(layout: &Layout) -> BTreeSet<i64> {
+    layout
         .groups
         .iter()
         .flat_map(|g| &g.cards)
         .filter_map(|c| c.service.as_ref())
-    {
-        bound
-            .entry(service.id)
-            .or_default()
-            .extend(service.metrics.iter().cloned());
+        .map(|service| service.id)
+        .collect()
+}
+
+/// The curve metrics of a reading's blocks (see the module): every metric a
+/// spark block names, and of those the ones whose daily rows are asked for.
+fn curves(details: &[Block]) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut metrics = BTreeSet::new();
+    let mut daily = BTreeSet::new();
+    for (metric, wants_days) in details.iter().filter_map(Block::curve) {
+        metrics.insert(metric.to_string());
+        if wants_days {
+            daily.insert(metric.to_string());
+        }
     }
-    bound
+    (metrics, daily)
 }
 
 /// A reason as the page shows it: one of [`integrations::FetchError`]'s fixed
@@ -290,16 +301,18 @@ pub async fn values_for(
     let viewer = viewer.into();
     let summaries = bound_visible(core, viewer, layout).await?;
     let mut doc = doc_of(core, viewer, &summaries, poller).await?;
-    // The history of what the user's cards show, of the services above only.
-    let bound = bound_metrics(layout);
+    // The history of the curve metrics, of the services above only.
     let mut wanted = BTreeMap::new();
     for (key, entry) in &mut doc.services {
         let Ok(id) = key.parse::<i64>() else { continue };
-        let Some(metrics) = bound.get(&id) else {
+        let (metrics, daily) = curves(&entry.details);
+        if metrics.is_empty() {
             continue;
-        };
-        entry.history = poller.history(id, metrics, doc.now);
-        wanted.insert(id, metrics.clone());
+        }
+        entry.history = poller.history(id, &metrics, doc.now);
+        if !daily.is_empty() {
+            wanted.insert(id, daily);
+        }
     }
     attach_daily(core, &mut doc.services, wanted, doc.now).await?;
     Ok(doc)
@@ -329,12 +342,12 @@ pub(crate) async fn bound_visible(
     viewer: impl Into<Viewer>,
     layout: &Layout,
 ) -> Result<Vec<ServiceSummary>, DbError> {
-    let bound = bound_metrics(layout);
+    let bound = bound_ids(layout);
     if bound.is_empty() {
         return Ok(Vec::new());
     }
     let mut visible = store::visible_to(core, viewer).await?;
-    visible.retain(|s| bound.contains_key(&s.id));
+    visible.retain(|s| bound.contains(&s.id));
     Ok(visible)
 }
 
@@ -427,8 +440,11 @@ struct Open {
     /// The newest point of each metric's series as last sent (whole or as an
     /// append): what the next event's new points are measured against.
     sent_history: HashMap<i64, BTreeMap<String, Point>>,
+    /// The curve metrics that asked for daily rows at the last event (a metric
+    /// that starts asking for them gets them at the next one).
+    sent_daily: HashMap<i64, BTreeSet<String>>,
     /// The UTC day (`YYYY-MM-DD`) of the last event, empty before the first:
-    /// when it changes, every bound metric's history and daily rows go out
+    /// when it changes, every curve metric's history and daily rows go out
     /// again (the old day's last row and the dropped 31st day are stale).
     sent_day: String,
     /// When the daily rows were last sent (Unix seconds): today's row grows
@@ -469,16 +485,16 @@ impl Open {
         let read = async {
             let (layout, _) = layout::load_or_default(&self.core, id).await?;
             let visible = store::visible_to(&self.core, viewer).await?;
-            let bound = bound_metrics(&layout);
+            let bound = bound_ids(&layout);
             let summaries: Vec<ServiceSummary> = visible
                 .iter()
-                .filter(|s| bound.contains_key(&s.id))
+                .filter(|s| bound.contains(&s.id))
                 .cloned()
                 .collect();
             let doc = doc_of(&self.core, viewer, &summaries, &self.poller).await?;
-            Ok::<_, DbError>((visible, doc, bound))
+            Ok::<_, DbError>((visible, doc))
         };
-        let (visible, doc, bound) = match read.await {
+        let (visible, doc) = match read.await {
             Ok(read) => read,
             Err(err) => {
                 tracing::warn!(%err, "live values: could not read the values; ending the stream");
@@ -498,6 +514,10 @@ impl Open {
         // are in the entry already.
         let mut new_sent: HashMap<i64, BTreeMap<String, Point>> = HashMap::new();
         let mut whole: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
+        // The metrics whose daily rows go out in this event, by service, and
+        // the metrics that ask for daily rows at all.
+        let mut days: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
+        let mut new_daily: HashMap<i64, BTreeSet<String>> = HashMap::new();
         // A new UTC day sends the history again, as a full event does (the
         // daily rows have moved a day); within a day the daily rows are sent
         // again every quarter of an hour.
@@ -511,7 +531,9 @@ impl Open {
             let text = serde_json::to_string(value).unwrap_or_default();
             let mut entry = value.clone();
             let mut changed = full || self.sent.get(&id) != Some(&text);
-            if let Some(metrics) = bound.get(&id) {
+            let (metrics, daily) = curves(&value.details);
+            if !metrics.is_empty() {
+                let metrics = &metrics;
                 let known = if from_scratch {
                     &no_points
                 } else {
@@ -551,22 +573,33 @@ impl Open {
                         changed = true;
                     }
                 }
+                // The daily rows of the metrics that ask for them: all of them
+                // in a full event or on a new day (also one with daily rows but
+                // no point in the last 24 hours: the service has been quiet,
+                // and the days are still worth sending); else of a metric sent
+                // whole, of one that has just started asking, and, every
+                // quarter of an hour, of those the client holds a point of.
+                let had_daily = self.sent_daily.get(&id);
+                let held = new_sent.get(&id);
+                let send_days: BTreeSet<String> = daily
+                    .iter()
+                    .filter(|m| {
+                        from_scratch
+                            || whole.get(&id).is_some_and(|w| w.contains(*m))
+                            || !had_daily.is_some_and(|d| d.contains(*m))
+                            || (refresh_daily && held.is_some_and(|h| h.contains_key(*m)))
+                    })
+                    .cloned()
+                    .collect();
                 if from_scratch {
-                    // Also a bound metric with daily rows but no point in the
-                    // last 24 hours (the service has been quiet): the days
-                    // are still worth sending.
-                    whole.entry(id).or_default().extend(metrics.iter().cloned());
                     changed = true;
-                } else if refresh_daily {
-                    let held: Vec<String> = new_sent
-                        .get(&id)
-                        .into_iter()
-                        .flat_map(|m| m.keys().cloned())
-                        .collect();
-                    if !held.is_empty() {
-                        whole.entry(id).or_default().extend(held);
-                        changed = true;
-                    }
+                }
+                if !send_days.is_empty() {
+                    days.insert(id, send_days);
+                    changed = true;
+                }
+                if !daily.is_empty() {
+                    new_daily.insert(id, daily);
                 }
             }
             if changed {
@@ -578,7 +611,8 @@ impl Open {
             self.daily_at = doc.now;
         }
         self.sent_day = today;
-        if let Err(err) = attach_daily(&self.core, &mut entries, whole, doc.now).await {
+        self.sent_daily = new_daily;
+        if let Err(err) = attach_daily(&self.core, &mut entries, days, doc.now).await {
             tracing::warn!(%err, "live values: could not read the daily history; ending the stream");
             return Turn::End;
         }
@@ -695,6 +729,7 @@ async fn live_values(
         changes: Changes::all(wake_rx).quiet(QUIET),
         sent: HashMap::new(),
         sent_history: HashMap::new(),
+        sent_daily: HashMap::new(),
         sent_day: String::new(),
         daily_at: 0,
         viewed: BTreeMap::new(),

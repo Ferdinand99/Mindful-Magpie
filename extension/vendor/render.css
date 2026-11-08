@@ -345,14 +345,15 @@ html:root:has(.mm-root)[data-bg="image"] {
 
 /* Wide cards and detail blocks ------------------------------------------------------
    A card is normal or wide (render() sets data-size). A wide card spans two columns of the
-   grid when the grid is wide enough for two (33.5rem) and takes one column below that.
+   grid when the grid is wide enough for two (536px) and takes one column below that.
    Metric cells wrap in two columns on a normal card and in up to five on a wide one.
 
    The blocks (.mm-blocks) come after the cells: lists (.mm-list), bars (.mm-bars), strips
-   (.mm-strip) and facts (.mm-facts), each with a small heading (.mm-block-title). A normal
-   card shows the first list (three lines and "+ N more") and the first bars or strip; a wide
-   card shows all of them, in two inner columns on a wide screen. */
-@container (min-width: 33.5rem) {
+   (.mm-strip), facts (.mm-facts) and curves (.mm-spark), each with a small heading
+   (.mm-block-title). A normal card shows the first list (three lines and "+ N more") and the
+   first bars, strip or curve; a wide card shows all of them, in two inner columns on a wide
+   screen. */
+@container (min-width: 536px) {
   .mm-card-wide {
     grid-column: span 2;
   }
@@ -579,6 +580,40 @@ a.mm-li-text:hover {
 }
 .mm-cell[data-status="unknown"] {
   background: var(--fill);
+}
+
+/* A curve (spark): an inline SVG of a metric's last 24 hours, as wide as the block. A line is
+   drawn in the brand colour; an up/down strip has one cell per half hour, coloured like the
+   strip's cells (blank where there was no reading). */
+.mm-spark {
+  display: block;
+  height: 28px;
+  min-width: 0;
+}
+.mm-spark[data-style="up_down"] {
+  height: 14px;
+}
+.mm-spark-svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+.mm-spark-path {
+  fill: none;
+  stroke: var(--brand);
+  stroke-width: 1.5px;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+.mm-spark-cell {
+  fill: var(--fill);
+}
+.mm-spark-cell[data-status="ok"] {
+  fill: var(--ok-text);
+}
+.mm-spark-cell[data-status="bad"] {
+  fill: var(--bad-text);
 }
 
 /* Facts: a label at the left, its value at the right. */

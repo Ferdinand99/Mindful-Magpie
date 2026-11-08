@@ -923,7 +923,8 @@ fn titles(s: &Snapshot) -> Vec<&str> {
             Block::List { title_key, .. }
             | Block::Bars { title_key, .. }
             | Block::Strip { title_key, .. }
-            | Block::Facts { title_key, .. } => title_key.as_str(),
+            | Block::Facts { title_key, .. }
+            | Block::Spark { title_key, .. } => title_key.as_str(),
         })
         .collect()
 }
@@ -988,6 +989,54 @@ async fn the_disks_become_bars_with_size_and_temperature() {
         ],
         "the empty slot has no bar, a missing temperature no text"
     );
+}
+
+#[tokio::test]
+async fn a_disk_bar_turns_yellow_and_red_at_the_thresholds_of_the_needs() {
+    // disk1 at 85 % (the warning), disk2 at 95 % (the problem), the cache at
+    // 18 %: neutral.
+    let mut doc = healthy();
+    doc["data"]["array"]["disks"][0]["fsUsed"] = json!("3400000000");
+    doc["data"]["array"]["disks"][1]["fsUsed"] = json!("3800000000");
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let s = fetch(&url).await;
+    let bars = bars_of(&s, "unraid_disks").expect("the disks");
+    let got: Vec<_> = bars.iter().map(|b| (b.label.as_str(), b.status)).collect();
+    assert_eq!(
+        got,
+        [
+            ("disk1", Some(Status::Warn)),
+            ("disk2", Some(Status::Bad)),
+            ("cache", None),
+        ]
+    );
+    // Just below the warning: neutral.
+    let doc = with("/data/array/disks/0/fsUsed", json!("3396000000"));
+    let (url, _) = serve(Answer::Json(doc)).await;
+    let s = fetch(&url).await;
+    assert_eq!(bars_of(&s, "unraid_disks").unwrap()[0].status, None);
+}
+
+#[tokio::test]
+async fn the_last_parity_check_is_a_moment_with_its_date_as_the_text() {
+    let (url, _) = serve(Answer::Json(healthy())).await;
+    let s = fetch(&url).await;
+    let rows = s
+        .details
+        .iter()
+        .find_map(|b| match b {
+            Block::Facts { title_key, rows } if title_key == "unraid_parity" => Some(rows),
+            _ => None,
+        })
+        .expect("the parity facts");
+    let at = rows[0].at.expect("a moment");
+    let day = jiff::Timestamp::from_second(at)
+        .unwrap()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .date()
+        .to_string();
+    assert_eq!(day, rows[0].value);
+    assert!(rows[1..].iter().all(|r| r.at.is_none()));
 }
 
 #[tokio::test]
@@ -1238,6 +1287,7 @@ async fn blocks_are_cut_to_eight_keeping_the_fullest_disks_in_order() {
             Block::Bars { bars, .. } => bars.len(),
             Block::Facts { rows, .. } => rows.len(),
             Block::Strip { cells, .. } => cells.len(),
+            Block::Spark { .. } => 1,
         };
         assert!(n <= block::MAX_ITEMS, "{block:?}");
     }

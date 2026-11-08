@@ -10,6 +10,10 @@
 //! - [`Block::Bars`]: labelled bars filled to a percentage, with a text.
 //! - [`Block::Strip`]: a row of status cells (for example the last day).
 //! - [`Block::Facts`]: label and value rows.
+//! - [`Block::Spark`]: a small curve of one metric's history (a line, or a
+//!   strip of up and down cells), drawn by the page from the `history` the
+//!   values document carries for that metric (see [`crate::values`]). The
+//!   block names the metric; it holds no numbers itself.
 //!
 //! The JSON is tagged with `"kind"`, for example
 //! `{"kind":"list","title_key":"x","items":[{"text":"a","status":"warn"}]}`.
@@ -32,7 +36,7 @@ use serde::{Deserialize, Serialize};
 
 use super::Status;
 use super::api::clean_text;
-use crate::layout::model::{is_format, link_problem};
+use crate::layout::model::{id_shape, is_format, link_problem};
 
 /// Most characters of any text in a block.
 pub const TEXT_CHARS: usize = 80;
@@ -67,6 +71,29 @@ pub enum Block {
         title_key: String,
         rows: Vec<Fact>,
     },
+    /// The curve of `metric` over the last 24 hours, from the history the
+    /// values document sends for it; `daily` asks for the last 30 days' rows
+    /// too (`history_daily`). A metric is any metric id of the service's kind.
+    Spark {
+        title_key: String,
+        metric: String,
+        #[serde(default)]
+        style: SparkStyle,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        daily: bool,
+    },
+}
+
+/// How a [`Block::Spark`] draws its points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SparkStyle {
+    /// A line through the points, scaled to their lowest and highest value.
+    #[default]
+    Line,
+    /// A strip of cells, one per point: bad where the value is above 0, good
+    /// where it is 0 (for a count of things that are down).
+    UpDown,
 }
 
 /// One line of a list: the text, a smaller second line, a status dot, a value
@@ -266,6 +293,27 @@ impl Block {
                     rows,
                 })
             }
+            // A curve of a metric id of another shape has nothing to draw.
+            Block::Spark {
+                title_key,
+                metric,
+                style,
+                daily,
+            } => id_shape(&metric).then(|| Block::Spark {
+                title_key: clean_key(title_key),
+                metric,
+                style,
+                daily,
+            }),
+        }
+    }
+
+    /// The metric a [`Block::Spark`] draws and whether it asks for the daily
+    /// rows; `None` for every other block.
+    pub fn curve(&self) -> Option<(&str, bool)> {
+        match self {
+            Block::Spark { metric, daily, .. } => Some((metric, *daily)),
+            _ => None,
         }
     }
 
@@ -276,7 +324,9 @@ impl Block {
             Block::List { title_key, items } => std::iter::once(title_key.as_str())
                 .chain(items.iter().filter_map(|i| i.badge_key.as_deref()))
                 .collect(),
-            Block::Bars { title_key, .. } | Block::Strip { title_key, .. } => vec![title_key],
+            Block::Bars { title_key, .. }
+            | Block::Strip { title_key, .. }
+            | Block::Spark { title_key, .. } => vec![title_key],
             Block::Facts { title_key, rows } => std::iter::once(title_key.as_str())
                 .chain(rows.iter().filter_map(|r| r.label_key.as_deref()))
                 .collect(),
@@ -584,6 +634,63 @@ mod tests {
         };
         assert_eq!(rows[0].label_key, None);
         assert_eq!(rows[0].label.as_deref(), Some("Name"));
+    }
+
+    #[test]
+    fn a_spark_names_a_metric_of_the_right_shape() {
+        let spark = |metric: &str| Block::Spark {
+            title_key: "x_curve".into(),
+            metric: metric.into(),
+            style: SparkStyle::UpDown,
+            daily: true,
+        };
+        assert_eq!(
+            serde_json::to_value(spark("down")).unwrap(),
+            serde_json::json!({ "kind": "spark", "title_key": "x_curve", "metric": "down",
+                                "style": "up_down", "daily": true })
+        );
+        // `style` defaults to a line, `daily` to false (and is left out then).
+        let back: Block = serde_json::from_value(
+            serde_json::json!({ "kind": "spark", "title_key": "k", "metric": "latency_ms" }),
+        )
+        .unwrap();
+        assert_eq!(
+            back,
+            Block::Spark {
+                title_key: "k".into(),
+                metric: "latency_ms".into(),
+                style: SparkStyle::Line,
+                daily: false
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            serde_json::json!({ "kind": "spark", "title_key": "k", "metric": "latency_ms", "style": "line" })
+        );
+        assert_eq!(back.curve(), Some(("latency_ms", false)));
+        assert_eq!(back.keys(), vec!["k"]);
+        assert_eq!(spark("down").bounded(), Some(spark("down")));
+        for bad in ["", "has space", "<b>", "ü", &"a".repeat(41)] {
+            assert_eq!(spark(bad).bounded(), None, "{bad:?}");
+        }
+        // A bad title key is blanked, as for the other blocks; the curve stays.
+        let Some(Block::Spark { title_key, .. }) = (Block::Spark {
+            title_key: "Bad Key".into(),
+            metric: "down".into(),
+            style: SparkStyle::Line,
+            daily: false,
+        })
+        .bounded() else {
+            panic!("the spark stays")
+        };
+        assert_eq!(title_key, "");
+        // An unknown style is not a block.
+        assert!(
+            serde_json::from_value::<Block>(
+                serde_json::json!({ "kind": "spark", "title_key": "k", "metric": "m", "style": "pie" })
+            )
+            .is_err()
+        );
     }
 
     fn one_item(item: ListItem) -> ListItem {

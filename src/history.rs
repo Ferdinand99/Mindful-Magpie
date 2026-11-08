@@ -29,19 +29,19 @@
 //! **Bounds.** Every write deletes the service's rows older than the window
 //! (all its metrics, also those the service no longer reports) and, per metric,
 //! anything beyond the newest 288 points; the daily rows older than 30 days go
-//! the same way. A metric that is no longer bound on any card keeps being
-//! recorded and pruned like the rest, so nothing grows past these bounds. The
+//! the same way. A metric that no card draws keeps being recorded and pruned
+//! like the rest, so nothing grows past these bounds. The
 //! rows go with their service (`ON DELETE CASCADE`).
 //!
 //! **What reaches a page.** See [`crate::values`]: `history`, `history_daily`
-//! and `history_append` per service entry, for the metrics bound on the user's
-//! cards only.
+//! and `history_append` per service entry, for the curve metrics of the
+//! services bound on the user's cards only.
 //!
-//! **A card asks for a curve** with a `spark` block naming one metric of its
-//! service (`Block::Spark { metric }`, which comes with the card blocks); the
-//! renderer then draws the metric's `history` as an inline SVG line. Nothing
-//! is drawn from a series with fewer than 2 points, and the renderer must
-//! treat every value as untrusted (a `NaN` never arrives, but a huge number
+//! **A card asks for a curve** with a spark block naming one metric of its
+//! service ([`Block::Spark`](crate::integrations::Block::Spark), written by the
+//! kind into the reading's details); the renderer then draws the metric's
+//! `history` as an inline SVG, a line or a strip of up and down cells. It
+//! treats every value as untrusted (a `NaN` never arrives, but a huge number
 //! may).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};

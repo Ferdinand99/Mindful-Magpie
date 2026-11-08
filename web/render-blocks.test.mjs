@@ -179,9 +179,10 @@ test("a_card_is_wide_by_its_own_size_or_else_by_its_services_default", () => {
 
 test("the_css_spans_two_columns_for_a_wide_card_when_the_grid_is_wide_enough", () => {
   const css = readFileSync(new URL("../static/magpie/render.css", import.meta.url), "utf8");
-  // The grid is the container; two columns of it (2 x 260px and the gap) are 33.5rem.
+  // The grid is the container; two columns of it (2 x 260px and the gap, with a few px to spare) fit in
+  // 536px, in px so that a larger root font size does not move it.
   assert.match(css, /\.mm-cards \{[^}]*container-type: inline-size;/);
-  const query = css.match(/@container \(min-width: 33\.5rem\) \{([\s\S]*?)\n\}\n/)[1];
+  const query = css.match(/@container \(min-width: 536px\) \{([\s\S]*?)\n\}\n/)[1];
   assert.match(query, /\.mm-card-wide \{\s*grid-column: span 2;/);
   assert.doesNotMatch(css.replace(query, ""), /grid-column: span 2/, "the span is inside the container query only");
   assert.match(query, /\.mm-card-wide \.mm-metrics \{\s*grid-template-columns: repeat\(5, /);
@@ -656,4 +657,155 @@ test("lines_that_repeat_a_key_are_matched_in_order", () => {
   const rows = [...t.root.querySelectorAll(".mm-li")];
   t.update([dup("same")]);
   assert.deepEqual([...t.root.querySelectorAll(".mm-li")], rows);
+});
+
+// ---- curves (spark blocks) -------------------------------------------------------------------------
+
+const NOW_S = NOW_MS / 1000;
+const SVG = "http://www.w3.org/2000/svg";
+const SPARK = { kind: "spark", title_key: "uptime", metric: "lat", style: "line" };
+const UPDOWN = { kind: "spark", title_key: "uptime", metric: "down", style: "up_down" };
+/** Points of a series, `ago` seconds before NOW each. */
+const series = (...pairs) => pairs.map(([ago, v]) => [NOW_S - ago, v]);
+function drawSpark(details, history, card = boundCard("c1", 2)) {
+  const p = page();
+  const layout = layoutOf(card);
+  const o = { ...EN, services: SERVICES, values: valuesFor(card.service.id, entry(details, { history })) };
+  render(p.root, layout, o);
+  return { ...p, layout, opts: o };
+}
+const yOf = (points) => points.split(" ").map((pair) => Number(pair.split(",")[1]));
+
+test("a_line_spark_is_an_svg_made_with_the_dom_and_scaled_to_the_lowest_and_highest_value", () => {
+  const { root } = drawSpark([SPARK], { lat: series([3600, 10], [1800, 30], [0, 20]), other: series([0, 1]) });
+  const block = root.querySelector(".mm-block-spark");
+  assert.ok(block, "a spark block");
+  const wrap = block.querySelector(".mm-spark");
+  assert.equal(wrap.getAttribute("role"), "img");
+  assert.equal(wrap.getAttribute("aria-label"), "Last 24 hours");
+  const pic = wrap.querySelector("svg");
+  assert.equal(pic.namespaceURI, SVG);
+  assert.equal(pic.getAttribute("aria-hidden"), "true");
+  const line = pic.querySelector("polyline");
+  assert.equal(line.namespaceURI, SVG);
+  const ys = yOf(line.getAttribute("points"));
+  assert.equal(ys.length, 3);
+  // The highest value is at the top (small y), the lowest at the bottom.
+  assert.ok(ys[1] < ys[2] && ys[2] < ys[0], ys.join(" "));
+  // x by time: the last point is at the right end.
+  const xs = line.getAttribute("points").split(" ").map((pair) => Number(pair.split(",")[0]));
+  assert.equal(xs[2], 288);
+  assert.ok(xs[0] < xs[1]);
+});
+
+test("one_point_or_equal_values_give_a_flat_line_and_bad_numbers_never_throw", () => {
+  const flat = (history) => {
+    const { root } = drawSpark([SPARK], history);
+    const line = root.querySelector(".mm-spark polyline");
+    return line ? line.getAttribute("points") : null;
+  };
+  // One point: a line across the whole width, in the middle.
+  assert.equal(flat({ lat: series([60, 5]) }), "0,16 288,16");
+  // All the same: flat, in the middle.
+  assert.deepEqual(new Set(yOf(flat({ lat: series([600, 7], [300, 7], [0, 7]) }))), new Set([16]));
+  // Too far apart to subtract (the span is not finite): flat too.
+  assert.deepEqual(new Set(yOf(flat({ lat: series([600, -1.7e308], [0, 1.7e308]) }))), new Set([16]));
+  // Negative numbers are numbers.
+  assert.equal(yOf(flat({ lat: series([600, -5], [0, -10]) })).length, 2);
+  // What is not a finite number, or older than a day, or not a point, is left out.
+  const mixed = flat({
+    lat: [
+      [NOW_S - 600, Number.NaN],
+      [NOW_S - 500, Infinity],
+      "x",
+      [NOW_S - 400],
+      [NOW_S - 200_000, 3],
+      [NOW_S - 300, 4],
+      [NOW_S, "9"],
+      null,
+      [NOW_S - 100, 6],
+    ],
+  });
+  assert.equal(yOf(mixed).length, 2);
+  assert.doesNotMatch(mixed, /NaN|Infinity/);
+  // Nothing to draw: no block at all, not even its title.
+  for (const history of [undefined, null, {}, { lat: [] }, { lat: "junk" }, { lat: series([200_000, 1]) }, { other: series([0, 1]) }, []]) {
+    const { root } = drawSpark([SPARK], history);
+    assert.equal(root.querySelector(".mm-block-spark"), null, JSON.stringify(history));
+  }
+  // A metric named like a property of every object is not looked up on the prototype.
+  const { root } = drawSpark([{ ...SPARK, metric: "__proto__" }, { ...SPARK, metric: "constructor" }], {});
+  assert.equal(root.querySelector(".mm-block-spark"), null);
+  // A spark with no metric, or an odd style, does not throw; the odd style draws a line.
+  const odd = drawSpark([{ kind: "spark", title_key: "uptime" }, { ...SPARK, style: "pie" }], { lat: series([0, 1]) });
+  assert.equal(odd.root.querySelectorAll(".mm-block-spark").length, 1);
+  assert.equal(odd.root.querySelector(".mm-spark").getAttribute("data-style"), "line");
+});
+
+test("an_up_down_spark_is_a_strip_of_half_hours_bad_where_something_was_down", () => {
+  const { root } = drawSpark(
+    [UPDOWN],
+    // Now: 0; 45 minutes ago: 2 down; 50 minutes and 5 hours ago: 0; a negative value is no reading.
+    { down: series([0, 0], [2700, 2], [3000, 0], [18_000, 0], [36_000, -1]) },
+  );
+  const wrap = root.querySelector(".mm-spark");
+  assert.equal(wrap.getAttribute("data-style"), "up_down");
+  const cells = [...wrap.querySelectorAll("rect")];
+  assert.equal(cells.length, 48);
+  assert.ok(cells.every((c) => c.namespaceURI === SVG));
+  const states = cells.map((c) => c.getAttribute("data-status"));
+  assert.equal(states.filter((s) => s === "bad").length, 1);
+  assert.equal(states[46], "bad", "the half hour 30 to 60 minutes ago");
+  assert.equal(states[47], "ok");
+  assert.equal(states.filter((s) => s === "ok").length, 2);
+  assert.equal(states.filter((s) => s === "none").length, 45);
+  assert.equal(wrap.getAttribute("aria-label"), "Last 24 hours, Status: problem: 1");
+  // A spark without a known title is a picture with nothing to say.
+  const plain = drawSpark([{ ...UPDOWN, title_key: "nope" }], { down: series([0, 0]) });
+  assert.equal(plain.root.querySelector(".mm-spark").getAttribute("aria-hidden"), "true");
+});
+
+test("a_normal_card_counts_a_spark_as_its_one_visual", () => {
+  const { root } = drawSpark([LIST(4), SPARK, BARS, STRIP], { lat: series([600, 1], [0, 2]) }, boundCard("c1", 1));
+  const kinds = [...root.querySelectorAll(".mm-block")].map((b) => b.getAttribute("class"));
+  assert.deepEqual(kinds, ["mm-block mm-block-list", "mm-block mm-block-spark"]);
+  // Without history the spark is not drawn, and the next visual takes its place.
+  const empty = drawSpark([LIST(4), SPARK, BARS], {}, boundCard("c1", 1));
+  const after = [...empty.root.querySelectorAll(".mm-block")].map((b) => b.getAttribute("class"));
+  assert.deepEqual(after, ["mm-block mm-block-list", "mm-block mm-block-bars"]);
+});
+
+test("a_spark_is_changed_in_place_when_a_point_is_added_and_no_focus_moves", () => {
+  const first = { lat: series([600, 1], [300, 2]), down: series([600, 0]) };
+  const t = liveCard([LIST(2), SPARK, UPDOWN]);
+  // The first draw had no history; the next update brings some.
+  t.update([LIST(2), SPARK, UPDOWN], { history: first });
+  const calls = [];
+  for (const el of t.root.querySelectorAll("*")) el.focus = () => calls.push("focus");
+  const link = t.root.querySelector("a.mm-li-text");
+  const pic = t.root.querySelector(".mm-spark-line");
+  const line = pic.querySelector("polyline");
+  const before = line.getAttribute("points");
+  const cells = [...t.root.querySelectorAll(".mm-spark-updown rect")];
+  // A point is appended (the page merged a history_append).
+  const next = { lat: [...first.lat, [NOW_S, 9]], down: [...first.down, [NOW_S, 1]] };
+  assert.equal(t.update([LIST(2), SPARK, UPDOWN], { history: next }), true);
+  assert.ok(t.root.querySelector(".mm-spark-line") === pic, "the same svg");
+  assert.ok(pic.querySelector("polyline") === line, "the same polyline");
+  assert.notEqual(line.getAttribute("points"), before);
+  assert.equal(yOf(line.getAttribute("points")).length, 3);
+  const after = [...t.root.querySelectorAll(".mm-spark-updown rect")];
+  assert.ok(after.length === 48 && after.every((c, i) => c === cells[i]), "the same cells");
+  assert.equal(after[47].getAttribute("data-status"), "bad");
+  assert.ok(t.root.querySelector("a.mm-li-text") === link);
+  assert.deepEqual(calls, []);
+});
+
+test("the_css_draws_the_spark_line_and_cells_in_the_status_colours", () => {
+  const css = readFileSync(new URL("../static/magpie/render.css", import.meta.url), "utf8");
+  assert.match(css, /\.mm-spark-path \{[^}]*fill: none;[^}]*stroke: var\(--brand\);/);
+  assert.match(css, /\.mm-spark-cell\[data-status="ok"\] \{\s*fill: var\(--ok-text\);/);
+  assert.match(css, /\.mm-spark-cell\[data-status="bad"\] \{\s*fill: var\(--bad-text\);/);
+  const source = readFileSync(new URL("../static/magpie/render.js", import.meta.url), "utf8");
+  assert.match(source, /createElementNS\(SVG_NS/);
 });

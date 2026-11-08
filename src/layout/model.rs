@@ -244,7 +244,7 @@ fn is_visible_symbol(emoji: &str) -> bool {
 }
 
 /// Whether `value` is 1 to 40 of `[A-Za-z0-9_-]`.
-fn id_shape(value: &str) -> bool {
+pub(crate) fn id_shape(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_ID
         && value

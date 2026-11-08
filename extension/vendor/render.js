@@ -427,13 +427,18 @@ function drawStatus(doc, labels, status) {
 
 // ---- detail blocks ------------------------------------------------------------------
 //
-// A service's reading may carry `details`: blocks of kind list, bars, strip or facts (see
+// A service's reading may carry `details`: blocks of kind list, bars, strip, facts or spark (see
 // src/integrations/block.rs for the shapes). Everything in them is text from outside, so it is set
 // with textContent only; a link goes through safeHref; a bar's width is a CSS custom property set
 // through the CSS object model. A block that is not well formed is left out, and the counts are
 // capped again here, because the extension may talk to a server that does not cap them.
+//
+// A spark block names a metric; its curve is drawn from the entry's `history` of that metric
+// (`[[unix_s, value], ...]`, the last 24 hours) as a small inline SVG, made with the DOM (no
+// markup): a line scaled to the lowest and highest value, or for `up_down` a strip of cells (bad
+// where the value is above 0, good where it is 0, blank where there is no point).
 
-const BLOCK_KINDS = ["list", "bars", "strip", "facts"];
+const BLOCK_KINDS = ["list", "bars", "strip", "facts", "spark"];
 const MAX_BLOCKS = 6;
 const MAX_ITEMS = 8;
 const MAX_CELLS = 48;
@@ -441,6 +446,15 @@ const MAX_CELLS = 48;
 const NORMAL_LINES = 3;
 // The key a block names its title or a row's label by (the same shape the server enforces).
 const DETAIL_KEY = /^[a-z0-9_.]{1,64}$/;
+// The window a spark draws (seconds), the most points it reads, and its picture's size in SVG
+// units (the style sheet sets the size on the page).
+const SPARK_WINDOW_S = 24 * 60 * 60;
+const SPARK_MAX_POINTS = 600;
+const SPARK_W = 288;
+const SPARK_H = 32;
+// The cells of an up/down strip: one per half hour.
+const SPARK_SLOTS = 48;
+const SVG_NS = "http://www.w3.org/2000/svg";
 
 /** The text of a detail key in the page's labels (`detail.<key>`), "" when the key is not known. */
 function detailLabel(labels, key) {
@@ -458,12 +472,35 @@ function momentMs(at) {
 }
 
 /**
- * A block as it is drawn: its kind, title key and the entries that can be drawn (at most the caps),
- * or null when none can (a block with nothing to show is not drawn, not even its title).
+ * The points of a spark's curve: the entry's history of `metric` within the last 24 hours before
+ * `nowS`, each `[t, v]` with finite numbers, oldest first, at most SPARK_MAX_POINTS (the newest).
  */
-function shapeBlock(block, labels) {
+function sparkPoints(history, metric, nowS) {
+  if (!isObject(history) || typeof metric !== "string" || !Object.hasOwn(history, metric)) return [];
+  const series = history[metric];
+  if (!Array.isArray(series)) return [];
+  const from = nowS - SPARK_WINDOW_S;
+  const points = series
+    .filter((p) => Array.isArray(p) && Number.isFinite(p[0]) && Number.isFinite(p[1]) && p[0] >= from && p[0] <= nowS + 300)
+    .map((p) => [p[0], p[1]])
+    .sort((a, b) => a[0] - b[0]);
+  return points.slice(-SPARK_MAX_POINTS);
+}
+
+/**
+ * A block as it is drawn: its kind, title key and the entries that can be drawn (at most the caps),
+ * or null when none can (a block with nothing to show is not drawn, not even its title). A spark's
+ * entries are its points (`ctx.history`, counted back from `ctx.nowMs`).
+ */
+function shapeBlock(block, ctx) {
+  const labels = ctx.labels;
   const list = (value) => (Array.isArray(value) ? value.filter(isObject) : []);
   let entries;
+  if (block.kind === "spark") {
+    entries = sparkPoints(ctx.history, block.metric, Math.floor(ctx.nowMs / 1000));
+    if (entries.length === 0) return null;
+    return { kind: "spark", title_key: block.title_key, look: ["up_down"].includes(block.style) ? "up_down" : "line", entries };
+  }
   if (block.kind === "list") {
     entries = list(block.items)
       .filter((item) => text(item.text) !== "")
@@ -483,12 +520,12 @@ function shapeBlock(block, labels) {
 }
 
 /** The blocks of `details` that can be drawn, at most six. */
-function wellFormedBlocks(details, labels) {
+function wellFormedBlocks(details, ctx) {
   if (!Array.isArray(details)) return [];
   const out = [];
   for (const block of details) {
     if (!isObject(block) || !BLOCK_KINDS.includes(block.kind)) continue;
-    const shaped = shapeBlock(block, labels);
+    const shaped = shapeBlock(block, ctx);
     if (shaped) out.push(shaped);
     if (out.length === MAX_BLOCKS) break;
   }
@@ -497,7 +534,7 @@ function wellFormedBlocks(details, labels) {
 
 /**
  * What a card of `size` draws of `blocks`: all of them when wide; when normal the first list (cut to
- * three lines) and the first bars or strip. Each is `{ block, cut }`.
+ * three lines) and the first visual (bars, strip or spark). Each is `{ block, cut }`.
  */
 function blocksFor(blocks, size) {
   if (size === "wide") return blocks.map((block) => ({ block, cut: false }));
@@ -508,7 +545,7 @@ function blocksFor(blocks, size) {
     if (block.kind === "list" && !list) {
       list = true;
       picked.push({ block, cut: true });
-    } else if ((block.kind === "bars" || block.kind === "strip") && !visual) {
+    } else if ((block.kind === "bars" || block.kind === "strip" || block.kind === "spark") && !visual) {
       visual = true;
       picked.push({ block, cut: false });
     }
@@ -637,6 +674,99 @@ function drawFacts(doc, ctx, block) {
   return wrap;
 }
 
+function svg(doc, tag, className) {
+  const el = doc.createElementNS(SVG_NS, tag);
+  if (className) el.setAttribute("class", className);
+  return el;
+}
+
+/** A number for an SVG attribute: two decimals at most, never NaN. */
+function coord(n) {
+  return Number.isFinite(n) ? String(Math.round(n * 100) / 100) : "0";
+}
+
+/**
+ * A line through the points, x by time over the last 24 hours and y between the lowest and the
+ * highest value. One point, or values that are all the same (or too far apart to subtract), give a
+ * flat line in the middle.
+ */
+function sparkLine(doc, points, nowS) {
+  const pic = svg(doc, "svg", "mm-spark-svg mm-spark-line");
+  pic.setAttribute("viewBox", `0 0 ${SPARK_W} ${SPARK_H}`);
+  pic.setAttribute("preserveAspectRatio", "none");
+  pic.setAttribute("focusable", "false");
+  let min = Infinity;
+  let max = -Infinity;
+  for (const [, v] of points) {
+    if (v < min) min = v;
+    if (v > max) max = v;
+  }
+  const span = max - min;
+  const flat = !(Number.isFinite(span) && span > 0);
+  const from = nowS - SPARK_WINDOW_S;
+  const x = (t) => Math.min(SPARK_W, Math.max(0, ((t - from) / SPARK_WINDOW_S) * SPARK_W));
+  const pad = 3;
+  const y = (v) => (flat ? SPARK_H / 2 : SPARK_H - pad - ((v - min) / span) * (SPARK_H - 2 * pad));
+  const coords = points.length === 1 ? [[0, y(points[0][1])], [SPARK_W, y(points[0][1])]] : points.map(([t, v]) => [x(t), y(v)]);
+  const line = svg(doc, "polyline", "mm-spark-path");
+  line.setAttribute("points", coords.map(([a, b]) => `${coord(a)},${coord(b)}`).join(" "));
+  line.setAttribute("vector-effect", "non-scaling-stroke");
+  pic.appendChild(line);
+  return pic;
+}
+
+/**
+ * A strip of half-hour cells over the last 24 hours: bad where a point in the cell is above 0, good
+ * where the cell has points and all are 0, blank where it has none (or only values below 0).
+ * Returns the picture and how many cells are bad.
+ */
+function sparkCells(doc, points, nowS) {
+  const pic = svg(doc, "svg", "mm-spark-svg mm-spark-updown");
+  pic.setAttribute("viewBox", `0 0 ${SPARK_SLOTS} 1`);
+  pic.setAttribute("preserveAspectRatio", "none");
+  pic.setAttribute("focusable", "false");
+  const slots = new Array(SPARK_SLOTS).fill("none");
+  const from = nowS - SPARK_WINDOW_S;
+  const size = SPARK_WINDOW_S / SPARK_SLOTS;
+  for (const [t, v] of points) {
+    const i = Math.min(SPARK_SLOTS - 1, Math.max(0, Math.floor((t - from) / size)));
+    if (v > 0) slots[i] = "bad";
+    else if (v === 0 && slots[i] === "none") slots[i] = "ok";
+  }
+  slots.forEach((state, i) => {
+    const cell = svg(doc, "rect", "mm-spark-cell");
+    cell.setAttribute("x", coord(i + 0.08));
+    cell.setAttribute("y", "0");
+    cell.setAttribute("width", "0.84");
+    cell.setAttribute("height", "1");
+    cell.setAttribute("data-status", state);
+    pic.appendChild(cell);
+  });
+  return { pic, bad: slots.filter((state) => state === "bad").length };
+}
+
+/** A spark block's picture: one image, named by its title (and, for up/down, the count of bad cells). */
+function drawSpark(doc, ctx, block) {
+  const wrap = make(doc, "div", "mm-spark");
+  wrap.setAttribute("data-style", block.look);
+  const nowS = Math.floor(ctx.nowMs / 1000);
+  let pic;
+  let bad = 0;
+  if (block.look === "up_down") ({ pic, bad } = sparkCells(doc, block.entries, nowS));
+  else pic = sparkLine(doc, block.entries, nowS);
+  const parts = [detailLabel(ctx.labels, block.title_key), bad > 0 ? `${label(ctx.labels, "status_bad")}: ${bad}` : ""];
+  const name = parts.filter((p) => p !== "").join(", ");
+  if (name !== "") {
+    wrap.setAttribute("role", "img");
+    wrap.setAttribute("aria-label", name);
+  } else {
+    wrap.setAttribute("aria-hidden", "true");
+  }
+  pic.setAttribute("aria-hidden", "true");
+  wrap.appendChild(pic);
+  return wrap;
+}
+
 function drawBlock(doc, ctx, block, cut, id) {
   const el = make(doc, "div", `mm-block mm-block-${block.kind}`);
   const titleText = detailLabel(ctx.labels, block.title_key);
@@ -651,17 +781,19 @@ function drawBlock(doc, ctx, block, cut, id) {
   if (block.kind === "list") el.appendChild(drawList(doc, ctx, block, cut));
   else if (block.kind === "bars") el.appendChild(drawBars(doc, block));
   else if (block.kind === "strip") el.appendChild(drawStrip(doc, ctx, block));
+  else if (block.kind === "spark") el.appendChild(drawSpark(doc, ctx, block));
   else el.appendChild(drawFacts(doc, ctx, block));
   return el;
 }
 
 /**
  * The blocks of a reading for a card of `size`, or null when there is nothing to draw. `cardKey`
- * makes the ids of the titles (`mm-bt-<card>-<n>`) different on every card of the page.
+ * makes the ids of the titles (`mm-bt-<card>-<n>`) different on every card of the page. `history`
+ * is the entry's, for the spark blocks.
  */
-function drawBlocks(doc, details, size, opts, cardKey, nowMs) {
-  const ctx = { labels: opts.labels, lang: opts.lang, nowMs };
-  const picked = blocksFor(wellFormedBlocks(details, ctx.labels), size);
+function drawBlocks(doc, details, history, size, opts, cardKey, nowMs) {
+  const ctx = { labels: opts.labels, lang: opts.lang, nowMs, history };
+  const picked = blocksFor(wellFormedBlocks(details, ctx), size);
   if (picked.length === 0) return null;
   const wrap = make(doc, "div", "mm-blocks");
   wrap.setAttribute("data-count", String(picked.length));
@@ -732,7 +864,7 @@ function drawService(doc, el, ref, opts) {
     svc.appendChild(grid);
   }
 
-  const blocks = drawBlocks(doc, snap.details, cardSizeOf(el), opts, el.getAttribute("data-card") ?? `s${ref.id}`, nowMs);
+  const blocks = drawBlocks(doc, snap.details, snap.history, cardSizeOf(el), opts, el.getAttribute("data-card") ?? `s${ref.id}`, nowMs);
   if (blocks) svc.appendChild(blocks);
 
   foot.appendChild(drawStatus(doc, labels, statusOf(snap.status)));
