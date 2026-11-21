@@ -508,13 +508,26 @@ fn validation_backgrounds() {
         "background.name",
         "bad_preset",
     );
-    // Until Task 5 checks uploaded images against the database, validate
-    // refuses every image background.
-    expect(
-        |l| l.background = Background::Image { id: "img1".into() },
-        "background.id",
-        "bad_image",
-    );
+    // `validate` never touches the database, so whether an image id is the
+    // user's own is the save's business (tests/background.rs). It only
+    // refuses an id that cannot be one: 1 to 64 of `[A-Za-z0-9_-]`.
+    for id in ["", "has space", "dot.png", "../x", &"x".repeat(65)] {
+        expect(
+            |l| l.background = Background::Image { id: id.into() },
+            "background.id",
+            "bad_image",
+        );
+    }
+    for id in [
+        "img1",
+        "0123456789abcdef0123456789abcdef",
+        "a_b-C",
+        &"x".repeat(64),
+    ] {
+        let mut l = sample();
+        l.background = Background::Image { id: id.into() };
+        assert_eq!(codes(&l), vec![], "{id}");
+    }
 }
 
 #[test]

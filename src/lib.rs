@@ -44,6 +44,9 @@ pub struct Magpie {
     /// official extension's and those of `MM_EXTENSION_IDS` (see
     /// [`connect::redirect_host`]).
     pub extension_hosts: Arc<Vec<String>>,
+    /// The users' uploaded start page backgrounds (files under the data
+    /// directory).
+    pub backgrounds: Arc<layout::Backgrounds>,
 }
 
 /// Installs the configuration, opens and migrates the database in
@@ -87,10 +90,17 @@ pub async fn start_with(
         core.with_conn(move |c| settings::set(c, settings::BASE_URL, &url))
             .await?;
     }
+    // Files of users who were deleted while Magpie was not running, and
+    // leftovers of an upload that did not finish.
+    let backgrounds = Arc::new(layout::Backgrounds::new(data_dir));
+    if let Err(err) = backgrounds.reconcile(&core).await {
+        tracing::warn!("can't sweep the background files: {err}");
+    }
     Ok(Magpie {
         core,
         token_budget: Arc::new(TokenBuckets::new()),
         extension_hosts: Arc::new(connect::allowed_hosts(extension_ids)),
+        backgrounds,
     })
 }
 
@@ -105,12 +115,16 @@ pub fn router(magpie: Magpie) -> Router {
         .merge(connect::router())
         .merge(api::router())
         .merge(kit_pages::router())
+        // Inside the sign-in guard: sees who is signed in (see the function).
+        .route_layer(from_fn(pages::sweep_after_user_delete))
         .route_layer(from_fn_with_state(core.clone(), guard::require_auth));
     // Sign-in, first-run setup, logout, health and static files.
     let public = Router::new()
         .route("/healthz", get(vole_kit::http::healthz))
         .route("/static/{*path}", get(vole_kit::http::assets::static_asset))
         .merge(api::public_router())
+        // Takes a cookie or an API token and answers 401 itself (see the module).
+        .merge(pages::image_router())
         .merge(kit_pages::public_router());
     protected
         .merge(public)

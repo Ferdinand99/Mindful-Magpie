@@ -24,16 +24,19 @@ body:has(.wall) {
   display: none;
 }
 
-/* The page fills the width: the grid grows with the screen instead of
-   stopping at the kit's reading width. */
+/* The page uses the width: the grid grows with the screen instead of stopping
+   at the kit's reading width, up to 2000px (the page and the top bar together,
+   centred): on a 2560px screen a group of a few cards no longer hangs at the far
+   left of a very wide empty page, and the Edit button stays near the content.
+   Below 2000px nothing changes. */
 .main.start {
-  max-width: none;
+  max-width: 2000px;
   gap: var(--sp-6);
   padding-left: max(clamp(1rem, 3vw, 3rem), var(--safe-left)); /* rtl-ok: safe-area insets are physical */
   padding-right: max(clamp(1rem, 3vw, 3rem), var(--safe-right)); /* rtl-ok: safe-area insets are physical */
 }
 body:has(.main.start) .topbar-inner {
-  max-width: none;
+  max-width: 2000px;
   padding-left: max(clamp(1rem, 3vw, 3rem), var(--safe-left)); /* rtl-ok: safe-area insets are physical */
   padding-right: max(clamp(1rem, 3vw, 3rem), var(--safe-right)); /* rtl-ok: safe-area insets are physical */
 }
@@ -59,6 +62,23 @@ body:has(.main.start) .topbar-inner {
 }
 .date::first-letter {
   text-transform: uppercase;
+}
+/* On an uploaded picture the muted grey of the date falls to about 3:1 on a
+   pale photo even under the scrim: lighten it and give it a soft shadow. */
+html:root:has(.mm-root)[data-bg="image"] .date {
+  color: rgba(245, 245, 247, 0.9);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+}
+
+/* The Edit button on an uploaded picture: its grey fill is faint on a pale
+   photo even under the scrim. Give it the dark glass of the cards and a hairline,
+   like the date above. (The open state, the inverted pill, keeps its own look.) */
+html:root:has(.mm-root)[data-bg="image"] #mm-edit:not([aria-pressed="true"]) {
+  --btn-bg: rgba(20, 20, 23, 0.62);
+  --btn-hover: rgba(20, 20, 23, 0.78);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.28);
+  -webkit-backdrop-filter: saturate(180%) blur(16px);
+  backdrop-filter: saturate(180%) blur(16px);
 }
 
 /* "Needs you": one glass row of alerts; hidden while nothing needs you. */
@@ -102,6 +122,311 @@ body:has(.main.start) .topbar-inner {
 }
 .mm-notice > div {
   flex: 1 1 18rem;
+}
+.mm-notice > .mm-notice-actions {
+  display: flex;
+  flex: none;
+  gap: var(--sp-2);
+}
+.mm-notice p {
+  margin: 0;
+}
+
+/* Edit mode ------------------------------------------------------------------
+   edit.js draws the page with the renderer and adds the controls below. The
+   sheets (forms, move menu, confirm) are the kit's .sheet. */
+.start-actions {
+  margin-inline-start: auto;
+}
+/* The Edit button while edit mode is open: the kit's inverted pill. */
+#mm-edit[aria-pressed="true"] {
+  --btn-bg: var(--text);
+  --btn-fg: var(--on-inverse);
+  --btn-hover: color-mix(in srgb, var(--text) 84%, var(--bg));
+}
+
+.mm-edit-host {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+.mm-edit-bar {
+  position: sticky;
+  top: calc(var(--topbar-h) + var(--safe-top) + var(--sp-2));
+  z-index: var(--z-sticky);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2) var(--sp-4);
+  padding: var(--sp-2) var(--sp-3);
+}
+.mm-edit-adds,
+.mm-edit-ends {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+.mm-edit-alert {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2) var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  border-color: var(--bad-text);
+}
+.mm-edit-alert p {
+  margin: 0;
+  font-weight: 500;
+}
+.mm-edit-problems {
+  display: flex;
+  flex-direction: column;
+  flex-basis: 100%;
+  align-items: flex-start;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.mm-edit-problems .btn {
+  height: auto;
+  min-height: 0;
+  padding-block: var(--sp-1);
+  text-align: start;
+  white-space: normal;
+}
+
+/* A group: its heading with the group's controls beside it. */
+.mm-edit-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-block-end: var(--sp-3);
+}
+.mm-edit-head .mm-group-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+}
+.mm-edit-actions {
+  display: flex;
+  flex: none;
+  gap: 2px;
+}
+.mm-grip {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 32px;
+  color: var(--muted);
+  cursor: grab;
+  touch-action: none;
+}
+.mm-grip:active {
+  cursor: grabbing;
+}
+.mm-edit-foot {
+  margin-block-start: var(--sp-3);
+}
+/* An empty group still takes a drop. */
+[data-editing] .mm-cards:empty {
+  min-height: 4.5rem;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--r-lg);
+}
+
+/* A card: the card, and its controls under it. A bookmark pill: the pill and
+   its controls beside it. */
+.mm-edit-item {
+  position: relative;
+  min-width: 0;
+}
+.mm-edit-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  cursor: grab;
+}
+.mm-edit-card > .mm-card {
+  flex: 1 1 auto;
+}
+.mm-edit-bookmark {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  max-width: 100%;
+  cursor: grab;
+}
+.mm-edit-controls {
+  display: flex;
+  justify-content: flex-end;
+  gap: 2px;
+}
+[data-editing] a.mm-card:hover {
+  transform: none;
+}
+.mm-dragging {
+  opacity: 0.45;
+}
+/* Where a drop would land: a brand line before or after the target, or a frame
+   around the group's grid. */
+.mm-drop-before {
+  box-shadow: -3px 0 0 var(--brand);
+}
+.mm-drop-after {
+  box-shadow: 3px 0 0 var(--brand);
+}
+/* The line sits on the other side in a right-to-left page. */
+[dir="rtl"] .mm-drop-before { /* rtl-ok: a shadow offset has no logical form */
+  box-shadow: 3px 0 0 var(--brand);
+}
+[dir="rtl"] .mm-drop-after { /* rtl-ok: a shadow offset has no logical form */
+  box-shadow: -3px 0 0 var(--brand);
+}
+.mm-group.mm-drop-before {
+  box-shadow: 0 -3px 0 var(--brand);
+}
+.mm-group.mm-drop-after {
+  box-shadow: 0 3px 0 var(--brand);
+}
+.mm-cards.mm-drop-end {
+  outline: 2px solid var(--brand);
+  outline-offset: 4px;
+  border-radius: var(--r-lg);
+}
+
+/* Colour picker: 13 round swatches, a radio group (arrow keys work). */
+.mm-swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+.mm-swatch {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  cursor: pointer;
+}
+.mm-swatch-dot {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--pal-gray);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12);
+}
+.mm-swatch:has(input:checked) {
+  box-shadow: 0 0 0 2px var(--card-raised), 0 0 0 4px var(--text);
+}
+.mm-swatch:has(input:focus-visible) {
+  outline: 2px solid var(--brand);
+  outline-offset: 3px;
+}
+.mm-swatch-dot[data-colour="red"] { background: var(--pal-red); }
+.mm-swatch-dot[data-colour="orange"] { background: var(--pal-orange); }
+.mm-swatch-dot[data-colour="yellow"] { background: var(--pal-yellow); }
+.mm-swatch-dot[data-colour="green"] { background: var(--pal-green); }
+.mm-swatch-dot[data-colour="mint"] { background: var(--pal-mint); }
+.mm-swatch-dot[data-colour="teal"] { background: var(--pal-teal); }
+.mm-swatch-dot[data-colour="cyan"] { background: var(--pal-cyan); }
+.mm-swatch-dot[data-colour="blue"] { background: var(--pal-blue); }
+.mm-swatch-dot[data-colour="indigo"] { background: var(--pal-indigo); }
+.mm-swatch-dot[data-colour="purple"] { background: var(--pal-purple); }
+.mm-swatch-dot[data-colour="pink"] { background: var(--pal-pink); }
+.mm-swatch-dot[data-colour="brown"] { background: var(--pal-brown); }
+.mm-swatch-dot[data-colour="gray"] { background: var(--pal-gray); }
+
+/* The background picker: four preset previews as a radio group, drawn from a
+   data attribute (no style attributes), then the upload. */
+.mm-bg-presets {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(6.5rem, 1fr));
+  gap: var(--sp-3);
+}
+.mm-bg-preset {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  cursor: pointer;
+}
+.mm-bg-dot {
+  display: block;
+  height: 3.5rem;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  background: var(--bg);
+}
+.mm-bg-dot[data-preset="hedgerow"] {
+  background:
+    radial-gradient(70% 70% at 15% 10%, rgba(139, 125, 255, 0.55), transparent 70%),
+    radial-gradient(70% 70% at 90% 20%, rgba(255, 100, 130, 0.4), transparent 70%),
+    radial-gradient(80% 80% at 50% 100%, rgba(48, 160, 200, 0.45), transparent 70%),
+    var(--bg);
+}
+.mm-bg-dot[data-preset="natt"] {
+  background: #0b0b0d;
+}
+.mm-bg-dot[data-preset="skumring"] {
+  background:
+    radial-gradient(70% 70% at 15% 10%, rgba(139, 92, 246, 0.7), transparent 70%),
+    radial-gradient(70% 70% at 90% 20%, rgba(244, 63, 94, 0.55), transparent 70%),
+    radial-gradient(80% 80% at 50% 100%, rgba(236, 72, 153, 0.4), transparent 70%),
+    #12081c;
+}
+.mm-bg-dot[data-preset="hav"] {
+  background:
+    radial-gradient(70% 70% at 15% 10%, rgba(20, 184, 166, 0.6), transparent 70%),
+    radial-gradient(70% 70% at 90% 20%, rgba(59, 130, 246, 0.55), transparent 70%),
+    radial-gradient(80% 80% at 50% 100%, rgba(6, 182, 212, 0.4), transparent 70%),
+    #061219;
+}
+.mm-bg-name {
+  font-size: 0.8125rem;
+  text-align: center;
+}
+.mm-bg-preset:has(input:checked) .mm-bg-dot {
+  box-shadow: 0 0 0 2px var(--card-raised), 0 0 0 4px var(--text);
+}
+.mm-bg-preset:has(input:focus-visible) .mm-bg-dot {
+  outline: 2px solid var(--brand);
+  outline-offset: 4px;
+}
+.mm-bg-status:empty {
+  display: none;
+}
+/* The upload: the file input is hidden inside a secondary-button label (the kit
+   draws the focus ring on the label); the file on its way is named beside it. */
+.mm-file-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2) var(--sp-3);
+}
+.mm-file-btn {
+  cursor: pointer;
+}
+.mm-file-name {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.8125rem;
+  overflow-wrap: anywhere;
+}
+
+/* The move menu: one button per move. */
+.mm-move-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.mm-move-list .btn {
+  justify-content: flex-start;
+  height: auto;
+  min-height: 40px;
+  padding-block: var(--sp-2);
+  text-align: start;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 /* The consent page of the browser extension (/connect/extension) ----------- */

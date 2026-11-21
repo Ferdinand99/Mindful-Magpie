@@ -13,8 +13,10 @@
 
 > **Status: under utvikling (in development).** Mindful Magpie ("Magpie") is a self-hosted start page for your
 > links and services. Today it has first-run setup, sign-in, users and roles, two-factor sign-in and passkeys, API
-> tokens, and an empty start page (clock, date and room for your groups) in the Hedgerow design. Links, services,
-> groups and widgets, the browser extension and the apps follow. It is part of the Hedgerow family and is built on
+> tokens, and a start page you build yourself in the browser, in the Hedgerow design: groups of link cards, bookmark
+> pills, a clock and one of four backgrounds or your own picture, with an edit mode on the page (drag and drop, or
+> the keyboard). A Firefox extension (`extension/`) shows the same page in the new tab. Widgets, the status row and
+> the apps follow. It is part of the Hedgerow family and is built on
 > [vole-kit](https://github.com/Ferdinand99/Vigilant-Vole), the shared kit that brings sign-in, users, setup,
 > translations and the design system. Nothing is released yet. The spike that settled the new-tab approach is in
 > [`docs/spike-findings.md`](docs/spike-findings.md).

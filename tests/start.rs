@@ -145,12 +145,17 @@ async fn boosted_navigation_loads_the_page_in_full() {
 }
 
 #[tokio::test]
-async fn boosted_navigation_from_the_start_page_is_not_reloaded() {
-    // The start page's head is already loaded when the request comes from `/`:
-    // the page is swapped in, with no redirect (that would reload it for nothing).
+async fn boosted_navigation_to_the_start_page_always_loads_it_in_full() {
+    // htmx drops the page's data blocks (they are scripts) from what it swaps
+    // in, so even from the start page itself a boosted request is answered with
+    // a redirect: the page is loaded in full, with its data.
     let app = App::new().await;
     let mut web = Web::new(&app, "ada", "admin").await;
-    for current in ["http://magpie.test:3010/", "http://magpie.test:3010/?x=1"] {
+    for current in [
+        "http://magpie.test:3010/",
+        "http://magpie.test:3010/?x=1",
+        "http://magpie.test:3010/settings/security",
+    ] {
         let req = Request::get("/")
             .header("hx-request", "true")
             .header("hx-boosted", "true")
@@ -159,27 +164,10 @@ async fn boosted_navigation_from_the_start_page_is_not_reloaded() {
             .unwrap();
         let res = web.send(req).await;
         assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-        assert_eq!(res.header("hx-redirect"), "", "redirected from {current}");
-        assert!(res.body.contains(r#"id="groups""#), "{}", res.body);
-        assert!(
-            res.header("vary").contains("HX-Boosted"),
-            "vary: {}",
-            res.header("vary")
-        );
+        assert_eq!(res.header("hx-redirect"), "/", "from {current}");
+        assert!(!res.body.contains(r#"id="groups""#), "{}", res.body);
+        assert_eq!(res.header("vary"), "HX-Boosted");
     }
-
-    // From any other page the redirect stays.
-    let req = Request::get("/")
-        .header("hx-request", "true")
-        .header("hx-boosted", "true")
-        .header(
-            "hx-current-url",
-            "http://magpie.test:3010/settings/security",
-        )
-        .body(Body::empty())
-        .unwrap();
-    let res = web.send(req).await;
-    assert_eq!(res.header("hx-redirect"), "/");
 }
 
 #[tokio::test]
@@ -425,4 +413,151 @@ async fn start_page_embeds_the_labels_for_the_renderer() {
             assert!(!text.is_empty() && !text.contains("start."), "{lang} {key}");
         }
     }
+}
+
+#[tokio::test]
+async fn start_page_has_the_edit_button() {
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    for (lang, label) in [("en", "Edit"), ("nb", "Rediger")] {
+        let res = start_page(&mut web, lang).await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        // A kit pill button with the pencil icon and aria-pressed.
+        let at = res.body.find(r#"id="mm-edit""#).expect("no edit button");
+        let start = res.body[..at].rfind("<button").unwrap();
+        let end = res.body[at..].find("</button>").unwrap() + at;
+        let button = &res.body[start..end];
+        assert!(button.contains(r#"type="button""#), "{button}");
+        assert!(button.contains(r#"aria-pressed="false""#), "{button}");
+        assert!(button.contains(r#"class="btn btn-secondary""#), "{button}");
+        assert!(button.contains("icons.svg#pencil"), "{button}");
+        assert!(
+            button.contains(&format!("<span>{label}</span>")),
+            "{lang}: {button}"
+        );
+        assert!(!button.contains("autofocus"), "{button}");
+        // Without scripts the button would do nothing: it starts hidden, and the
+        // page script shows it.
+        let wrapper = &res.body[res.body[..start].rfind("<div").unwrap()..start];
+        assert!(
+            wrapper.contains("start-actions") && wrapper.contains("hidden"),
+            "{wrapper}"
+        );
+    }
+}
+
+/// The keys `edit.js` lists in `LABEL_KEYS`.
+fn edit_label_keys() -> Vec<String> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("static/magpie");
+    let source = std::fs::read_to_string(dir.join("edit.js")).unwrap();
+    let list = source
+        .split("export const LABEL_KEYS = [")
+        .nth(1)
+        .and_then(|rest| rest.split("];").next())
+        .expect("edit.js lists no LABEL_KEYS");
+    list.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect()
+}
+
+#[tokio::test]
+async fn start_page_labels_cover_every_string_edit_mode_uses() {
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    let keys = edit_label_keys();
+    assert!(keys.len() > 60, "only {} keys found", keys.len());
+    let mut texts = Vec::new();
+    for lang in ["en", "nb"] {
+        let res = start_page(&mut web, lang).await;
+        let labels = json_block(&res.body, "mm-labels");
+        for key in &keys {
+            let text = labels[key.as_str()].as_str().unwrap_or_default();
+            assert!(
+                !text.is_empty() && !text.starts_with("start."),
+                "{lang}: no text for {key}"
+            );
+        }
+        texts.push(labels);
+    }
+    // The two languages really differ (a key copied untranslated would not).
+    for key in ["edit_done", "conflict", "reload", "save_failed", "add_card"] {
+        assert_ne!(texts[0][key], texts[1][key], "{key} is not translated");
+    }
+    assert_eq!(texts[1]["conflict"], "Siden er endret i en annen fane");
+    assert_eq!(texts[1]["reload"], "Last inn på nytt");
+    assert_eq!(texts[1]["save_failed"], "Kunne ikke lagre – prøv igjen");
+    assert_eq!(texts[1]["edit_done"], "Ferdig");
+    assert_eq!(texts[1]["add_card"], "Legg til kort");
+    // A text with a placeholder keeps it for the script to fill in.
+    assert!(texts[0]["edit_item"].as_str().unwrap().contains("{title}"));
+    assert!(texts[1]["err_too_long"].as_str().unwrap().contains("{max}"));
+}
+
+#[tokio::test]
+async fn edit_mode_scripts_are_served() {
+    let app = App::new().await;
+    for path in [
+        "/static/magpie/ops.js",
+        "/static/magpie/rules.js",
+        "/static/magpie/edit.js",
+    ] {
+        let res = app.get(path).await;
+        assert_eq!(res.status, StatusCode::OK, "{path}: {}", res.body);
+        assert!(
+            res.header("content-type").contains("javascript"),
+            "{path} content-type: {}",
+            res.header("content-type")
+        );
+    }
+}
+
+#[tokio::test]
+async fn start_page_carries_the_signed_in_users_number() {
+    // A draft kept in the browser is tied to this number, so that the next
+    // person in the same tab never sees it (static/magpie/start.js).
+    let app = App::new().await;
+    let mut ada = Web::new(&app, "ada", "admin").await;
+    let mut bob = Web::new(&app, "bob", "viewer").await;
+    let ada_id = common::user_id(&app, "ada").await;
+    let bob_id = common::user_id(&app, "bob").await;
+    assert_ne!(ada_id, bob_id);
+    for (web, id, name) in [(&mut ada, ada_id, "ada"), (&mut bob, bob_id, "bob")] {
+        let res = start_page(web, "en").await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        let at = res.body.find(r#"id="groups""#).unwrap();
+        let tag = &res.body[at..res.body[at..].find('>').unwrap() + at];
+        assert!(tag.contains(&format!(r#"data-user="{id}""#)), "{tag}");
+        assert!(!tag.contains(name), "the name is not on the page: {tag}");
+    }
+}
+
+#[tokio::test]
+async fn start_page_is_not_kept_in_the_htmx_history_cache() {
+    // htmx keeps a snapshot of every page it leaves in sessionStorage, and the
+    // snapshot outlives a sign-out in the same tab: Back could show the start
+    // page, with its layout, to the next person. `hx-history="false"` anywhere
+    // in the page makes htmx keep no snapshot of it; Back then fetches the page
+    // from the server, for whoever is signed in.
+    let app = App::new().await;
+    let mut web = Web::new(&app, "ada", "admin").await;
+    let res = start_page(&mut web, "en").await;
+    assert!(
+        res.body.contains(r#"hx-history="false""#),
+        "the start page does not opt out of htmx's history cache"
+    );
+    // Nor in the browser's own caches: Back after a sign-out asks the server.
+    assert_eq!(res.header("cache-control"), "no-store");
+    // The page's own data is in the page, not in a snapshot.
+    assert!(res.body.contains(r#"id="mm-layout""#), "{}", res.body);
+
+    // The check lives in the htmx the kit ships: it looks for this selector.
+    // (If a newer htmx changes it, this fails and the opt-out needs a new look.)
+    let htmx = app.get("/static/htmx.min.js").await;
+    assert_eq!(htmx.status, StatusCode::OK);
+    assert!(
+        htmx.body.contains(r#"[hx-history="false" i]"#),
+        "this htmx does not know hx-history=false"
+    );
 }
